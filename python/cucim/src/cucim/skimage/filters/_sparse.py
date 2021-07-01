@@ -1,5 +1,11 @@
+import itertools
+from collections.abc import Iterable
+
 import cupy as cp
 import numpy as np
+
+from ..transform import integral_image
+from cucim import _misc
 
 
 def _validate_window_size(axis_sizes):
@@ -137,3 +143,55 @@ def correlate_sparse(image, kernel, mode='reflect'):
         padded_image, kernel.shape, kernel_indices_and_values
     )
     return out
+
+
+def _uniform_filter(image, w):
+    """Return local mean of each pixel using a neighborhood defined by a
+    rectangular window size ``w``. The algorithm uses integral images to
+    speedup computation.
+
+    Parameters
+    ----------
+    image : ndarray
+        Input image.
+    w : int, or iterable of int
+        Window size specified as a single odd integer (3, 5, 7, …),
+        or an iterable of length ``image.ndim`` containing only odd
+        integers (e.g. ``(1, 5, 5)``).
+
+    Returns
+    -------
+    m : ndarray of float, same shape as ``image``
+        Local mean of the image.
+
+    """
+    from cucim.skimage.thresholding import _validate_window_size
+    if not isinstance(w, Iterable):
+        w = (w,) * image.ndim
+    _validate_window_size(w)
+
+    # TODO: should be (k + 1) // 2 instead of k // 2 + 1?
+    pad_width = tuple((k // 2 + 1, k // 2) for k in w)
+
+    float_dtype = np.result_type(image.dtype, np.float32)
+    padded = cp.pad(image.astype(float_dtype), pad_width,
+                    mode='reflect')
+
+    integral = integral_image(padded)
+
+    # Store the kernel as a list 2-tuples where:
+    #     - The first element is an index into the kernel (of shape w).
+    #     - The second element is the value at that index.
+    kernel_indices_and_values = []
+    for indices in itertools.product(*tuple([(0, _w) for _w in w])):
+        kernel_indices_and_values.append(
+            (indices, (-1) ** (image.ndim % 2 != np.sum(indices) % 2))
+        )
+
+    total_window_size = _misc.prod(w)
+    kernel_shape = tuple(_w + 1 for _w in w)
+    m = _correlate_sparse(integral, kernel_shape, kernel_indices_and_values)
+    m = m.astype(dtype=float_dtype, copy=False)
+    m /= total_window_size
+
+    return m

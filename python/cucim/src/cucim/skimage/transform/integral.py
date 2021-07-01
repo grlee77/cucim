@@ -2,7 +2,7 @@ import cupy as cp
 import numpy as np
 
 
-def integral_image(image):
+def integral_image(image, dtype=None):
     r"""Integral image / summed area table.
 
     The integral image contains the sum of all elements above and to the
@@ -28,9 +28,13 @@ def integral_image(image):
            ACM SIGGRAPH Computer Graphics, vol. 18, 1984, pp. 207-212.
 
     """
-    S = image
-    for i in range(image.ndim):
-        S = S.cumsum(axis=i)
+    if dtype is None and image.real.dtype.kind == 'f':
+        # default to at least double precision cumsum for accuracy
+        dtype = np.promote_types(image.dtype, np.float64)
+
+    S = image.cumsum(axis=0, dtype=dtype)
+    for i in range(1, image.ndim):
+        S.cumsum(axis=i, dtype=dtype, out=S)
     return S
 
 
