@@ -56,7 +56,8 @@ def filter_tile(
 
 
 def svs2tif(input_file, output_folder, tile_size, overlap,
-            num_workers=os.cpu_count(), output_filename="image.tif"):
+            num_workers=os.cpu_count(), compression="jpeg",
+            output_filename="image.tif"):
     output_folder = str(output_folder)
 
     logger.info("Parameters")
@@ -65,7 +66,13 @@ def svs2tif(input_file, output_folder, tile_size, overlap,
     logger.info("        tile size: %d", tile_size)
     logger.info("          overlap: %d", overlap)
     logger.info("      num_workers: %d", num_workers)
+    logger.info("      compression: %s", compression)
     logger.info("  output filename: %s", output_filename)
+
+    if compression == "jpeg":
+        compress = ("jpeg", 95)
+    else:
+        compress = None
 
     with OpenSlide(input_file) as slide:
         properties = slide.properties
@@ -174,7 +181,7 @@ def svs2tif(input_file, output_folder, tile_size, overlap,
                             y_resolution // 2 ** level,
                             resolution_unit,
                         ),
-                        compress=("jpeg", 95),  # requires imagecodecs
+                        compress=compress,  # requires imagecodecs
                         subfiletype=subfiletype,
                     )
                 logger.info("Done.")
