@@ -70,9 +70,9 @@ def svs2tif(input_file, output_folder, tile_size, overlap,
     logger.info("  output filename: %s", output_filename)
 
     if compression == "jpeg":
-        compress = ("jpeg", 95)
+        compression = ("jpeg", 95)
     else:
-        compress = None
+        compression = None
 
     with OpenSlide(input_file) as slide:
         properties = slide.properties
@@ -181,7 +181,7 @@ def svs2tif(input_file, output_folder, tile_size, overlap,
                             y_resolution // 2 ** level,
                             resolution_unit,
                         ),
-                        compress=compress,  # requires imagecodecs
+                        compression=compression,  # requires imagecodecs
                         subfiletype=subfiletype,
                     )
                 logger.info("Done.")
