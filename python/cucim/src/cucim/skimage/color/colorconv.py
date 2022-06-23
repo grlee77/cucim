@@ -127,11 +127,11 @@ def convert_colorspace(arr, fromspace, tospace, *, channel_axis=-1):
 
 
 def _prepare_colorarray(arr, force_copy=False, force_c_contiguous=True,
-                        channel_axis=-1):
+                        channel_axis=-1, expected_channels=3):
     """Check the shape of the array and convert it to
     floating point representation.
     """
-    if arr.shape[channel_axis] != 3:
+    if expected_channels is not None and arr.shape[channel_axis] != expected_channels:
         msg = (f'the input array must have size 3 along `channel_axis`, '
                f'got {arr.shape}')
         raise ValueError(msg)
@@ -1721,6 +1721,25 @@ def _separate_stains_kernel(m):
         name='cucim_skimage_color_seperate_stains')
 
 
+@cp.memoize(for_each_device=True)
+def _separate_stains_kernel_2ch(m):
+    log_adjust = 1 / np.log(1e-6)
+    code = f"""
+    X tmp[3];
+    for (int ch=0; ch<3; ch++)
+    {{
+        tmp[ch] = log(max(rgb[3*i + ch], 1e-6)) * {log_adjust};
+    }}
+    stains[2*i] = tmp[0] * {m[0]} + tmp[1] * {m[2]} + tmp[2] * {m[4]};
+    stains[2*i + 1] = tmp[0] * {m[1]} + tmp[1] * {m[3]} + tmp[2] * {m[5]};
+    """  # noqa
+    return cp.ElementwiseKernel(
+        'raw X rgb',
+        'raw X stains',
+        code,
+        name='cucim_skimage_color_seperate_stains_2ch')
+
+
 @channel_as_last_axis()
 def separate_stains(rgb, conv_matrix, *, channel_axis=-1):
     """RGB to stain color space conversion.
@@ -1787,8 +1806,9 @@ def separate_stains(rgb, conv_matrix, *, channel_axis=-1):
     rgb = _prepare_colorarray(rgb, force_c_contiguous=True,
                               channel_axis=channel_axis)
 
-    if conv_matrix.shape != (3, 3):
-        raise ValueError("conv_matrix must have shape (3, 3)")
+    if conv_matrix.shape != (3, 3) and conv_matrix.shape != (3, 2):
+        raise ValueError("conv_matrix must have shape (3, 3) or (3, 2)")
+    n_ch = conv_matrix.shape[-1]
     conv_matrix = tuple(cp.asnumpy(conv_matrix).ravel())
 
     # #cp.maximum(rgb, 1e-6, out=rgb)  # avoiding log artifacts
@@ -1797,8 +1817,12 @@ def separate_stains(rgb, conv_matrix, *, channel_axis=-1):
     # conv_matrix = cp.asarray(conv_matrix, dtype=rgb.dtype)
     # stains = (cp.log(rgb) / log_adjust) @ conv_matrix
 
-    kern = _separate_stains_kernel(conv_matrix)
-    stains = cp.empty_like(rgb)
+    if n_ch == 2:
+        kern = _separate_stains_kernel_2ch(conv_matrix)
+        stains = cp.empty_like(rgb[..., :2], order='C')  #  TODO: remove assumption that last axis is channels
+    elif n_ch == 3:
+        kern = _separate_stains_kernel(conv_matrix)
+        stains = cp.empty_like(rgb)
     kern(rgb, stains, size=rgb.size // 3)
     cp.maximum(stains, 0, out=stains)
     return stains
@@ -1829,6 +1853,34 @@ def _combine_stains_kernel(m):
         'raw X rgb',
         code,
         name='cucim_skimage_color_combine_stains')
+
+
+
+@cp.memoize(for_each_device=True)
+def _combine_stains_kernel_2ch(m):
+    # log_adjust here is used to compensate the sum within separate_stains()
+    log_adjust = np.log(1e-6)
+    code = f"""
+    X tmp[2];
+    for (int ch=0; ch<2; ch++)
+    {{
+        tmp[ch] = stains[2*i + ch] * {log_adjust};
+    }}
+
+    rgb[3*i] = tmp[0] * {m[0]} + tmp[1] * {m[3]};
+    rgb[3*i + 1] = tmp[0] * {m[1]} + tmp[1] * {m[4]};
+    rgb[3*i + 2] = tmp[0] * {m[2]} + tmp[1] * {m[5]};
+
+    for (int ch=0; ch<3; ch++)
+    {{
+        rgb[3*i + ch] = min(max(exp(rgb[3*i + ch]), (X)0.0), (X)1.0);
+    }}
+    """  # noqa
+    return cp.ElementwiseKernel(
+        'raw X stains',
+        'raw X rgb',
+        code,
+        name='cucim_skimage_color_combine_stains_2ch')
 
 
 @channel_as_last_axis()
@@ -1892,15 +1944,21 @@ def combine_stains(stains, conv_matrix, *, channel_axis=-1):
     >>> ihc_rgb = combine_stains(ihc_hdx, rgb_from_hdx)
     """  # noqa
     stains = _prepare_colorarray(stains, force_c_contiguous=True,
-                                 channel_axis=channel_axis)
+                                 channel_axis=channel_axis,
+                                 expected_channels=None)
 
-    if conv_matrix.shape != (3, 3):
-        raise ValueError("conv_matrix must have shape (3, 3)")
+    if conv_matrix.shape != (3, 3) and conv_matrix.shape != (2, 3):
+        raise ValueError("conv_matrix must have shape (3, 3) or (2, 3)")
+    n_ch = conv_matrix.shape[0]
     conv_matrix = tuple(cp.asnumpy(conv_matrix).ravel())
 
-    kern = _combine_stains_kernel(conv_matrix)
-    rgb = cp.empty_like(stains)
-    kern(stains, rgb, size=stains.size // 3)
+    if n_ch == 2:
+        kern = _combine_stains_kernel_2ch(conv_matrix)
+        rgb = cp.empty(stains.shape[:-1] + (3,), dtype=stains.dtype)  # TODO: remove channel_axis = -1 assumption here
+    elif n_ch == 3:
+        kern = _combine_stains_kernel(conv_matrix)
+        rgb = cp.empty_like(stains)
+    kern(stains, rgb, size=rgb.size // 3)
 
     return rgb
 
