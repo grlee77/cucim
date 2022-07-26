@@ -2,6 +2,7 @@ from .._shared.utils import deprecated
 from ._basic_features import multiscale_basic_features
 from ._canny import canny
 from ._daisy import daisy
+from .brief import BRIEF
 from .corner import (corner_foerstner, corner_harris, corner_kitchen_rosenfeld,
                      corner_peaks, corner_shi_tomasi, hessian_matrix,
                      hessian_matrix_det, hessian_matrix_eigvals, shape_index,
@@ -61,5 +62,6 @@ __all__ = ['canny',
            # 'corner_fast',
            # 'corner_orientations',
            'match_template',
+           'BRIEF',
            'register_translation',
            'masked_register_translation']

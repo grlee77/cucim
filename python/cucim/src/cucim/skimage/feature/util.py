@@ -4,6 +4,25 @@ from .._shared.utils import _supported_float_type, check_nD
 from ..util import img_as_float
 
 
+class DescriptorExtractor(object):
+
+    def __init__(self):
+        self.descriptors_ = cp.array([])
+
+    def extract(self, image, keypoints):
+        """Extract feature descriptors in image for given keypoints.
+
+        Parameters
+        ----------
+        image : 2D array
+            Input image.
+        keypoints : (N, 2) array
+            Keypoint locations as ``(row, col)``.
+
+        """
+        raise NotImplementedError()
+
+
 def _prepare_grayscale_input_2D(image):
     image = cp.squeeze(image)
     check_nD(image, 2)
@@ -25,7 +44,7 @@ def _fused_mask_border(distance, rows, cols, k0, k1):
     mask = (distance - 1) < k0
     mask &= k0 < (rows - distance + 1)
     mask &= (distance - 1) < k1
-    mask &= k1 < (cols - distance + 1)
+    mask &= k1z < (cols - distance + 1)
     return mask
 
 
