@@ -20,6 +20,15 @@ def _prepare_grayscale_input_nD(image):
     return image.astype(float_dtype, copy=False)
 
 
+@cp.fuse()
+def _fused_mask_border(distance, rows, cols, k0, k1):
+    mask = (distance - 1) < k0
+    mask &= k0 < (rows - distance + 1)
+    mask &= (distance - 1) < k1
+    mask &= k1 < (cols - distance + 1)
+    return mask
+
+
 def _mask_border_keypoints(image_shape, keypoints, distance):
     """Mask coordinates that are within certain distance from the image border.
 
@@ -43,11 +52,6 @@ def _mask_border_keypoints(image_shape, keypoints, distance):
     rows = image_shape[0]
     cols = image_shape[1]
 
-    mask = (
-        ((distance - 1) < keypoints[:, 0])
-        & (keypoints[:, 0] < (rows - distance + 1))
-        & ((distance - 1) < keypoints[:, 1])
-        & (keypoints[:, 1] < (cols - distance + 1))
+    return _fused_mask_border(
+        distance, rows, cols, keypoints[:, 0], keypoints[:, 1]
     )
-
-    return mask
