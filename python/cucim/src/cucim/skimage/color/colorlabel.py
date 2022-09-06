@@ -36,7 +36,9 @@ def _rgb_vector(color):
     return np.asarray(color[:3])  # CuPy Backend: leave this array on the host
 
 
-def _match_label_with_color(label, colors, bg_label, bg_color):
+def _match_label_with_color(
+    label, colors, bg_label, bg_color, bg_label_is_first
+):
     """Return `unique_labels` and `color_cycle` for label array and color list.
 
     Colors are cycled for normal labels, but the background color should only
@@ -49,25 +51,42 @@ def _match_label_with_color(label, colors, bg_label, bg_color):
 
     # map labels to their ranks among all labels from small to large
     unique_labels, mapped_labels = cp.unique(label, return_inverse=True)
+    n_unique = unique_labels.size
 
-    # get rank of bg_label
-    bg_label_rank_list = mapped_labels[label.ravel() == bg_label]
+    # n_unique + 1 in case bg_label wasn't present within label
+    new_type = np.min_scalar_type(n_unique + 1)
+    mapped_labels = mapped_labels.astype(label.dtype, copy=False)
 
-    # The rank of each label is the index of the color it is matched to in
-    # color cycle. bg_label should always be mapped to the first color, so
-    # its rank must be 0. Other labels should be ranked from small to large
-    # from 1.
-    if len(bg_label_rank_list) > 0:
-        bg_label_rank = bg_label_rank_list[0]
-        mapped_labels[mapped_labels < bg_label_rank] += 1
-        mapped_labels[label.ravel() == bg_label] = 0
-    else:
+    has_bg_pixels = True
+    if bg_label_is_first and not cp.any(label.ravel() == bg_label):
+        # If bg_label was not present at time of cp.unique call,
+        # need to increment by 1
         mapped_labels += 1
+        n_unique += 1
+        has_bg_pixels = False
+    else:
+        # get rank of bg_label
+        bg_mask = label.ravel() == bg_label
+        bg_label_rank_list = mapped_labels[bg_mask]
+
+        # The rank of each label is the index of the color it is matched to in
+        # color cycle. bg_label should always be mapped to the first color, so
+        # its rank must be 0. Other labels should be ranked from small to large
+        # from 1.
+        if len(bg_label_rank_list) > 0:
+            bg_label_rank = bg_label_rank_list[0]
+            if bg_label_rank > 0:
+                mapped_labels[mapped_labels < bg_label_rank] += 1
+                mapped_labels[bg_mask] = 0
+        else:
+            mapped_labels += 1
+            n_unique += 1
+            has_bg_pixels = False
 
     # Modify labels and color cycle so background color is used only once.
     color_cycle = itertools.cycle(colors)
     color_cycle = itertools.chain([bg_color], color_cycle)
-    return mapped_labels, color_cycle
+    return mapped_labels, color_cycle, n_unique, has_bg_pixels
 
 
 def label2rgb(label, image=None, colors=None, alpha=0.3,
@@ -175,7 +194,6 @@ def _label2rgb_overlay(label, image=None, colors=None, alpha=0.3,
     colors = [_rgb_vector(c) for c in colors]
 
     if image is None:
-        image = cp.zeros(label.shape + (3,), dtype=np.float64)
         # Opacity doesn't make sense if no image exists.
         alpha = 1
     else:
@@ -203,23 +221,31 @@ def _label2rgb_overlay(label, image=None, colors=None, alpha=0.3,
 
     # Ensure that all labels are non-negative so we can index into
     # `label_to_color` correctly.
-    offset = min(int(label.min()), bg_label)
+
+    # Note: mapping to int -> device synchronize
+    min_label, max_label = map(int, (label.min(), label.max()))
+    bg_label_is_first = min_label == bg_label
+    min_label = min(min_label, bg_label)
+    max_label = max(max_label, bg_label)
+
+    offset = min_label
     if offset != 0:
         label = label - offset  # Make sure you don't modify the input array.
         bg_label -= offset
+        max_label -= offset
 
-    new_type = np.min_scalar_type(int(label.max()))
+    new_type = np.min_scalar_type(max_label)
     if new_type == bool:
         new_type = np.uint8
-    label = label.astype(new_type)
+    label = label.astype(new_type, copy=False)
 
-    mapped_labels_flat, color_cycle = _match_label_with_color(
-        label, colors, bg_label, bg_color)
+    mapped_labels_flat, color_cycle, n_unique, has_bg_pixels = _match_label_with_color(
+        label, colors, bg_label, bg_color, bg_label_is_first)
 
     if len(mapped_labels_flat) == 0:
         return image
 
-    dense_labels = range(int(mapped_labels_flat.max()) + 1)
+    dense_labels = range(n_unique)
 
     # CuPy Backend: small color_cycle arrays are left on the CPU
     label_to_color = np.stack([c for i, c in zip(dense_labels, color_cycle)])
@@ -228,12 +254,26 @@ def _label2rgb_overlay(label, image=None, colors=None, alpha=0.3,
 
     mapped_labels = mapped_labels_flat.reshape(label.shape)
     label = mapped_labels
-    result = label_to_color[mapped_labels] * alpha + image * (1 - alpha)
+
+
+    if alpha == 1.0:
+        result = label_to_color[mapped_labels]
+    else:
+
+        @cp.fuse()
+        def _merge_images(overlay, image, alpha):
+            return overlay * alpha + image * (1 - alpha)
+
+        result = _merge_images(label_to_color[mapped_labels], image, alpha)
 
     # Remove background label if its color was not specified.
-    remove_background = 0 in mapped_labels_flat and bg_color is None
+
+    remove_background = bg_color is None and has_bg_pixels
     if remove_background:
-        result[label == bg_label] = image[label == bg_label]
+        if image is None:
+            result[label == bg_label] = 0
+        else:
+            result[label == bg_label] = image[label == bg_label]
 
     return result
 
