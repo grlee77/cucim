@@ -1975,16 +1975,6 @@ def lab2lch(lab, *, channel_axis=-1):
     return lab
 
 
-def _cart2polar_2pi(x, y):
-    """convert cartesian coordinates to polar (uses non-standard theta range!)
-
-    NON-STANDARD RANGE! Maps to ``(0, 2*pi)`` rather than usual ``(-pi, +pi)``
-    """
-    r, t = cp.hypot(x, y), cp.arctan2(y, x)
-    t += cp.where(t < 0., 2 * np.pi, 0)
-    return r, t
-
-
 @cp.memoize(for_each_device=True)
 def _lch2lab_kernel(nchannels=3, name='lch2lab'):
     code = f"""

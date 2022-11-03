@@ -24,7 +24,7 @@ import cupy as cp
 import numpy as np
 
 from .._shared.utils import _supported_float_type
-from .colorconv import _cart2polar_2pi, lab2lch
+from .colorconv import lab2lch
 
 
 def _float_inputs(lab1, lab2, allow_float32=True):
@@ -35,6 +35,22 @@ def _float_inputs(lab1, lab2, allow_float32=True):
     lab1 = lab1.astype(float_dtype, copy=False)
     lab2 = lab2.astype(float_dtype, copy=False)
     return lab1, lab2
+
+
+@cp.memoize()
+def _get_cie76_kernel():
+
+    return cp.ElementwiseKernel(
+        in_params='F L1, F a1, F b1, F L2, F a2, F b2',
+        out_params='F out',
+        operation="""
+            out = (L2 - L1) * (L2 - L1);
+            out += (a2 - a1) * (a2 - a1);
+            out += (b2 - b1) * (b2 - b1);
+            out = sqrt(out);
+        """,
+        name='cucim_skimage_cie76'
+    )
 
 
 def deltaE_cie76(lab1, lab2, channel_axis=-1):
@@ -64,10 +80,37 @@ def deltaE_cie76(lab1, lab2, channel_axis=-1):
     lab1, lab2 = _float_inputs(lab1, lab2, allow_float32=True)
     L1, a1, b1 = cp.moveaxis(lab1, source=channel_axis, destination=0)[:3]
     L2, a2, b2 = cp.moveaxis(lab2, source=channel_axis, destination=0)[:3]
-    out = (L2 - L1) * (L2 - L1)
-    out += (a2 - a1) * (a2 - a1)
-    out += (b2 - b1) * (b2 - b1)
-    return cp.sqrt(out, out=out)
+    kernel = _get_cie76_kernel()
+    out = cp.empty_like(L1)
+    return kernel(L1, a1, b1, L2, a2, b2, out)
+
+
+@cp.memoize()
+def _get_ciede94_kernel():
+
+    return cp.ElementwiseKernel(
+        in_params='F L1, F C1, F k1, F L2, F C2, F k2, F dH2, float64 kL, float64 kC, float64 kH',  # noqa
+        out_params='F out',
+        operation="""
+            F dL = L1 - L2;
+            F dC = C1 - C2;
+
+            F SC = 1 + k1 * C1;
+            F SH = 1 + k2 * C1;
+
+            out = dL / kL;
+            out *= out;
+            F tmp = dC / (kC * SC);
+            tmp *= tmp;
+            out += tmp;
+            tmp = kH * SH;
+            tmp *= tmp;
+            out += dH2 / tmp;
+            out = max(out, static_cast<F>(0));
+            out = sqrt(out);
+        """,
+        name='cucim_skimage_ciede94'
+    )
 
 
 def deltaE_ciede94(lab1, lab2, kH=1, kC=1, kL=1, k1=0.045, k2=0.015, *,
@@ -131,23 +174,154 @@ def deltaE_ciede94(lab1, lab2, kH=1, kC=1, kL=1, k1=0.045, k2=0.015, *,
     L1, C1 = lab2lch(lab1, channel_axis=0)[:2]
     L2, C2 = lab2lch(lab2, channel_axis=0)[:2]
 
-    dL = L1 - L2
-    dC = C1 - C2
     dH2 = get_dH2(lab1, lab2, channel_axis=0)
 
-    SL = 1
-    SC = 1 + k1 * C1
-    SH = 1 + k2 * C1
+    out = cp.empty_like(L1)
+    kernel = _get_ciede94_kernel()
+    return kernel(L1, C1, k1, L2, C2, k2, dH2, kL, kC, kH, out)
 
-    dE2 = dL / (kL * SL)
-    dE2 *= dE2
-    tmp = dC / (kC * SC)
-    tmp *= tmp
-    dE2 += tmp
-    tmp = kH * SH
-    tmp *= tmp
-    dE2 += dH2 / tmp
-    return cp.sqrt(cp.maximum(dE2, 0, out=dE2), out=dE2)
+
+@cp.memoize()
+def _get_ciede2000_kernel():
+
+    return cp.ElementwiseKernel(
+        in_params='F L1, F C1, F k1, F L2, F C2, F k2, F dH2, float64 kL, float64 kC, float64 kH',  # noqa
+        out_params='F out',
+        operation="""
+            F dL = L1 - L2;
+            F dC = C1 - C2;
+
+            F SC = 1 + k1 * C1;
+            F SH = 1 + k2 * C1;
+
+            out = dL / kL;
+            out *= out;
+            F tmp = dC / (kC * SC);
+            tmp *= tmp;
+            out += tmp;
+            tmp = kH * SH;
+            tmp *= tmp;
+            out += dH2 / tmp;
+            out = max(out, static_cast<F>(0));
+            out = sqrt(out);
+        """,
+        name='cucim_skimage_ciede2000'
+    )
+
+
+@cp.memoize()
+def _get_ciede2000_kernel():
+
+    return cp.ElementwiseKernel(
+        in_params='F L1, F a1, F b1, F L2, F a2, F b2, float64 kL, float64 kC, float64 kH',  # noqa
+        out_params='W out',
+        operation="""
+
+        // magnitude of (a, b) is the chroma
+        // note: pow(25.0, 7.0) = 6103515625.0
+        F Cbar, c7, scale;
+        Cbar = 0.5 * (hypot(a1, b1) + hypot(a2, b2));
+        c7 = pow(Cbar, static_cast<F>(7.0));
+        scale = 0.5 * (1 - sqrt(c7 / (c7 + 6103515625.0)));
+        scale += 1.0;
+
+        // convert cartesian coordinates to polar (non-standard theta range!)
+        // uses [0, 2*M_PI] instead of [-M_PI, M_PI]
+        F h1, h2, C1, C2;
+        C1 = hypot(a1 * scale, b1);
+        h1 = atan2(b1, a1 * scale);
+        if (h1 < 0) {
+          h1 += 2 * M_PI;
+        }
+        C2 = hypot(a2 * scale, b2);
+        h2 = atan2(b2, a2 * scale);
+        if (h2 < 0) {
+          h2 += 2 * M_PI;
+        }
+
+        // lightness term
+        F tmpL, SL, L_term;
+        tmpL = 0.5 * (L1 + L2) - 50;
+        tmpL *= tmpL;
+        SL = 1.0 + 0.015 * tmpL / sqrt(20.0 + tmpL);
+        L_term = (L2 - L1) / (kL * SL);
+
+        // chroma term
+        F SC, C_term;
+        Cbar = 0.5 * (C1 + C2);  // new coordiantes
+        SC = 1 + 0.045 * Cbar;
+        C_term = (C2 - C1) / (kC * SC);
+
+        // hue term
+        F h_diff, h_sum, CC;
+        h_diff = h2 - h1;
+        h_sum = h1 + h2;
+        CC = C1 * C2;
+
+        F dH, dH_term;
+        dH = h_diff;
+        if (CC == 0.) {
+            dH = 0.;  // if r == 0, dtheta == 0
+        } else {
+            if (h_diff > M_PI) {
+                dH -= 2 * M_PI;
+            } else if (h_diff < -M_PI) {
+                dH += 2 * M_PI;
+            }
+        }
+        dH_term = 2 * sqrt(CC) * sin(dH / 2);
+
+        F Hbar;
+        Hbar = h_sum;
+        if (CC == 0.0) {
+            Hbar *= 2.0;
+        } else if (abs(h_diff) > M_PI) {
+            if (h_sum < 2 * M_PI) {
+                Hbar += 2 * M_PI;
+            } else if (h_sum >= 2 * M_PI) {
+                Hbar -= 2 * M_PI;
+            }
+        }
+        Hbar *= 0.5;
+
+        F SH, H_term;
+        F rad30 = 0.5235987755982988;
+        F rad6 = 0.10471975511965978;
+        F rad63 = 1.0995574287564276;
+        SH = (1.0 -
+              0.17 * cos(Hbar - rad30) +
+              0.24 * cos(2.0 * Hbar) +
+              0.32 * cos(3.0 * Hbar + rad6) -
+              0.20 * cos(4.0 * Hbar - rad63));
+        SH *= 0.015 * Cbar;
+        SH += 1.0;
+        H_term = dH_term / (kH * SH);
+
+        // hue rotation
+        F Rc, tmp, dtheta;
+        // note: pow(25.0, 7.0) = 6103515625.0
+        // recall that c, h are polar coordiantes.  c==r, h==theta
+
+        F R_term;
+        c7 = pow(Cbar, static_cast<F>(7.0));
+        Rc = 2.0 * sqrt(c7 / (c7 + 6103515625.0));
+        tmp = (Hbar * 180.0 / M_PI - 275.0) / 25.0;
+        tmp *= tmp;
+        dtheta = rad30 * exp(-tmp);
+        R_term = -sin(2 * dtheta) * Rc * C_term * H_term;
+
+        // put it all together
+        F dE2;
+        dE2 = L_term * L_term;
+        dE2 += C_term * C_term;
+        dE2 += H_term * H_term;
+        dE2 += R_term;
+        dE2 = max(dE2, 0.0);
+        out = sqrt(dE2);
+
+        """,
+        name='cucim_skimage_ciede2000_kernel'
+    )
 
 
 def deltaE_ciede2000(lab1, lab2, kL=1, kC=1, kH=1, *, channel_axis=-1):
@@ -191,7 +365,7 @@ def deltaE_ciede2000(lab1, lab2, kL=1, kC=1, kH=1, *, channel_axis=-1):
     .. [3] M. Melgosa, J. Quesada, and E. Hita, "Uniformity of some recent
            color metrics tested with an accurate color-difference tolerance
            dataset," Appl. Opt. 33, 8069-8077 (1994).
-    """
+    """  # noqa
     lab1, lab2 = _float_inputs(lab1, lab2, allow_float32=True)
     warnings.warn(
         "The numerical accuracy of this function on the GPU is reduced "
@@ -209,81 +383,67 @@ def deltaE_ciede2000(lab1, lab2, kL=1, kC=1, kH=1, *, channel_axis=-1):
     L1, a1, b1 = cp.moveaxis(lab1, source=channel_axis, destination=0)[:3]
     L2, a2, b2 = cp.moveaxis(lab2, source=channel_axis, destination=0)[:3]
 
-    # distort `a` based on average chroma
-    # then convert to lch coordines from distorted `a`
-    # all subsequence calculations are in the new coordiantes
-    # (often denoted "prime" in the literature)
-    Cbar = 0.5 * (cp.hypot(a1, b1) + cp.hypot(a2, b2))
-    c7 = Cbar ** 7
-    G = 0.5 * (1 - cp.sqrt(c7 / (c7 + 25 ** 7)))
-    scale = 1 + G
-    C1, h1 = _cart2polar_2pi(a1 * scale, b1)
-    C2, h2 = _cart2polar_2pi(a2 * scale, b2)
-    # recall that c, h are polar coordiantes.  c==r, h==theta
-
     # cide2000 has four terms to delta_e:
     # 1) Luminance term
     # 2) Hue term
     # 3) Chroma term
     # 4) hue Rotation term
 
-    # lightness term
-    Lbar = 0.5 * (L1 + L2)
-    tmp = Lbar - 50
-    tmp *= tmp
-    SL = 1 + 0.015 * tmp / cp.sqrt(20 + tmp)
-    L_term = (L2 - L1) / (kL * SL)
+    # core computation
+    dE2 = cp.empty_like(L1)
+    kernel = _get_ciede2000_kernel()
+    kernel(L1, a1, b1, L2, a2, b2, kL, kC, kH, dE2)
 
-    # chroma term
-    Cbar = 0.5 * (C1 + C2)  # new coordiantes
-    SC = 1 + 0.045 * Cbar
-    C_term = (C2 - C1) / (kC * SC)
-
-    # hue term
-    h_diff = h2 - h1
-    h_sum = h1 + h2
-    CC = C1 * C2
-
-    dH = h_diff.copy()
-    dH[h_diff > np.pi] -= 2 * np.pi
-    dH[h_diff < -np.pi] += 2 * np.pi
-    dH[CC == 0.] = 0.  # if r == 0, dtheta == 0
-    dH_term = 2 * cp.sqrt(CC) * cp.sin(dH / 2)
-
-    Hbar = h_sum.copy()
-    mask = cp.logical_and(CC != 0., cp.abs(h_diff) > np.pi)
-    Hbar[mask * (h_sum < 2 * np.pi)] += 2 * np.pi
-    Hbar[mask * (h_sum >= 2 * np.pi)] -= 2 * np.pi
-    Hbar[CC == 0.] *= 2
-    Hbar *= 0.5
-
-    T = (1 -
-         0.17 * cp.cos(Hbar - np.deg2rad(30)) +
-         0.24 * cp.cos(2 * Hbar) +
-         0.32 * cp.cos(3 * Hbar + np.deg2rad(6)) -
-         0.20 * cp.cos(4 * Hbar - np.deg2rad(63))
-         )
-    SH = 1 + 0.015 * Cbar * T
-
-    H_term = dH_term / (kH * SH)
-
-    # hue rotation
-    c7 = Cbar ** 7
-    Rc = 2 * cp.sqrt(c7 / (c7 + 25 ** 7))
-    tmp = (cp.rad2deg(Hbar) - 275) / 25
-    tmp *= tmp
-    dtheta = np.deg2rad(30) * cp.exp(-tmp)
-    R_term = -cp.sin(2 * dtheta) * Rc * C_term * H_term
-
-    # put it all together
-    dE2 = L_term * L_term
-    dE2 += C_term * C_term
-    dE2 += H_term * H_term
-    dE2 += R_term
-    cp.sqrt(cp.maximum(dE2, 0, out=dE2), out=dE2)
     if unroll:
         dE2 = dE2[0]
     return dE2
+
+
+@cp.memoize()
+def _get_cmc_kernel():
+
+    return cp.ElementwiseKernel(
+        in_params='F L1, F C1, F L2, F C2, F h1, F dH2, float64 kL, float64 kC',  # noqa
+        out_params='F dE2',
+        operation="""
+
+        F dC, dL, T, c1_4, f, SL, SC, SH_sq, tmp;
+        F deg2rad164 = 2.8623399732707004;
+        F deg2rad345 = 6.021385919380437;
+
+        dC = C1 - C2;
+        dL = L1 - L2;
+        if ((h1 >= deg2rad164) && (h1 <= deg2rad345)) {
+            // deg2rad(168) = 2.9321531433504737
+            T = 0.56 + 0.2 * abs(cos(h1 + static_cast<F>(2.9321531433504737)));
+        } else {
+            // deg2rad(35) = 0.6108652381980153
+            T = 0.36 + 0.4 * abs(cos(h1 + static_cast<F>(0.6108652381980153)));
+        }
+        c1_4 = C1 * C1;
+        c1_4 *= c1_4;
+        f = sqrt(c1_4 / (c1_4 + 1900.0));
+
+        if (L1 < 16) {
+            SL = 0.511;
+        } else {
+            SL = 0.040975 * L1 / (1.0 + 0.01765 * L1);
+        }
+        SC = 0.638 + 0.0638 * C1 / (1.0 + 0.0131 * C1);
+        SH_sq = SC * (f * T + 1.0 - f);
+        SH_sq *= SH_sq;
+
+        dE2 = (dL / (kL * SL));
+        dE2 *= dE2;
+        tmp = (dC / (kC * SC));
+        tmp *= tmp;
+        dE2 += tmp;
+        dE2 += dH2 / SH_sq;
+        dE2 = max(dE2, 0.0);
+        dE2 = sqrt(dE2);
+        """,
+        name='cucim_skimage_cmc_kernel'
+    )
 
 
 def deltaE_cmc(lab1, lab2, kL=1, kC=1, *, channel_axis=-1):
@@ -334,25 +494,35 @@ def deltaE_cmc(lab1, lab2, kL=1, kC=1, *, channel_axis=-1):
     L1, C1, h1 = lab2lch(lab1, channel_axis=0)[:3]
     L2, C2, h2 = lab2lch(lab2, channel_axis=0)[:3]
 
-    dC = C1 - C2
-    dL = L1 - L2
     dH2 = get_dH2(lab1, lab2, channel_axis=0)
 
-    T = cp.where(cp.logical_and(cp.rad2deg(h1) >= 164, cp.rad2deg(h1) <= 345),
-                 0.56 + 0.2 * cp.abs(np.cos(h1 + cp.deg2rad(168))),
-                 0.36 + 0.4 * cp.abs(np.cos(h1 + cp.deg2rad(35)))
-                 )
-    c1_4 = C1 ** 4
-    F = cp.sqrt(c1_4 / (c1_4 + 1900))
+    dE2 = cp.zeros_like(L1)
+    kernel = _get_cmc_kernel()
+    kernel(L1, C1, L2, C2, h1, dH2, kL, kC, dE2)
 
-    SL = cp.where(L1 < 16, 0.511, 0.040975 * L1 / (1. + 0.01765 * L1))
-    SC = 0.638 + 0.0638 * C1 / (1. + 0.0131 * C1)
-    SH = SC * (F * T + 1 - F)
+    return dE2
 
-    dE2 = (dL / (kL * SL)) ** 2
-    dE2 += (dC / (kC * SC)) ** 2
-    dE2 += dH2 / (SH ** 2)
-    return cp.sqrt(cp.maximum(dE2, 0, out=dE2), out=dE2)
+
+@cp.memoize()
+def _get_dH2_kernel():
+
+    return cp.ElementwiseKernel(
+        in_params='F a1, F b1, F a2, F b2',  # noqa
+        out_params='G out',
+        operation="""
+        // magnitude of (a, b) is the chroma
+        double C1 = hypot(a1, b1);
+        double C2 = hypot(a2, b2);
+
+        // have to keep double here for out_temp for accuracy
+        double out_temp = C1 * C2;
+        out_temp -= a1 * a2;
+        out_temp -= b1 * b2;
+        out_temp *= 2;
+        out = out_temp;
+        """,
+        name='cucim_skimage_ciede2000'
+    )
 
 
 def get_dH2(lab1, lab2, *, channel_axis=-1):
@@ -374,19 +544,11 @@ def get_dH2(lab1, lab2, *, channel_axis=-1):
         2*|ab1|*|ab2| - 2*dot(ab1, ab2)
     """
     # This function needs double precision internally for accuracy
-    input_is_float_32 = _supported_float_type(
-        [lab1.dtype, lab2.dtype]
-    ) == cp.float32
+    float_dtype = _supported_float_type([lab1.dtype, lab2.dtype])
     lab1, lab2 = _float_inputs(lab1, lab2, allow_float32=False)
     a1, b1 = cp.moveaxis(lab1, source=channel_axis, destination=0)[1:3]
     a2, b2 = cp.moveaxis(lab2, source=channel_axis, destination=0)[1:3]
 
-    # magnitude of (a, b) is the chroma
-    C1 = cp.hypot(a1, b1)
-    C2 = cp.hypot(a2, b2)
-
-    term = (C1 * C2) - (a1 * a2 + b1 * b2)
-    out = 2 * term
-    if input_is_float_32:
-        out = out.astype(np.float32)
-    return out
+    out = cp.empty(a1.shape, dtype=float_dtype)
+    kernel = _get_dH2_kernel()
+    return kernel(a1, b1, a2, b2, out)
