@@ -109,6 +109,11 @@ def normalized_root_mse(image_true, image_test, *, normalization='euclidean'):
     return cp.sqrt(mean_squared_error(image_true, image_test)) / denom
 
 
+@cp.fuse()
+def _psnr_fused(data_range, err):
+    return 10 * cp.log10((data_range * data_range) / err)
+
+
 def peak_signal_noise_ratio(image_true, image_test, *, data_range=None):
     """
     Compute the peak signal to noise ratio (PSNR) for an image.
@@ -161,7 +166,7 @@ def peak_signal_noise_ratio(image_true, image_test, *, data_range=None):
     image_true, image_test = _as_floats(image_true, image_test)
 
     err = mean_squared_error(image_true, image_test)
-    return 10 * cp.log10((data_range * data_range) / err)
+    return _psnr_fused(data_range, err)
 
 
 def _pad_to(arr, shape):
@@ -257,8 +262,7 @@ def normalized_mutual_information(image0, image1, *, bins=100):
         density=True,
     )
 
-    H0 = entropy(cp.sum(hist, axis=0))
-    H1 = entropy(cp.sum(hist, axis=1))
-    H01 = entropy(cp.reshape(hist, -1))
-
-    return (H0 + H1) / H01
+    out = entropy(cp.sum(hist, axis=0))   # H0
+    out += entropy(cp.sum(hist, axis=1))  # H1
+    out /= entropy(cp.reshape(hist, -1))  # H01
+    return out
