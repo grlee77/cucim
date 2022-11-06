@@ -521,7 +521,7 @@ def _get_dH2_kernel():
         out_temp *= 2;
         out = out_temp;
         """,
-        name='cucim_skimage_ciede2000'
+        name='cucim_skimage_dH2'
     )
 
 
