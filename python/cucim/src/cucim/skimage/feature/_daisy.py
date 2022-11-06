@@ -8,6 +8,20 @@ from .._shared.filters import gaussian
 from .._shared.utils import check_nD
 
 
+@cp.memoize()
+def _get_daisy_grad_kernel():
+    return cp.ElementwiseKernel(
+        in_params='F dx, F dy',
+        out_params='F grad_mag, F grad_ori',
+        operation="""
+        grad_mag = dx * dx;
+        grad_mag += dy * dy;
+        grad_mag = sqrt(grad_mag);
+        grad_ori = atan2(dy, dx);
+        """,
+        name='cucim_skimage_feature_daisy_grad')
+
+
 def daisy(image, step=4, radius=15, rings=3, histograms=8, orientations=8,
           normalization='l1', sigmas=None, ring_radii=None, visualize=False):
     """Extract DAISY feature descriptors densely for the given image.
@@ -125,10 +139,11 @@ def daisy(image, step=4, radius=15, rings=3, histograms=8, orientations=8,
 
     # Compute gradient orientation and magnitude and their contribution
     # to the histograms
-    grad_mag = dx * dx
-    grad_mag += dy * dy
-    cp.sqrt(grad_mag, out=grad_mag)
-    grad_ori = cp.arctan2(dy, dx)
+    grad_mag = cp.empty_like(dx)
+    grad_ori = cp.empty_like(dy)
+    kernel = _get_daisy_grad_kernel()
+    kernel(dx, dy, grad_mag, grad_ori)
+
     pi = cp.pi
     orientation_kappa = orientations / pi
     orientation_angles = [2 * o * pi / orientations - pi
