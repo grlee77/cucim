@@ -274,7 +274,7 @@ class RegionProperties:
     """
 
     def __init__(self, slice, label, label_image, intensity_image,
-                 cache_active, *, extra_properties=None):
+                 cache_active, *, extra_properties=None, order=3):
 
         if intensity_image is not None:
             ndim = label_image.ndim
@@ -287,6 +287,7 @@ class RegionProperties:
             multichannel = False
 
         self.label = label
+        self.order = order
 
         self._slice = slice
         self.slice = slice
@@ -535,14 +536,14 @@ class RegionProperties:
     @property
     @_cached
     def moments(self):
-        M = _moments.moments(self.image.astype(cp.uint8), 3)
+        M = _moments.moments(self.image.astype(cp.uint8), self.order)
         return M
 
     @property
     @_cached
     def moments_central(self):
         mu = _moments.moments_central(self.image.astype(cp.uint8),
-                                      self.centroid_local, order=3)
+                                      self.centroid_local, order=self.order)
         return mu
 
     @property
@@ -553,7 +554,7 @@ class RegionProperties:
     @property
     @_cached
     def moments_normalized(self):
-        return _moments.moments_normalized(self.moments_central, 3)
+        return _moments.moments_normalized(self.moments_central, self.order)
 
     @property
     @only2d
@@ -599,12 +600,12 @@ class RegionProperties:
         image = self._image_intensity_double()
         if self._multichannel:
             moments = cp.stack(
-                [_moments.moments(image[..., i], order=3)
+                [_moments.moments(image[..., i], order=self.order)
                     for i in range(image.shape[-1])],
                 axis=-1
             )
         else:
-            moments = _moments.moments(image, order=3)
+            moments = _moments.moments(image, order=self.order)
         return moments
 
     @property
@@ -615,13 +616,13 @@ class RegionProperties:
         if self._multichannel:
             moments_list = [
                 _moments.moments_central(
-                    image[..., i], center=ctr[..., i], order=3
+                    image[..., i], center=ctr[..., i], order=self.order
                 )
                 for i in range(image.shape[-1])
             ]
             moments = cp.stack(moments_list, axis=-1)
         else:
-            moments = _moments.moments_central(image, ctr, order=3)
+            moments = _moments.moments_central(image, ctr, order=self.order)
         return moments
 
     @property
@@ -644,13 +645,14 @@ class RegionProperties:
         if self._multichannel:
             nchannels = self._intensity_image.shape[-1]
             return cp.stack(
-                [_moments.moments_normalized(mu[..., i], order=3)
+                [_moments.moments_normalized(mu[..., i], order=self.order)
                  for i in range(nchannels)],
                 axis=-1,
             )
         else:
-            return _moments.moments_normalized(mu, order=3)
-        return _moments.moments_normalized(self.moments_weighted_central, 3)
+            return _moments.moments_normalized(mu, order=self.order)
+        return _moments.moments_normalized(self.moments_weighted_central,
+                                           self.order)
 
     def __iter__(self):
         props = PROP_VALS
@@ -860,7 +862,8 @@ def _props_to_dict(regions, properties=('label', 'bbox'), separator='-'):
 def regionprops_table(label_image, intensity_image=None,
                       properties=('label', 'bbox'),
                       *,
-                      cache=True, separator='-', extra_properties=None):
+                      cache=True, separator='-', extra_properties=None,
+                      order=3):
     """Compute image properties and return them as a pandas-compatible table.
 
     The table is a dictionary mapping column names to value arrays. See Notes
@@ -909,6 +912,9 @@ def regionprops_table(label_image, intensity_image=None,
         issued. A property computation function must take a region mask as its
         first argument. If the property requires an intensity image, it must
         accept the intensity image as the second argument.
+    order : int, optional
+        The maximum order to compute in moments-related properties. The default
+        is to compute moments up to the 3rd order.
 
     Returns
     -------
@@ -994,7 +1000,8 @@ def regionprops_table(label_image, intensity_image=None,
 
     """
     regions = regionprops(label_image, intensity_image=intensity_image,
-                          cache=cache, extra_properties=extra_properties)
+                          cache=cache, extra_properties=extra_properties,
+                          order=order)
     if extra_properties is not None:
         properties = (
             list(properties) + [prop.__name__ for prop in extra_properties]
@@ -1010,7 +1017,8 @@ def regionprops_table(label_image, intensity_image=None,
                 dtype=intensity_image.dtype,
             )
         regions = regionprops(label_image, intensity_image=intensity_image,
-                              cache=cache, extra_properties=extra_properties)
+                              cache=cache, extra_properties=extra_properties,
+                              order=order)
 
         out_d = _props_to_dict(regions, properties=properties,
                                separator=separator)
@@ -1022,7 +1030,7 @@ def regionprops_table(label_image, intensity_image=None,
 
 
 def regionprops(label_image, intensity_image=None, cache=True,
-                coordinates=None, *, extra_properties=None):
+                coordinates=None, *, extra_properties=None, order=order):
     r"""Measure properties of labeled image regions.
 
     Parameters
@@ -1071,6 +1079,9 @@ def regionprops(label_image, intensity_image=None, cache=True,
         issued. A property computation function must take a region mask as its
         first argument. If the property requires an intensity image, it must
         accept the intensity image as the second argument.
+    order : int, optional
+        The maximum order to compute in moments-related properties. The default
+        is to compute moments up to the 3rd order.
 
     Returns
     -------
@@ -1156,14 +1167,15 @@ def regionprops(label_image, intensity_image=None, cache=True,
         Value with the least intensity in the region.
     **label** : int
         The label in the labeled input image.
-    **moments** : (3, 3) ndarray
-        Spatial moments up to 3rd order::
+    **moments** : (order, order) ndarray
+        Spatial moments up to the specified order (default=3)::
 
             m_ij = sum{ array(row, col) * row^i * col^j }
 
         where the sum is over the `row`, `col` coordinates of the region.
-    **moments_central** : (3, 3) ndarray
-        Central moments (translation invariant) up to 3rd order::
+    **moments_central** : (order, order) ndarray
+        Central moments (translation invariant) up to the specified order
+        (default=3)::
 
             mu_ij = sum{ array(row, col) * (row - row_c)^i * (col - col_c)^j }
 
@@ -1171,21 +1183,22 @@ def regionprops(label_image, intensity_image=None, cache=True,
         and `row_c` and `col_c` are the coordinates of the region's centroid.
     **moments_hu** : tuple
         Hu moments (translation, scale and rotation invariant).
-    **moments_normalized** : (3, 3) ndarray
+    **moments_normalized** : (order, order) ndarray
         Normalized moments (translation and scale invariant) up to 3rd order::
 
             nu_ij = mu_ij / m_00^[(i+j)/2 + 1]
 
         where `m_00` is the zeroth spatial moment.
-    **moments_weighted** : (3, 3) ndarray
-        Spatial moments of intensity image up to 3rd order::
+    **moments_weighted** : (order, order) ndarray
+        Spatial moments of intensity image up to the specified order
+        (default=3)::
 
             wm_ij = sum{ array(row, col) * row^i * col^j }
 
         where the sum is over the `row`, `col` coordinates of the region.
-    **moments_weighted_central** : (3, 3) ndarray
+    **moments_weighted_central** : (order, order) ndarray
         Central moments (translation invariant) of intensity image up to
-        3rd order::
+        the specified order (default=3)::
 
             wmu_ij = sum{ array(row, col) * (row - row_c)^i * (col - col_c)^j }
 
@@ -1195,9 +1208,9 @@ def regionprops(label_image, intensity_image=None, cache=True,
     **moments_weighted_hu** : tuple
         Hu moments (translation, scale and rotation invariant) of intensity
         image.
-    **moments_weighted_normalized** : (3, 3) ndarray
+    **moments_weighted_normalized** : (order, order) ndarray
         Normalized moments (translation and scale invariant) of intensity
-        image up to 3rd order::
+        image up to the specified order::
 
             wnu_ij = wmu_ij / wm_00^[(i+j)/2 + 1]
 
@@ -1313,7 +1326,8 @@ def regionprops(label_image, intensity_image=None, cache=True,
         label = i + 1
 
         props = RegionProperties(sl, label, label_image, intensity_image,
-                                 cache, extra_properties=extra_properties)
+                                 cache, extra_properties=extra_properties,
+                                 order=order)
         regions.append(props)
 
     return regions
