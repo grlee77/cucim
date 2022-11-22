@@ -23,8 +23,8 @@ descs, descs_img = daisy(img, step=180, radius=58, rings=2, histograms=6,
                          orientations=8, visualize=True)
 
 fig, ax = plt.subplots()
-ax.axis('off')
+ax.axis("off")
 ax.imshow(cp.asnumpy(descs_img))
 descs_num = descs.shape[0] * descs.shape[1]
-ax.set_title('%i DAISY descriptors extracted:' % descs_num)
+ax.set_title(f"{descs_num} DAISY descriptors extracted:")
 plt.show()

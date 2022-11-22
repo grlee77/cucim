@@ -1,11 +1,12 @@
 """
-=========================
-Different perimeters
-=========================
+============================================
+Measure perimeters with different estimators
+============================================
 
-In this example we show the uncertainty on calculating perimeters, comparing
-classic and Crofton ones. For that, we evaluate the perimeters of a square and
-its rotated version.
+In this example, we show the error on measuring perimeters, comparing classic
+approximations and Crofton ones. For that, we estimate the perimeter of an
+object (either a square or a disk) and its rotated version, as we increase the
+rotation angle.
 
 """
 import cupy as cp
@@ -18,10 +19,10 @@ from cucim.skimage.transform import rotate
 
 
 # scale parameter can be used to increase the grid size. The resulting curves
-# should be smoothed with higer scales
+# should be smoothed with higher scales
 scale = 10
 
-# Construct 2 figures, square and disks
+# Construct two objects, a square and a disk
 square = cp.zeros((100*scale, 100*scale))
 square[40*scale:60*scale, 40*scale:60*scale] = 1
 
@@ -35,10 +36,11 @@ ax = axes.flatten()
 dX = X[0, 1] - X[0, 0]
 true_perimeters = [80 * scale, 2 * cp.pi * R / dX]
 
-# for each type of objects, the different perimeters are evaluated
+# For each type of object, estimate its perimeter as the object is rotated,
+# according to different approximations
 for index, obj in enumerate([square, disk]):
 
-    # 2 neighbourhoud configurations for measure.perimeter
+    # `neighborhood` value can be 4 or 8 for the classic perimeter estimator
     for n in [4, 6]:
         p = []
         angles = range(90)
@@ -48,12 +50,11 @@ for index, obj in enumerate([square, disk]):
             p.append(float(perimeter(rotated, n)))
         ax[index].plot(angles, p)
 
-    # 2 or 4 directions can be used by measure.perimeter_crofton
+    # `directions` value can be 2 or 4 for the Crofton estimator
     for d in [2, 4]:
         p = []
         angles = np.arange(0, 90, 2)
         for i in angles:
-            # rotation and perimeter evaluation
             rotated = rotate(obj, i, order=0)
             p.append(float(perimeter_crofton(rotated, d)))
         ax[index].plot(angles, p)

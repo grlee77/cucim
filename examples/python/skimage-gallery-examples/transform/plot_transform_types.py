@@ -62,7 +62,7 @@ ax.imshow(cp.asnumpy(tf_img))
 _ = ax.set_title('Euclidean transformation')
 
 ######################################################################
-# For a rotation around the center of the image, one can 
+# For a rotation around the center of the image, one can
 # compose a translation to change the origin, a rotation, and finally
 # the inverse of the first translation.
 
