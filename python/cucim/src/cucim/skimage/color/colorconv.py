@@ -1036,11 +1036,11 @@ def gray2rgba(image, alpha=None, *, channel_axis=-1):
         warn("alpha can't be safely cast to image dtype {}"
              .format(image.dtype.name), stacklevel=2)
 
-    if np.isscalar(alpha):
+    if cp.isscalar(alpha):
         alpha = cp.full(image.shape, alpha, dtype=image.dtype)
     elif alpha.shape != image.shape:
         raise ValueError("alpha.shape must match image.shape")
-    rgba = np.stack((image,) * 3 + (alpha,), axis=channel_axis)
+    rgba = cp.stack((image,) * 3 + (alpha,), axis=channel_axis)
     return rgba
 
 
