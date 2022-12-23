@@ -919,7 +919,23 @@ def threshold_triangle(image, nbins=256):
     return bin_centers[arg_level]
 
 
-def _mean_std(image, w):
+_operation_mean_std = """
+m /= total_window_size;
+g2 /= total_window_size;
+g2 -= m * m;
+s = sqrt(max(g2, static_cast<F>(0.0)));
+"""
+
+def _get_mean_std_kernel():
+    return cp.ElementwiseKernel(
+        in_params='F total_window_size',
+        out_params='F g2, F m, F s',
+        operation=_operation_mean_std,
+        name='cucim_skimage_mean_std'
+    )
+
+
+def _mean_std(image, w, postproc=None):
     """Return local mean and standard deviation of each pixel using a
     neighborhood defined by a rectangular window size ``w``.
     The algorithm uses integral images to speedup computation. This is
@@ -974,16 +990,23 @@ def _mean_std(image, w):
     m = _correlate_sparse(integral, kernel_shape, kernel_indices,
                           kernel_values)
     m = m.astype(float_dtype, copy=False)
-    m /= total_window_size
     g2 = _correlate_sparse(integral_sq, kernel_shape, kernel_indices,
                            kernel_values)
     g2 = g2.astype(float_dtype, copy=False)
-    g2 /= total_window_size
-    # Note: we use np.clip because g2 is not guaranteed to be greater than
-    # m*m when floating point error is considered
-    s = cp.clip(g2 - m * m, 0, None)
-    cp.sqrt(s, out=s)
+
+    inner_kernel = _get_mean_std_kernel()
+    s = cp.empty_like(m)
+    inner_kernel(total_window_size, g2, m, s)
     return m, s
+
+
+def _get_niblack_inner_kernel():
+    return cp.ElementwiseKernel(
+        in_params='float64 k, F m',
+        out_params='F s',
+        operation="s = m - k * s;",
+        name='cucim_skimage_mean_std'
+    )
 
 
 def threshold_niblack(image, window_size=15, k=0.2):
@@ -1046,7 +1069,16 @@ def threshold_niblack(image, window_size=15, k=0.2):
     >>> threshold_image = threshold_niblack(image, window_size=7, k=0.1)
     """
     m, s = _mean_std(image, window_size)
-    return m - k * s
+    return _get_niblack_inner_kernel()(k, m, s)
+
+
+def _get_sauvola_inner_kernel():
+    return cp.ElementwiseKernel(
+        in_params='float64 k, float64 r, F m',
+        out_params='F s',
+        operation="s = m * (1 + k * ((s / r) - 1));",
+        name='cucim_skimage_mean_std'
+    )
 
 
 def threshold_sauvola(image, window_size=15, k=0.2, r=None):
@@ -1106,7 +1138,7 @@ def threshold_sauvola(image, window_size=15, k=0.2, r=None):
         imin, imax = dtype_limits(image, clip_negative=False)
         r = 0.5 * (imax - imin)
     m, s = _mean_std(image, window_size)
-    return m * (1 + k * ((s / r) - 1))
+    return _get_sauvola_inner_kernel()(k, r, m, s)
 
 
 def apply_hysteresis_threshold(image, low, high):
