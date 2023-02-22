@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Infrastructure, Inc.
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Networks, Inc.
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 
 import cmath
@@ -500,6 +500,13 @@ def affine_transform(
     _util._check_cval(mode, cval, integer_output)
     large_int = max(math.prod(input.shape), math.prod(output_shape)) > 1 << 31
     if matrix.ndim == 1:
+        # identify batch axes where zoom == 1 and shift == 0
+        # (no interpolation needed)
+        matrix_host = cupy.asnumpy(matrix)
+        batch_axes = tuple(
+            j for j in range(ndim) if matrix_host[j] == 1.0 and offset[j] == 0.0
+        )
+
         offset = cupy.asarray(offset, dtype=cupy.float64)
         offset = -offset / matrix
         kern = _interp_kernels._get_zoom_shift_kernel(
@@ -511,6 +518,7 @@ def affine_transform(
             order=order,
             integer_output=integer_output,
             nprepad=nprepad,
+            batch_axes=batch_axes,
         )
         kern(filtered, offset, matrix, output)
     else:
@@ -734,6 +742,10 @@ def shift(
         integer_output = output.dtype.kind in "iu"
         _util._check_cval(mode, cval, integer_output)
         large_int = math.prod(input.shape) > 1 << 31
+
+        # identify batch axes where shift == 0 (no interpolation needed)
+        batch_axes = tuple(j for j, s in enumerate(shift) if s == 0)
+
         kern = _interp_kernels._get_shift_kernel(
             input.ndim,
             large_int,
@@ -743,6 +755,7 @@ def shift(
             order=order,
             integer_output=integer_output,
             nprepad=nprepad,
+            batch_axes=batch_axes,
         )
         shift = cupy.asarray(shift, dtype=cupy.float64, order="C")
         if shift.ndim != 1:
@@ -878,6 +891,15 @@ def zoom(
         large_int = (
             max(math.prod(input.shape), math.prod(output_shape)) > 1 << 31
         )
+
+        # identify batch axes where zoom == 1 (no interpolation needed)
+        # this occurs when input_shape[j] == output_shape[j]
+        batch_axes = tuple(
+            j
+            for j, (in_s, out_s) in enumerate(zip(input.shape, output_shape))
+            if in_s == out_s
+        )
+
         kern = _interp_kernels._get_zoom_kernel(
             input.ndim,
             large_int,
@@ -887,6 +909,7 @@ def zoom(
             integer_output=integer_output,
             grid_mode=grid_mode,
             nprepad=nprepad,
+            batch_axes=batch_axes,
         )
         zoom = cupy.asarray(zoom, dtype=cupy.float64)
         kern(filtered, zoom, output)
