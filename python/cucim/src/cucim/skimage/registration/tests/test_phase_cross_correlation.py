@@ -3,8 +3,10 @@ import itertools
 import cupy as cp
 import numpy as np
 import pytest
+import skimage
 from cupy.testing import assert_allclose
 from cupyx.scipy.ndimage import fourier_shift
+from packaging.version import Version
 from skimage.data import camera, eagle
 
 from cucim.skimage import img_as_float
@@ -181,8 +183,9 @@ def test_mismatch_offsets_size():
     ("shift0", "shift1"),
     itertools.product((100, -100, 350, -350), (100, -100, 350, -350)),
 )
-@cp.testing.with_requires("scikit-image>=0.20")
 def test_disambiguate_2d(shift0, shift1):
+    if Version(skimage.__version__) < Version("0.20"):
+        pytest.skip("requires scikit-image >= 0.20")
     image = cp.array(eagle()[500:, 900:])  # use a highly textured image region
 
     # Protect against some versions of scikit-image + imagio loading as
