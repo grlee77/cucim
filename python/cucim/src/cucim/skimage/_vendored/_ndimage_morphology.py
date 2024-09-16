@@ -29,6 +29,7 @@ def _get_binary_erosion_kernel(
         true_val = 0
         false_val = 1
     else:
+        border_value = int(border_value)
         true_val = 1
         false_val = 0
 
@@ -59,14 +60,14 @@ def _get_binary_erosion_kernel(
     # {{{{ required because format is called again within _generate_nd_kernel
     found = f"""
         if ({{cond}}) {{{{
-            if (!{int(border_value)}) {{{{
-                y = cast<Y>({int(false_val)});
+            if (!{border_value}) {{{{
+                y = cast<Y>({false_val});
                 return;
             }}}}
         }}}} else {{{{
-            bool nn = {{value}} ? {int(true_val)} : {int(false_val)};
+            bool nn = {{value}} ? {true_val} : {false_val};
             if (!nn) {{{{
-                y = cast<Y>({int(false_val)});
+                y = cast<Y>({false_val});
                 return;
             }}}}
         }}}}"""
@@ -76,12 +77,13 @@ def _get_binary_erosion_kernel(
         name += "_invert"
     has_weights = not all_weights_nonzero
 
+    modes = ("constant",) * len(w_shape)
     return _filters_core._generate_nd_kernel(
         name,
         pre,
         found,
         "",
-        "constant",
+        modes,
         w_shape,
         int_type,
         offsets,
@@ -190,7 +192,6 @@ def _binary_erosion(
     ndim = input.ndim
     axes = _util._check_axes(axes, ndim)
     num_axes = len(axes)
-    default_structure = False
     if structure is None:
         structure = generate_binary_structure(num_axes, 1)
         all_weights_nonzero = input.ndim == 1
@@ -254,19 +255,18 @@ def _binary_erosion(
     origin = tuple(origin)
     int_type = _util._get_inttype(input)
     offsets = _filters_core._origins_to_offsets(origin, structure_shape)
-    if not default_structure:
-        if isinstance(structure, tuple):
-            nnz = math.prod(structure_shape)
-            all_weights_nonzero = True
+    if isinstance(structure, tuple):
+        nnz = math.prod(structure_shape)
+        all_weights_nonzero = True
+        center_is_true = True
+    else:
+        # synchronize required to determine if all weights are non-zero
+        nnz = int(cupy.count_nonzero(structure))
+        all_weights_nonzero = nnz == structure.size
+        if all_weights_nonzero:
             center_is_true = True
         else:
-            # synchronize required to determine if all weights are non-zero
-            nnz = int(cupy.count_nonzero(structure))
-            all_weights_nonzero = nnz == structure.size
-            if all_weights_nonzero:
-                center_is_true = True
-            else:
-                center_is_true = _center_is_true(structure, origin)
+            center_is_true = _center_is_true(structure, origin)
 
     erode_kernel = _get_binary_erosion_kernel(
         structure_shape,
@@ -1062,12 +1062,9 @@ def grey_closing(
         warnings.warn(
             "ignoring size because footprint is set", UserWarning, stacklevel=2
         )
-    tmp = grey_dilation(
-        input, size, footprint, structure, None, mode, cval, origin, axes=axes
-    )
-    return grey_erosion(
-        tmp, size, footprint, structure, output, mode, cval, origin, axes=axes
-    )
+    kwargs = dict(mode=mode, cval=cval, origin=origin, axes=axes)
+    tmp = grey_dilation(input, size, footprint, structure, None, **kwargs)
+    return grey_erosion(tmp, size, footprint, structure, output, **kwargs)
 
 
 def grey_opening(
@@ -1119,12 +1116,9 @@ def grey_opening(
         warnings.warn(
             "ignoring size because footprint is set", UserWarning, stacklevel=2
         )
-    tmp = grey_erosion(
-        input, size, footprint, structure, None, mode, cval, origin, axes=axes
-    )
-    return grey_dilation(
-        tmp, size, footprint, structure, output, mode, cval, origin, axes=axes
-    )
+    kwargs = dict(mode=mode, cval=cval, origin=origin, axes=axes)
+    tmp = grey_erosion(input, size, footprint, structure, None, **kwargs)
+    return grey_dilation(tmp, size, footprint, structure, output, **kwargs)
 
 
 def morphological_gradient(

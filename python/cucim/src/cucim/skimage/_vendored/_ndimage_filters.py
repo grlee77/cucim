@@ -1313,6 +1313,7 @@ def _min_or_max_filter(
         # expand origins ,footprint and structure if num_axes < input.ndim
         ftprnt = _util._expand_footprint(input.ndim, axes, ftprnt)
         origins = _util._expand_origin(input.ndim, axes, origin)
+        modes = tuple(_util._expand_mode(input.ndim, axes, modes))
 
     if structure is not None:
         structure = _util._expand_footprint(
