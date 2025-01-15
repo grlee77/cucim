@@ -12,6 +12,7 @@ from scipy.ndimage import find_objects as cpu_find_objects
 from cucim.skimage import data, measure
 from cucim.skimage.measure._regionprops_gpu import (
     area_bbox_from_slices,
+    moments_to_moments_central,
     regionprops_area,
     regionprops_area_bbox,
     regionprops_bbox_coords,
@@ -306,11 +307,13 @@ def test_centroid(precompute_max, local, ndim):
     [
         (False, None, 1),
         (True, cp.float32, 1),
-        (True, cp.uint8, 1),
         (True, cp.uint8, 3),
     ],
 )
-def test_moments_2d(spacing, order, weighted, intensity_dtype, num_channels):
+@pytest.mark.parametrize("central", [False, True])
+def test_moments_2d(
+    spacing, order, weighted, intensity_dtype, num_channels, central
+):
     shape = (800, 600)
     labels = get_labels_nd(shape)
     max_label = int(cp.max(labels))
@@ -320,23 +323,34 @@ def test_moments_2d(spacing, order, weighted, intensity_dtype, num_channels):
             shape, dtype=intensity_dtype, num_channels=num_channels
         )
         kwargs["intensity_image"] = intensity_image
-        prop = "moments_weighted"
+        prop = "moments_weighted_central" if central else "moments_weighted"
     else:
-        prop = "moments"
+        prop = "moments_central" if central else "moments"
     expected = measure.regionprops_table(labels, properties=[prop], **kwargs)
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
-    allclose = functools.partial(assert_allclose, rtol=1e-6)
+    if central:
+        moments = moments_to_moments_central(moments, ndim=len(shape))
 
+    # regionprops does not use the more accurate analytical expressions for the
+    # central moments, so need to relax tolerance in the "central" moments case
+    rtol = 1e-4 if central else 1e-6
+    atol = 1e-5 if central else 0
+
+    allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
     if num_channels == 1:
         # zeroth moment
         allclose(moments[:, 0, 0], expected[prop + "-0-0"])
 
         if order > 0:
             # first-order moments
-            allclose(moments[:, 0, 1], expected[prop + "-0-1"])
-            allclose(moments[:, 1, 0], expected[prop + "-1-0"])
+            if central:
+                assert_array_equal(moments[:, 0, 1], 0.0)
+                assert_array_equal(moments[:, 1, 0], 0.0)
+            else:
+                allclose(moments[:, 0, 1], expected[prop + "-0-1"])
+                allclose(moments[:, 1, 0], expected[prop + "-1-0"])
         if order > 1:
             # second-order moments
             allclose(moments[:, 0, 2], expected[prop + "-0-2"])
@@ -355,8 +369,12 @@ def test_moments_2d(spacing, order, weighted, intensity_dtype, num_channels):
 
         if order > 0:
             # first-order moments
-            allclose(moments[:, c, 0, 1], expected[prop + f"-0-1-{c}"])
-            allclose(moments[:, c, 1, 0], expected[prop + f"-1-0-{c}"])
+            if central:
+                assert_array_equal(moments[:, c, 0, 1], 0.0)
+                assert_array_equal(moments[:, c, 1, 0], 0.0)
+            else:
+                allclose(moments[:, c, 0, 1], expected[prop + f"-0-1-{c}"])
+                allclose(moments[:, c, 1, 0], expected[prop + f"-1-0-{c}"])
         if order > 1:
             # second-order moments
             allclose(moments[:, c, 0, 2], expected[prop + f"-0-2-{c}"])
@@ -377,11 +395,13 @@ def test_moments_2d(spacing, order, weighted, intensity_dtype, num_channels):
     [
         (False, None, 1),
         (True, cp.float32, 1),
-        (True, cp.uint8, 1),
         (True, cp.uint8, 3),
     ],
 )
-def test_moments_3d(spacing, order, weighted, intensity_dtype, num_channels):
+@pytest.mark.parametrize("central", [False, True])
+def test_moments_3d(
+    spacing, order, weighted, intensity_dtype, num_channels, central
+):
     shape = (96, 64, 48)
     labels = get_labels_nd(shape)
     max_label = int(cp.max(labels))
@@ -391,24 +411,36 @@ def test_moments_3d(spacing, order, weighted, intensity_dtype, num_channels):
             shape, dtype=intensity_dtype, num_channels=num_channels
         )
         kwargs["intensity_image"] = intensity_image
-        prop = "moments_weighted"
+        prop = "moments_weighted_central" if central else "moments_weighted"
     else:
-        prop = "moments"
+        prop = "moments_central" if central else "moments"
     # regionprops_table always computes 3rd order moments
     expected = measure.regionprops_table(labels, properties=[prop], **kwargs)
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
-    allclose = functools.partial(assert_allclose, rtol=1e-6)
+    if central:
+        moments = moments_to_moments_central(moments, ndim=len(shape))
 
+    # regionprops does not use the more accurate analytical expressions for the
+    # central moments, so need to relax tolerance in the "central" moments case
+    rtol = 1e-4 if central else 1e-6
+    atol = 1e-3 if central else 0
+
+    allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
     if num_channels == 1:
         # zeroth moment
         allclose(moments[:, 0, 0, 0], expected[prop + "-0-0-0"])
         if order > 0:
             # first-order moments
-            allclose(moments[:, 0, 0, 1], expected[prop + "-0-0-1"])
-            allclose(moments[:, 0, 1, 0], expected[prop + "-0-1-0"])
-            allclose(moments[:, 1, 0, 0], expected[prop + "-1-0-0"])
+            if central:
+                assert_array_equal(moments[:, 0, 0, 1], 0.0)
+                assert_array_equal(moments[:, 0, 1, 0], 0.0)
+                assert_array_equal(moments[:, 1, 0, 0], 0.0)
+            else:
+                allclose(moments[:, 0, 0, 1], expected[prop + "-0-0-1"])
+                allclose(moments[:, 0, 1, 0], expected[prop + "-0-1-0"])
+                allclose(moments[:, 1, 0, 0], expected[prop + "-1-0-0"])
         if order > 1:
             # second-order moments
             allclose(moments[:, 0, 0, 2], expected[prop + "-0-0-2"])
@@ -435,9 +467,20 @@ def test_moments_3d(spacing, order, weighted, intensity_dtype, num_channels):
             allclose(moments[:, c, 0, 0, 0], expected[prop + f"-0-0-0-{c}"])
             if order > 0:
                 # first-order moments
-                allclose(moments[:, c, 0, 0, 1], expected[prop + f"-0-0-1-{c}"])
-                allclose(moments[:, c, 0, 1, 0], expected[prop + f"-0-1-0-{c}"])
-                allclose(moments[:, c, 1, 0, 0], expected[prop + f"-1-0-0-{c}"])
+                if central:
+                    assert_array_equal(moments[:, c, 0, 0, 1], 0.0)
+                    assert_array_equal(moments[:, c, 0, 1, 0], 0.0)
+                    assert_array_equal(moments[:, c, 1, 0, 0], 0.0)
+                else:
+                    allclose(
+                        moments[:, c, 0, 0, 1], expected[prop + f"-0-0-1-{c}"]
+                    )
+                    allclose(
+                        moments[:, c, 0, 1, 0], expected[prop + f"-0-1-0-{c}"]
+                    )
+                    allclose(
+                        moments[:, c, 1, 0, 0], expected[prop + f"-1-0-0-{c}"]
+                    )
             if order > 1:
                 # second-order moments
                 allclose(moments[:, c, 0, 0, 2], expected[prop + f"-0-0-2-{c}"])
