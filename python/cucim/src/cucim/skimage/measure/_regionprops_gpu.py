@@ -887,11 +887,21 @@ def get_moments_kernel(
     weighted=False,
     num_channels=1,
 ):
+    # note: ndim here is the number of spatial image dimensions
+
     coord_dtype = cp.dtype(coord_dtype)
     moments_dtype = cp.dtype(moments_dtype)
+
+    use_floating_point = moments_dtype.kind == "f"
+    if weighted and not use_floating_point:
+        raise ValueError(
+            "`moments_dtype` must be a floating point type for weighted "
+            "moments calculations."
+        )
     uint_t = (
         "unsigned int" if coord_dtype.itemsize <= 4 else "unsigned long long"
     )
+    c_type = "double" if use_floating_point else f"{uint_t}"
 
     if spacing is not None:
         if len(spacing) != ndim:
@@ -899,19 +909,16 @@ def get_moments_kernel(
         if moments_dtype.kind != "f":
             raise ValueError("moments must have a floating point data type")
 
+    # number is for a densely populated moments matrix of size (order + 1) per
+    # side (values at locations where order is greater than specified will be 0)
+    num_moments = (order + 1) ** ndim
+
     source = """
         auto L = label[i];
         if (L != 0) {"""
     source += _unravel_loop_index("label", ndim, uint_t=uint_t)
     # using bounding box to transform the global coordinates to local ones
     # (c0 = local coordinate on axis 0, etc.)
-    use_floating_point = moments_dtype.kind == "f"
-    if weighted and not use_floating_point:
-        raise ValueError(
-            "`moments_dtype` must be a floating point type for weighted "
-            "moments calculations."
-        )
-    c_type = "double" if use_floating_point else f"{uint_t}"
     for d in range(ndim):
         source += f"""
             {c_type} c{d} = in_coord[{d}]
@@ -922,10 +929,8 @@ def get_moments_kernel(
     if order > 3:
         raise ValueError("Only moments of orders 0-3 are supported")
 
-    # number is for a densely populated moments matrix of size (order + 1) per
-    # side (values at locations where order is greater than specified will be 0)
-    num_moments = (order + 1) ** ndim
     if num_channels > 1:
+        # insert a loop over channels in multichannel case
         source += f"""
             {uint_t} num_channels = moments.shape()[1];
             for ({uint_t} c = 0; c < num_channels; c++) {{\n"""
@@ -1014,7 +1019,7 @@ def get_moments_kernel(
             atomicAdd(&moments[offset + 36], {w}c0 * c0 * c1);
             atomicAdd(&moments[offset + 48], {w}c0 * c0 * c0);\n"""
     else:
-        raise ValueError("only 2d and 3d shapes are supported")
+        raise ValueError("only ndim = 2 or 3 is supported")
     if num_channels > 1:
         source += """
             }  // channels loop"
@@ -1150,3 +1155,206 @@ def regionprops_moments(
         input_args = input_args + (intensity_image,)
     moments_kernel(*input_args, moments, size=label_image.size)
     return moments
+
+
+@cp.memoize(for_each_device=True)
+def get_moments_central_kernel(
+    moments_dtype,
+    ndim,
+    order,
+):
+    """Applies analytical formulas to convert raw moments to central moments
+
+    These are as in `_moments_raw_to_central_fast` from
+    `_moments_analytical.py` but that kernel is scalar, while this one will be
+    applied to all labeled regions (and any channels dimension) at once.
+    """
+    moments_dtype = cp.dtype(moments_dtype)
+
+    uint_t = "unsigned int"
+
+    # number is for a densely populated moments matrix of size (order + 1) per
+    # side (values at locations where order is greater than specified will be 0)
+    num_moments = (order + 1) ** ndim
+
+    if moments_dtype.kind != "f":
+        raise ValueError(
+            "`moments_dtype` must be a floating point type for central moments "
+            "calculations."
+        )
+
+    # floating point type used for the intermediate computations
+    float_type = "double"
+
+    source = f"""
+            {uint_t} offset = i * {num_moments};\n"""
+    if ndim == 2:
+        if order <= 1:
+            # only zeroth moment is non-zero for central moments
+            source += """
+            out[offset] = moments_raw[offset];\n"""
+        elif order == 2:
+            source += f"""
+            // retrieve the 2nd order raw moments
+            {float_type} m00 = moments_raw[offset];
+            {float_type} m01 = moments_raw[offset + 1];
+            {float_type} m02 = moments_raw[offset + 2];
+            {float_type} m10 = moments_raw[offset + 3];
+            {float_type} m11 = moments_raw[offset + 4];
+            {float_type} m20 = moments_raw[offset + 6];
+
+            // compute centroids
+            // (TODO: add option to output the centroids as well?)
+            {float_type} cx = m10 / m00;
+            {float_type} cy = m01 / m00;
+
+            // analytical expressions for the central moments
+            out[offset] = m00;                  // out[0, 0]
+            // 2nd order central moments
+            out[offset + 2] = m02 - cy * m01;   // out[0, 2]
+            out[offset + 4] = m11 - cx * m01;   // out[1, 1]
+            out[offset + 6] = m20 - cx * m10;   // out[2, 0]\n"""
+        elif order == 3:
+            source += f"""
+            // retrieve the 2nd order raw moments
+            {float_type} m00 = moments_raw[offset];
+            {float_type} m01 = moments_raw[offset + 1];
+            {float_type} m02 = moments_raw[offset + 2];
+            {float_type} m03 = moments_raw[offset + 3];
+            {float_type} m10 = moments_raw[offset + 4];
+            {float_type} m11 = moments_raw[offset + 5];
+            {float_type} m12 = moments_raw[offset + 6];
+            {float_type} m20 = moments_raw[offset + 8];
+            {float_type} m21 = moments_raw[offset + 9];
+            {float_type} m30 = moments_raw[offset + 12];
+
+            // compute centroids
+            {float_type} cx = m10 / m00;
+            {float_type} cy = m01 / m00;
+
+            // zeroth moment
+            out[offset] = m00;                                                  // out[0, 0]
+            // 2nd order central moments
+            out[offset + 2] = m02 - cy * m01;                                   // out[0, 2]
+            out[offset + 5] = m11 - cx * m01;                                   // out[1, 1]
+            out[offset + 8] = m20 - cx * m10;                                   // out[2, 0]
+            // 3rd order central moments
+            out[offset + 3] = m03 - 3*cy*m02 + 2*cy*cy*m01;                     // out[0, 3]
+            out[offset + 6] = m12 - 2*cy*m11 - cx*m02 + 2*cy*cx*m01;            // out[1, 2]
+            out[offset + 9] = m21 - 2*cx*m11 - cy*m20 + cx*cx*m01 + cy*cx*m10;  // out[2, 1]
+            out[offset + 12] = m30 - 3*cx*m20 + 2*cx*cx*m10;                    // out[3, 0]\n"""  # noqa: E501
+    elif ndim == 3:
+        if order <= 1:
+            # only zeroth moment is non-zero for central moments
+            source += """
+            out[offset] = moments_raw[offset];\n"""
+        elif order == 2:
+            source += f"""
+             // retrieve the 2nd order raw moments
+            {float_type} m000 = moments_raw[offset];
+            {float_type} m001 = moments_raw[offset + 1];
+            {float_type} m002 = moments_raw[offset + 2];
+            {float_type} m010 = moments_raw[offset + 3];
+            {float_type} m011 = moments_raw[offset + 4];
+            {float_type} m020 = moments_raw[offset + 6];
+            {float_type} m100 = moments_raw[offset + 9];
+            {float_type} m101 = moments_raw[offset + 10];
+            {float_type} m110 = moments_raw[offset + 12];
+            {float_type} m200 = moments_raw[offset + 18];
+
+            // compute centroids
+            {float_type} cx = m100 / m000;
+            {float_type} cy = m010 / m000;
+            {float_type} cz = m001 / m000;
+
+            // zeroth moment
+            out[offset] = m000;                  // out[0, 0, 0]
+            // 2nd order central moments
+            out[offset + 2] = -cz*m001 + m002;   // out[0, 0, 2]
+            out[offset + 4] = -cy*m001 + m011;   // out[0, 1, 1]
+            out[offset + 6] = -cy*m010 + m020;   // out[0, 2, 0]
+            out[offset + 10] = -cx*m001 + m101;  // out[1, 0, 1]
+            out[offset + 12] = -cx*m010 + m110;  // out[1, 1, 0]
+            out[offset + 18] = -cx*m100 + m200;  // out[2, 0, 0]\n"""
+        elif order == 3:
+            source += f"""
+             // retrieve the 3rd order raw moments
+            {float_type} m000 = moments_raw[offset];
+            {float_type} m001 = moments_raw[offset + 1];
+            {float_type} m002 = moments_raw[offset + 2];
+            {float_type} m003 = moments_raw[offset + 3];
+            {float_type} m010 = moments_raw[offset + 4];
+            {float_type} m011 = moments_raw[offset + 5];
+            {float_type} m012 = moments_raw[offset + 6];
+            {float_type} m020 = moments_raw[offset + 8];
+            {float_type} m021 = moments_raw[offset + 9];
+            {float_type} m030 = moments_raw[offset + 12];
+            {float_type} m100 = moments_raw[offset + 16];
+            {float_type} m101 = moments_raw[offset + 17];
+            {float_type} m102 = moments_raw[offset + 18];
+            {float_type} m110 = moments_raw[offset + 20];
+            {float_type} m111 = moments_raw[offset + 21];
+            {float_type} m120 = moments_raw[offset + 24];
+            {float_type} m200 = moments_raw[offset + 32];
+            {float_type} m201 = moments_raw[offset + 33];
+            {float_type} m210 = moments_raw[offset + 36];
+            {float_type} m300 = moments_raw[offset + 48];
+
+            // compute centroids
+            {float_type} cx = m100 / m000;
+            {float_type} cy = m010 / m000;
+            {float_type} cz = m001 / m000;
+
+            // zeroth moment
+            out[offset] = m000;
+            // 2nd order central moments
+            out[offset + 2] = -cz*m001 + m002;     // out[0, 0, 2]
+            out[offset + 5] = -cy*m001 + m011;     // out[0, 1, 1]
+            out[offset + 8] = -cy*m010 + m020;     // out[0, 2, 0]
+            out[offset + 17] = -cx*m001 + m101;    // out[1, 0, 1]
+            out[offset + 20] = -cx*m010 + m110;    // out[1, 1, 0]
+            out[offset + 32] = -cx*m100 + m200;    // out[2, 0, 0]
+            // 3rd order central moments
+            out[offset + 3] = 2*cz*cz*m001 - 3*cz*m002 + m003;                               // out[0, 0, 3]
+            out[offset + 6] = -cy*m002 + 2*cz*(cy*m001 - m011) + m012;                       // out[0, 1, 2]
+            out[offset + 9] = cy*cy*m001 - 2*cy*m011 + cz*(cy*m010 - m020) + m021;           // out[0, 2, 1]
+            out[offset + 12] = 2*cy*cy*m010 - 3*cy*m020 + m030;                              // out[0, 3, 0]
+            out[offset + 18] = -cx*m002 + 2*cz*(cx*m001 - m101) + m102;                      // out[1, 0, 2]
+            out[offset + 21] = -cx*m011 + cy*(cx*m001 - m101) + cz*(cx*m010 - m110) + m111;  // out[1, 1, 1]
+            out[offset + 24] = -cx*m020 - 2*cy*(-cx*m010 + m110) + m120;                     // out[1, 2, 0]
+            out[offset + 33] = cx*cx*m001 - 2*cx*m101 + cz*(cx*m100 - m200) + m201;          // out[2, 0, 1]
+            out[offset + 36] = cx*cx*m010 - 2*cx*m110 + cy*(cx*m100 - m200) + m210;          // out[2, 1, 0]
+            out[offset + 48] = 2*cx*cx*m100 - 3*cx*m200 + m300;                              // out[3, 0, 0]\n"""  # noqa: E501
+    else:
+        # note: ndim here is the number of spatial image dimensions
+        raise ValueError("only ndim = 2 or 3 is supported")
+    inputs = "raw X moments_raw"
+    outputs = "raw X out"
+    name = f"cucim_moments_central_order{order}_{ndim}d"
+    return cp.ElementwiseKernel(
+        inputs, outputs, source, preamble=_includes, name=name
+    )
+
+
+def moments_to_moments_central(moments_raw, ndim):
+    if moments_raw.ndim == 2 + ndim:
+        num_channels = moments_raw.shape[1]
+    elif moments_raw.ndim == 1 + ndim:
+        num_channels = 1
+    else:
+        raise ValueError(
+            f"{moments_raw.shape=} does not have expected length of `ndim + 1`"
+            " (or `ndim + 2` for the multi-channel weighted moments case)."
+        )
+    order = moments_raw.shape[-1] - 1
+    max_label = moments_raw.shape[0]
+
+    if moments_raw.dtype.kind != "f":
+        float_dtype = cp.promote_types(cp.float32, moments_raw.dtype)
+        moments_raw = moments_raw.astype(float_dtype)
+
+    moments_kernel = get_moments_central_kernel(moments_raw.dtype, ndim, order)
+    moments_central = cp.zeros_like(moments_raw)
+    # kernel loops over moments so size is max_label * num_channels
+    moments_kernel(moments_raw, moments_central, size=max_label * num_channels)
+    return moments_central
