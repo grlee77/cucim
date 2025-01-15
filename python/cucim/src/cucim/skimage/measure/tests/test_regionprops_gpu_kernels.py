@@ -351,23 +351,23 @@ def test_moments_2d(spacing, order, weighted, intensity_dtype, num_channels):
     else:
         for c in range(num_channels):
             # zeroth moment
-            allclose(moments[:, 0, 0, c], expected[prop + f"-0-0-{c}"])
+            allclose(moments[:, c, 0, 0], expected[prop + f"-0-0-{c}"])
 
         if order > 0:
             # first-order moments
-            allclose(moments[:, 0, 1, c], expected[prop + f"-0-1-{c}"])
-            allclose(moments[:, 1, 0, c], expected[prop + f"-1-0-{c}"])
+            allclose(moments[:, c, 0, 1], expected[prop + f"-0-1-{c}"])
+            allclose(moments[:, c, 1, 0], expected[prop + f"-1-0-{c}"])
         if order > 1:
             # second-order moments
-            allclose(moments[:, 0, 2, c], expected[prop + f"-0-2-{c}"])
-            allclose(moments[:, 1, 1, c], expected[prop + f"-1-1-{c}"])
-            allclose(moments[:, 2, 0, c], expected[prop + f"-2-0-{c}"])
+            allclose(moments[:, c, 0, 2], expected[prop + f"-0-2-{c}"])
+            allclose(moments[:, c, 1, 1], expected[prop + f"-1-1-{c}"])
+            allclose(moments[:, c, 2, 0], expected[prop + f"-2-0-{c}"])
         if order > 3:
             # third-order moments
-            allclose(moments[:, 0, 3, c], expected[prop + f"-0-3-{c}"])
-            allclose(moments[:, 1, 2, c], expected[prop + f"-1-2-{c}"])
-            allclose(moments[:, 2, 1, c], expected[prop + f"-2-1-{c}"])
-            allclose(moments[:, 3, 0, c], expected[prop + f"-3-0-{c}"])
+            allclose(moments[:, c, 0, 3], expected[prop + f"-0-3-{c}"])
+            allclose(moments[:, c, 1, 2], expected[prop + f"-1-2-{c}"])
+            allclose(moments[:, c, 2, 1], expected[prop + f"-2-1-{c}"])
+            allclose(moments[:, c, 3, 0], expected[prop + f"-3-0-{c}"])
 
 
 @pytest.mark.parametrize("spacing", [None, (0.8, 0.5, 0.75)])
@@ -432,29 +432,29 @@ def test_moments_3d(spacing, order, weighted, intensity_dtype, num_channels):
     else:
         for c in range(num_channels):
             # zeroth moment
-            allclose(moments[:, 0, 0, 0, c], expected[prop + f"-0-0-0-{c}"])
+            allclose(moments[:, c, 0, 0, 0], expected[prop + f"-0-0-0-{c}"])
             if order > 0:
                 # first-order moments
-                allclose(moments[:, 0, 0, 1, c], expected[prop + f"-0-0-1-{c}"])
-                allclose(moments[:, 0, 1, 0, c], expected[prop + f"-0-1-0-{c}"])
-                allclose(moments[:, 1, 0, 0, c], expected[prop + f"-1-0-0-{c}"])
+                allclose(moments[:, c, 0, 0, 1], expected[prop + f"-0-0-1-{c}"])
+                allclose(moments[:, c, 0, 1, 0], expected[prop + f"-0-1-0-{c}"])
+                allclose(moments[:, c, 1, 0, 0], expected[prop + f"-1-0-0-{c}"])
             if order > 1:
                 # second-order moments
-                allclose(moments[:, 0, 0, 2, c], expected[prop + f"-0-0-2-{c}"])
-                allclose(moments[:, 0, 2, 0, c], expected[prop + f"-0-2-0-{c}"])
-                allclose(moments[:, 2, 0, 0, c], expected[prop + f"-2-0-0-{c}"])
-                allclose(moments[:, 1, 1, 0, c], expected[prop + f"-1-1-0-{c}"])
-                allclose(moments[:, 1, 0, 1, c], expected[prop + f"-1-0-1-{c}"])
-                allclose(moments[:, 0, 1, 1, c], expected[prop + f"-0-1-1-{c}"])
+                allclose(moments[:, c, 0, 0, 2], expected[prop + f"-0-0-2-{c}"])
+                allclose(moments[:, c, 0, 2, 0], expected[prop + f"-0-2-0-{c}"])
+                allclose(moments[:, c, 2, 0, 0], expected[prop + f"-2-0-0-{c}"])
+                allclose(moments[:, c, 1, 1, 0], expected[prop + f"-1-1-0-{c}"])
+                allclose(moments[:, c, 1, 0, 1], expected[prop + f"-1-0-1-{c}"])
+                allclose(moments[:, c, 0, 1, 1], expected[prop + f"-0-1-1-{c}"])
             if order > 2:
                 # third-order moments
-                allclose(moments[:, 0, 0, 3, c], expected[prop + f"-0-0-3-{c}"])
-                allclose(moments[:, 0, 3, 0, c], expected[prop + f"-0-3-0-{c}"])
-                allclose(moments[:, 3, 0, 0, c], expected[prop + f"-3-0-0-{c}"])
-                allclose(moments[:, 1, 2, 0, c], expected[prop + f"-1-2-0-{c}"])
-                allclose(moments[:, 2, 1, 0, c], expected[prop + f"-2-1-0-{c}"])
-                allclose(moments[:, 1, 0, 2, c], expected[prop + f"-1-0-2-{c}"])
-                allclose(moments[:, 2, 0, 1, c], expected[prop + f"-2-0-1-{c}"])
-                allclose(moments[:, 0, 1, 2, c], expected[prop + f"-0-1-2-{c}"])
-                allclose(moments[:, 0, 2, 1, c], expected[prop + f"-0-2-1-{c}"])
-                allclose(moments[:, 1, 1, 1, c], expected[prop + f"-1-1-1-{c}"])
+                allclose(moments[:, c, 0, 0, 3], expected[prop + f"-0-0-3-{c}"])
+                allclose(moments[:, c, 0, 3, 0], expected[prop + f"-0-3-0-{c}"])
+                allclose(moments[:, c, 3, 0, 0], expected[prop + f"-3-0-0-{c}"])
+                allclose(moments[:, c, 1, 2, 0], expected[prop + f"-1-2-0-{c}"])
+                allclose(moments[:, c, 2, 1, 0], expected[prop + f"-2-1-0-{c}"])
+                allclose(moments[:, c, 1, 0, 2], expected[prop + f"-1-0-2-{c}"])
+                allclose(moments[:, c, 2, 0, 1], expected[prop + f"-2-0-1-{c}"])
+                allclose(moments[:, c, 0, 1, 2], expected[prop + f"-0-1-2-{c}"])
+                allclose(moments[:, c, 0, 2, 1], expected[prop + f"-0-2-1-{c}"])
+                allclose(moments[:, c, 1, 1, 1], expected[prop + f"-1-1-1-{c}"])

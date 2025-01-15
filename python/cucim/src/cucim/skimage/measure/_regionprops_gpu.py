@@ -927,14 +927,15 @@ def get_moments_kernel(
     num_moments = (order + 1) ** ndim
     if num_channels > 1:
         source += f"""
-            {uint_t} num_channels = moments.shape()[label.ndim + 1];
+            {uint_t} num_channels = moments.shape()[1];
             for ({uint_t} c = 0; c < num_channels; c++) {{\n"""
     else:
         source += f"""
             {uint_t} num_channels = 1;
             {uint_t} c = 0;\n"""
     source += f"""
-            {uint_t} offset = (L - 1) * {num_moments} * num_channels + c;\n"""
+            {uint_t} offset = (L - 1) * {num_moments} * num_channels
+                              + c * {num_moments};\n"""
 
     if weighted:
         source += f"""
@@ -951,79 +952,75 @@ def get_moments_kernel(
 
     # need additional multiplication by the intensity value for weighted case
     w = "w * " if weighted else ""
-
-    # index into moments depends on num_channels
-    nc = " * num_channels" if num_channels > 1 else ""
-
     if ndim == 2:
         if order == 1:
             source += f"""
-            atomicAdd(&moments[offset + 1{nc}], {w}c1);
-            atomicAdd(&moments[offset + 2{nc}], {w}c0);\n"""
+            atomicAdd(&moments[offset + 1], {w}c1);
+            atomicAdd(&moments[offset + 2], {w}c0);\n"""
         elif order == 2:
             source += f"""
-            atomicAdd(&moments[offset + 1{nc}], {w}c1);
-            atomicAdd(&moments[offset + 2{nc}], {w}c1 * c1);
-            atomicAdd(&moments[offset + 3{nc}], {w}c0);
-            atomicAdd(&moments[offset + 4{nc}], {w}c0 * c1);
-            atomicAdd(&moments[offset + 6{nc}], {w}c0 * c0);\n"""
+            atomicAdd(&moments[offset + 1], {w}c1);
+            atomicAdd(&moments[offset + 2], {w}c1 * c1);
+            atomicAdd(&moments[offset + 3], {w}c0);
+            atomicAdd(&moments[offset + 4], {w}c0 * c1);
+            atomicAdd(&moments[offset + 6], {w}c0 * c0);\n"""
         elif order == 3:
             source += f"""
-            atomicAdd(&moments[offset + 1{nc}], {w}c1);
-            atomicAdd(&moments[offset + 2{nc}], {w}c1 * c1);
-            atomicAdd(&moments[offset + 3{nc}], {w}c1 * c1 * c1);
-            atomicAdd(&moments[offset + 4{nc}], {w}c0);
-            atomicAdd(&moments[offset + 5{nc}], {w}c0 * c1);
-            atomicAdd(&moments[offset + 6{nc}], {w}c0 * c1 * c1);
-            atomicAdd(&moments[offset + 8{nc}], {w}c0 * c0);
-            atomicAdd(&moments[offset + 9{nc}], {w}c0 * c0 * c1);
-            atomicAdd(&moments[offset + 12{nc}], {w}c0 * c0 * c0);\n"""
+            atomicAdd(&moments[offset + 1], {w}c1);
+            atomicAdd(&moments[offset + 2], {w}c1 * c1);
+            atomicAdd(&moments[offset + 3], {w}c1 * c1 * c1);
+            atomicAdd(&moments[offset + 4], {w}c0);
+            atomicAdd(&moments[offset + 5], {w}c0 * c1);
+            atomicAdd(&moments[offset + 6], {w}c0 * c1 * c1);
+            atomicAdd(&moments[offset + 8], {w}c0 * c0);
+            atomicAdd(&moments[offset + 9], {w}c0 * c0 * c1);
+            atomicAdd(&moments[offset + 12], {w}c0 * c0 * c0);\n"""
     elif ndim == 3:
         if order == 1:
             source += f"""
-            atomicAdd(&moments[offset + 1{nc}], {w}c2);
-            atomicAdd(&moments[offset + 2{nc}], {w}c1);
-            atomicAdd(&moments[offset + 4{nc}], {w}c0);\n"""
+            atomicAdd(&moments[offset + 1], {w}c2);
+            atomicAdd(&moments[offset + 2], {w}c1);
+            atomicAdd(&moments[offset + 4], {w}c0);\n"""
         elif order == 2:
             source += f"""
-            atomicAdd(&moments[offset + 1{nc}], {w}c2);
-            atomicAdd(&moments[offset + 2{nc}], {w}c2 * c2);
-            atomicAdd(&moments[offset + 3{nc}], {w}c1);
-            atomicAdd(&moments[offset + 4{nc}], {w}c1 * c2);
-            atomicAdd(&moments[offset + 6{nc}], {w}c1 * c1);
-            atomicAdd(&moments[offset + 9{nc}], {w}c0);
-            atomicAdd(&moments[offset + 10{nc}], {w}c0 * c2);
-            atomicAdd(&moments[offset + 12{nc}], {w}c0 * c1);
-            atomicAdd(&moments[offset + 18{nc}], {w}c0 * c0);\n"""
+            atomicAdd(&moments[offset + 1], {w}c2);
+            atomicAdd(&moments[offset + 2], {w}c2 * c2);
+            atomicAdd(&moments[offset + 3], {w}c1);
+            atomicAdd(&moments[offset + 4], {w}c1 * c2);
+            atomicAdd(&moments[offset + 6], {w}c1 * c1);
+            atomicAdd(&moments[offset + 9], {w}c0);
+            atomicAdd(&moments[offset + 10], {w}c0 * c2);
+            atomicAdd(&moments[offset + 12], {w}c0 * c1);
+            atomicAdd(&moments[offset + 18], {w}c0 * c0);\n"""
         elif order == 3:
             source += f"""
-            atomicAdd(&moments[offset + 1{nc}], {w}c2);
-            atomicAdd(&moments[offset + 2{nc}], {w}c2 * c2);
-            atomicAdd(&moments[offset + 3{nc}], {w}c2 * c2 * c2);
-            atomicAdd(&moments[offset + 4{nc}], {w}c1);
-            atomicAdd(&moments[offset + 5{nc}], {w}c1 * c2);
-            atomicAdd(&moments[offset + 6{nc}], {w}c1 * c2 * c2);
-            atomicAdd(&moments[offset + 8{nc}], {w}c1 * c1);
-            atomicAdd(&moments[offset + 9{nc}], {w}c1 * c1 * c2);
-            atomicAdd(&moments[offset + 12{nc}], {w}c1 * c1 * c1);
-            atomicAdd(&moments[offset + 16{nc}], {w}c0);
-            atomicAdd(&moments[offset + 17{nc}], {w}c0 * c2);
-            atomicAdd(&moments[offset + 18{nc}], {w}c0 * c2 * c2);
-            atomicAdd(&moments[offset + 20{nc}], {w}c0 * c1);
-            atomicAdd(&moments[offset + 21{nc}], {w}c0 * c1 * c2);
-            atomicAdd(&moments[offset + 24{nc}], {w}c0 * c1 * c1);
-            atomicAdd(&moments[offset + 32{nc}], {w}c0 * c0);
-            atomicAdd(&moments[offset + 33{nc}], {w}c0 * c0 * c2);
-            atomicAdd(&moments[offset + 36{nc}], {w}c0 * c0 * c1);
-            atomicAdd(&moments[offset + 48{nc}], {w}c0 * c0 * c0);\n"""
+            atomicAdd(&moments[offset + 1], {w}c2);
+            atomicAdd(&moments[offset + 2], {w}c2 * c2);
+            atomicAdd(&moments[offset + 3], {w}c2 * c2 * c2);
+            atomicAdd(&moments[offset + 4], {w}c1);
+            atomicAdd(&moments[offset + 5], {w}c1 * c2);
+            atomicAdd(&moments[offset + 6], {w}c1 * c2 * c2);
+            atomicAdd(&moments[offset + 8], {w}c1 * c1);
+            atomicAdd(&moments[offset + 9], {w}c1 * c1 * c2);
+            atomicAdd(&moments[offset + 12], {w}c1 * c1 * c1);
+            atomicAdd(&moments[offset + 16], {w}c0);
+            atomicAdd(&moments[offset + 17], {w}c0 * c2);
+            atomicAdd(&moments[offset + 18], {w}c0 * c2 * c2);
+            atomicAdd(&moments[offset + 20], {w}c0 * c1);
+            atomicAdd(&moments[offset + 21], {w}c0 * c1 * c2);
+            atomicAdd(&moments[offset + 24], {w}c0 * c1 * c1);
+            atomicAdd(&moments[offset + 32], {w}c0 * c0);
+            atomicAdd(&moments[offset + 33], {w}c0 * c0 * c2);
+            atomicAdd(&moments[offset + 36], {w}c0 * c0 * c1);
+            atomicAdd(&moments[offset + 48], {w}c0 * c0 * c0);\n"""
     else:
         raise ValueError("only 2d and 3d shapes are supported")
     if num_channels > 1:
         source += """
-        }  // channels loop"
+            }  // channels loop"
         """
     source += """
-          }\n"""
+        }\n"""
     inputs = f"raw X label, raw {coord_dtype.name} bbox"
     if spacing:
         inputs += ", raw float64 spacing"
@@ -1069,7 +1066,39 @@ def regionprops_moments(
     moments : cp.ndarray
         The moments up to the specified order. Will be stored in an
         ``(order + 1, ) * ndim`` matrix where any elements corresponding to
-        order greater than that specified will be set to 0.
+        order greater than that specified will be set to 0.  For example, for
+        the 2D case, the last two axes represent the 2D moments matrix, ``M``
+        where each matrix would have the following sizes and non-zero entries:
+
+            ```py
+            # for a 2D image with order = 1
+            M = [
+               [m00, m01],
+               [m10,   0],
+            ]
+
+            # for a 2D image with order = 2
+            M = [
+               [m00, m01, m02],
+               [m10, m11,   0],
+               [m20,   0,   0],
+            ]
+
+            # for a 2D image with order = 3
+            M = [
+               [m00, m01, m02, m03],
+               [m10, m11, m12,   0],
+               [m20, m21,   0,   0],
+               [m30,   0,   0,   0],
+            ]
+            ```
+
+        When there is no `intensity_image` or the `intensity_image` is single
+        channel, the shape of the moments output is
+        ``shape = (max_label, ) + (order + 1, ) * ndim``.
+        When the ``intensity_image`` is multichannel a channel axis will be
+        present in the `moments` output at position 1 to give
+        ``shape = (max_label, ) + (num_channels, ) + (order + 1,) * ndim``.
     """
     if max_label is None:
         max_label = int(label_image.max())
@@ -1085,13 +1114,13 @@ def regionprops_moments(
     if intensity_image is not None:
         num_channels = _check_shapes(label_image, intensity_image)
         if num_channels > 1:
-            #  moments_shape = (num_channels,) + moments_shape
-            moments_shape = moments_shape + (num_channels,)
+            moments_shape = (max_label,) + (num_channels,) + (order + 1,) * ndim
         weighted = True
     else:
         num_channels = 1
         weighted = False
 
+    print(f"{moments_shape=}")
     bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
 
     # Initialize value for atomicMin on even coordinates
