@@ -1125,7 +1125,6 @@ def regionprops_moments(
         num_channels = 1
         weighted = False
 
-    print(f"{moments_shape=}")
     bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
 
     # Initialize value for atomicMin on even coordinates
@@ -1552,3 +1551,104 @@ def normalize_central_moments(moments_central, ndim, spacing=None):
     # kernel loops over moments so size is max_label * num_channels
     moments_norm_kernel(*inputs, moments_norm, size=max_label * num_channels)
     return moments_norm
+
+
+@cp.memoize(for_each_device=True)
+def get_moments_hu_kernel(moments_dtype):
+    """Normalizes central moments of order >=2"""
+    moments_dtype = cp.dtype(moments_dtype)
+
+    uint_t = "unsigned int"
+
+    # number is for a densely populated moments matrix of size (order + 1) per
+    # side (values at locations where order is greater than specified will be 0)
+    num_moments = 16
+
+    if moments_dtype.kind != "f":
+        raise ValueError(
+            "`moments_dtype` must be a floating point type for central moments "
+            "calculations."
+        )
+
+    # floating point type used for the intermediate computations
+    float_type = "double"
+
+    # compute offset to the current moment matrix and hu moment vector
+    source = f"""
+            {uint_t} offset_normalized = i * {num_moments};
+            {uint_t} offset_hu = i * 7;\n"""
+
+    source += f"""
+    // retrieve 2nd and 3rd order normalized moments
+    {float_type} m02 = moments_normalized[offset_normalized + 2];
+    {float_type} m03 = moments_normalized[offset_normalized + 3];
+    {float_type} m12 = moments_normalized[offset_normalized + 6];
+    {float_type} m11 = moments_normalized[offset_normalized + 5];
+    {float_type} m20 = moments_normalized[offset_normalized + 8];
+    {float_type} m21 = moments_normalized[offset_normalized + 9];
+    {float_type} m30 = moments_normalized[offset_normalized + 12];
+
+    {float_type} t0 = m30 + m12;
+    {float_type} t1 = m21 + m03;
+    {float_type} q0 = t0 * t0;
+    {float_type} q1 = t1 * t1;
+    {float_type} n4 = 4 * m11;
+    {float_type} s = m20 + m02;
+    {float_type} d = m20 - m02;
+    hu[offset_hu] = s;
+    hu[offset_hu + 1] = d * d + n4 * m11;
+    hu[offset_hu + 3] = q0 + q1;
+    hu[offset_hu + 5] = d * (q0 - q1) + n4 * t0 * t1;
+    t0 *= q0 - 3 * q1;
+    t1 *= 3 * q0 - q1;
+    q0 = m30- 3 * m12;
+    q1 = 3 * m21 - m03;
+    hu[offset_hu + 2] = q0 * q0 + q1 * q1;
+    hu[offset_hu + 4] = q0 * t0 + q1 * t1;
+    hu[offset_hu + 6] = q1 * t0 - q0 * t1;\n"""
+
+    inputs = f"raw {moments_dtype.name} moments_normalized"
+    outputs = f"raw {moments_dtype.name} hu"
+    name = f"cucim_moments_hu_order_{moments_dtype.name}"
+    return cp.ElementwiseKernel(
+        inputs, outputs, source, preamble=_includes, name=name
+    )
+
+
+def moments_hu(moments_normalized):
+    if moments_normalized.ndim == 4:
+        num_channels = moments_normalized.shape[1]
+    elif moments_normalized.ndim == 3:
+        num_channels = 1
+    else:
+        raise ValueError(
+            "Hu's moments are only defined for 2D images. Expected "
+            "`moments_normalized to have 3 dimensions (or 4 for the "
+            "multi-channel `intensity_image` case)."
+        )
+    order = moments_normalized.shape[-1] - 1
+    if order < 3:
+        raise ValueError(
+            "Calculating Hu's moments requires normalized moments of "
+            "order >= 3 to be provided as input"
+        )
+    elif order > 3:
+        # truncate any unused moments
+        moments_normalized = cp.ascontiguousarray(
+            moments_normalized[..., :4, :4]
+        )
+    max_label = moments_normalized.shape[0]
+
+    if moments_normalized.dtype.kind != "f":
+        raise ValueError("moments_normalized must have a floating point dtype")
+
+    moments_hu_kernel = get_moments_hu_kernel(moments_normalized.dtype)
+    # Hu's moments are a set of 7 moments stored instead of a moment matrix
+    hu_shape = moments_normalized.shape[:-2] + (7,)
+    moments_hu = cp.full(hu_shape, cp.nan, dtype=moments_normalized.dtype)
+
+    # kernel loops over moments so size is max_label * num_channels
+    moments_hu_kernel(
+        moments_normalized, moments_hu, size=max_label * num_channels
+    )
+    return moments_hu

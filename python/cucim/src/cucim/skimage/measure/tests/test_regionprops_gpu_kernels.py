@@ -12,6 +12,7 @@ from scipy.ndimage import find_objects as cpu_find_objects
 from cucim.skimage import data, measure
 from cucim.skimage.measure._regionprops_gpu import (
     area_bbox_from_slices,
+    moments_hu,
     moments_to_moments_central,
     normalize_central_moments,
     regionprops_area,
@@ -311,7 +312,7 @@ def test_centroid(precompute_max, local, ndim):
         (True, cp.uint8, 3),
     ],
 )
-@pytest.mark.parametrize("norm_type", ["raw", "central", "normalized"])
+@pytest.mark.parametrize("norm_type", ["raw", "central", "normalized", "hu"])
 def test_moments_2d(
     spacing, order, weighted, intensity_dtype, num_channels, norm_type
 ):
@@ -320,6 +321,11 @@ def test_moments_2d(
     max_label = int(cp.max(labels))
     kwargs = {"spacing": spacing}
     prop = "moments"
+    if norm_type == "hu":
+        if order != 3:
+            pytest.skip("Hu moments require order = 3")
+        elif spacing and spacing != (1.0, 1.0):
+            pytest.skip("Hu moments only support spacing = (1.0, 1.0)")
     if norm_type == "normalized" and order < 2:
         pytest.skip("normalized case only supports order >=2")
     if weighted:
@@ -332,30 +338,36 @@ def test_moments_2d(
         prop += "_central"
     elif norm_type == "normalized":
         prop += "_normalized"
+    elif norm_type == "hu":
+        prop += "_hu"
     expected = measure.regionprops_table(labels, properties=[prop], **kwargs)
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
-    if norm_type in ["central", "normalized"]:
+    if norm_type in ["central", "normalized", "hu"]:
         ndim = len(shape)
         moments = moments_to_moments_central(moments, ndim=ndim)
-        if norm_type == "normalized":
+        if norm_type in ["normalized", "hu"]:
             moments = normalize_central_moments(
                 moments, ndim=ndim, spacing=spacing
             )
+            if norm_type == "normalized":
+                # assert that np.nan values were set for non-computed orders
+                orders = cp.arange(order + 1)[:, cp.newaxis]
+                orders = orders + orders.T
+                mask = cp.logical_and(orders < 1, orders > order)
+                # prepend labels (and channels) axes
+                if num_channels > 1:
+                    mask = mask[cp.newaxis, cp.newaxis, ...]
+                    mask = cp.tile(mask, moments.shape[:2] + (1, 1))
+                else:
+                    mask = mask[cp.newaxis, ...]
+                    mask = cp.tile(mask, moments.shape[:1] + (1, 1))
+                assert cp.all(cp.isnan(moments[mask]))
 
-            # assert that np.nan values were set for non-computed orders
-            orders = cp.arange(order + 1)[:, cp.newaxis]
-            orders = orders + orders.T
-            mask = cp.logical_and(orders < 1, orders > order)
-            # prepend labels (and channels) axes
-            if num_channels > 1:
-                mask = mask[cp.newaxis, cp.newaxis, ...]
-                mask = cp.tile(mask, moments.shape[:2] + (1, 1))
-            else:
-                mask = mask[cp.newaxis, ...]
-                mask = cp.tile(mask, moments.shape[:1] + (1, 1))
-            assert cp.all(cp.isnan(moments[mask]))
+            if norm_type == "hu":
+                moments = moments_hu(moments)
+                assert moments.shape[-1] == 7
 
     # regionprops does not use the more accurate analytical expressions for the
     # central moments, so need to relax tolerance in the "central" moments case
@@ -363,53 +375,64 @@ def test_moments_2d(
     atol = 1e-5 if norm_type != "raw" else 0
 
     allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
-    if num_channels == 1:
-        # zeroth moment
-        allclose(moments[:, 0, 0], expected[prop + "-0-0"])
-
-        if order > 0 and norm_type != "normalized":
-            # first-order moments
-            if norm_type == "central":
-                assert_array_equal(moments[:, 0, 1], 0.0)
-                assert_array_equal(moments[:, 1, 0], 0.0)
-            else:
-                allclose(moments[:, 0, 1], expected[prop + "-0-1"])
-                allclose(moments[:, 1, 0], expected[prop + "-1-0"])
-        if order > 1:
-            # second-order moments
-            allclose(moments[:, 0, 2], expected[prop + "-0-2"])
-            allclose(moments[:, 1, 1], expected[prop + "-1-1"])
-            allclose(moments[:, 2, 0], expected[prop + "-2-0"])
-        if order > 3:
-            # third-order moments
-            allclose(moments[:, 0, 3], expected[prop + "-0-3"])
-            allclose(moments[:, 1, 2], expected[prop + "-1-2"])
-            allclose(moments[:, 2, 1], expected[prop + "-2-1"])
-            allclose(moments[:, 3, 0], expected[prop + "-3-0"])
+    if norm_type == "hu":
+        # hu moments are stored as a 7-element vector
+        if num_channels == 1:
+            for d in range(7):
+                allclose(moments[:, d], expected[prop + f"-{d}"])
+        else:
+            for c in range(num_channels):
+                for d in range(7):
+                    allclose(moments[:, c, d], expected[prop + f"-{d}-{c}"])
     else:
-        for c in range(num_channels):
+        # All other moment types produce a (order + 1, order + 1) matrix
+        if num_channels == 1:
             # zeroth moment
-            allclose(moments[:, c, 0, 0], expected[prop + f"-0-0-{c}"])
+            allclose(moments[:, 0, 0], expected[prop + "-0-0"])
 
-        if order > 0 and norm_type != "normalized":
-            # first-order moments
-            if norm_type == "central":
-                assert_array_equal(moments[:, c, 0, 1], 0.0)
-                assert_array_equal(moments[:, c, 1, 0], 0.0)
-            else:
-                allclose(moments[:, c, 0, 1], expected[prop + f"-0-1-{c}"])
-                allclose(moments[:, c, 1, 0], expected[prop + f"-1-0-{c}"])
-        if order > 1:
-            # second-order moments
-            allclose(moments[:, c, 0, 2], expected[prop + f"-0-2-{c}"])
-            allclose(moments[:, c, 1, 1], expected[prop + f"-1-1-{c}"])
-            allclose(moments[:, c, 2, 0], expected[prop + f"-2-0-{c}"])
-        if order > 3:
-            # third-order moments
-            allclose(moments[:, c, 0, 3], expected[prop + f"-0-3-{c}"])
-            allclose(moments[:, c, 1, 2], expected[prop + f"-1-2-{c}"])
-            allclose(moments[:, c, 2, 1], expected[prop + f"-2-1-{c}"])
-            allclose(moments[:, c, 3, 0], expected[prop + f"-3-0-{c}"])
+            if order > 0 and norm_type != "normalized":
+                # first-order moments
+                if norm_type == "central":
+                    assert_array_equal(moments[:, 0, 1], 0.0)
+                    assert_array_equal(moments[:, 1, 0], 0.0)
+                else:
+                    allclose(moments[:, 0, 1], expected[prop + "-0-1"])
+                    allclose(moments[:, 1, 0], expected[prop + "-1-0"])
+            if order > 1:
+                # second-order moments
+                allclose(moments[:, 0, 2], expected[prop + "-0-2"])
+                allclose(moments[:, 1, 1], expected[prop + "-1-1"])
+                allclose(moments[:, 2, 0], expected[prop + "-2-0"])
+            if order > 3:
+                # third-order moments
+                allclose(moments[:, 0, 3], expected[prop + "-0-3"])
+                allclose(moments[:, 1, 2], expected[prop + "-1-2"])
+                allclose(moments[:, 2, 1], expected[prop + "-2-1"])
+                allclose(moments[:, 3, 0], expected[prop + "-3-0"])
+        else:
+            for c in range(num_channels):
+                # zeroth moment
+                allclose(moments[:, c, 0, 0], expected[prop + f"-0-0-{c}"])
+
+            if order > 0 and norm_type != "normalized":
+                # first-order moments
+                if norm_type == "central":
+                    assert_array_equal(moments[:, c, 0, 1], 0.0)
+                    assert_array_equal(moments[:, c, 1, 0], 0.0)
+                else:
+                    allclose(moments[:, c, 0, 1], expected[prop + f"-0-1-{c}"])
+                    allclose(moments[:, c, 1, 0], expected[prop + f"-1-0-{c}"])
+            if order > 1:
+                # second-order moments
+                allclose(moments[:, c, 0, 2], expected[prop + f"-0-2-{c}"])
+                allclose(moments[:, c, 1, 1], expected[prop + f"-1-1-{c}"])
+                allclose(moments[:, c, 2, 0], expected[prop + f"-2-0-{c}"])
+            if order > 3:
+                # third-order moments
+                allclose(moments[:, c, 0, 3], expected[prop + f"-0-3-{c}"])
+                allclose(moments[:, c, 1, 2], expected[prop + f"-1-2-{c}"])
+                allclose(moments[:, c, 2, 1], expected[prop + f"-2-1-{c}"])
+                allclose(moments[:, c, 3, 0], expected[prop + f"-3-0-{c}"])
 
 
 @pytest.mark.parametrize("spacing", [None, (0.8, 0.5, 0.75)])
