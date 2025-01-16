@@ -1243,6 +1243,8 @@ def get_moments_central_kernel(
             out[offset + 6] = m12 - 2*cy*m11 - cx*m02 + 2*cy*cx*m01;            // out[1, 2]
             out[offset + 9] = m21 - 2*cx*m11 - cy*m20 + cx*cx*m01 + cy*cx*m10;  // out[2, 1]
             out[offset + 12] = m30 - 3*cx*m20 + 2*cx*cx*m10;                    // out[3, 0]\n"""  # noqa: E501
+        else:
+            raise ValueError("only order <= 3 is supported")
     elif ndim == 3:
         if order <= 1:
             # only zeroth moment is non-zero for central moments
@@ -1325,6 +1327,8 @@ def get_moments_central_kernel(
             out[offset + 33] = cx*cx*m001 - 2*cx*m101 + cz*(cx*m100 - m200) + m201;          // out[2, 0, 1]
             out[offset + 36] = cx*cx*m010 - 2*cx*m110 + cy*(cx*m100 - m200) + m210;          // out[2, 1, 0]
             out[offset + 48] = 2*cx*cx*m100 - 3*cx*m200 + m300;                              // out[3, 0, 0]\n"""  # noqa: E501
+        else:
+            raise ValueError("only order <= 3 is supported")
     else:
         # note: ndim here is the number of spatial image dimensions
         raise ValueError("only ndim = 2 or 3 is supported")
@@ -1358,3 +1362,193 @@ def moments_to_moments_central(moments_raw, ndim):
     # kernel loops over moments so size is max_label * num_channels
     moments_kernel(moments_raw, moments_central, size=max_label * num_channels)
     return moments_central
+
+
+@cp.memoize(for_each_device=True)
+def get_moments_normalize_kernel(moments_dtype, ndim, order, unit_scale=False):
+    """Normalizes central moments of order >=2"""
+    moments_dtype = cp.dtype(moments_dtype)
+
+    uint_t = "unsigned int"
+
+    # number is for a densely populated moments matrix of size (order + 1) per
+    # side (values at locations where order is greater than specified will be 0)
+    num_moments = (order + 1) ** ndim
+
+    if moments_dtype.kind != "f":
+        raise ValueError(
+            "`moments_dtype` must be a floating point type for central moments "
+            "calculations."
+        )
+
+    # floating point type used for the intermediate computations
+    float_type = "double"
+
+    source = f"""
+            {uint_t} offset = i * {num_moments};\n"""
+    if ndim == 2:
+        if order == 2:
+            source += f"""
+            // retrieve zeroth moment
+            {float_type} m00 = moments_central[offset];\n"""
+
+            # compute normalization factor
+            source += f"""
+            {float_type} norm_order2 = pow(m00, 2.0 / {ndim} + 1.0);"""
+            if not unit_scale:
+                source += """
+                norm_order2 *= scale * scale;\n"""
+
+            # normalize
+            source += """
+            // normalize the 2nd order central moments
+            out[offset + 2] = moments_central[offset + 2] / norm_order2;  // out[0, 2]
+            out[offset + 4] = moments_central[offset + 4] / norm_order2;  // out[1, 1]
+            out[offset + 6] = moments_central[offset + 6] / norm_order2;  // out[2, 0]\n"""  # noqa: E501
+        elif order == 3:
+            source += f"""
+            // retrieve zeroth moment
+            {float_type} m00 = moments_central[offset];\n"""
+
+            # compute normalization factor
+            source += f"""
+            {float_type} norm_order2 = pow(m00, 2.0 / {ndim} + 1.0);
+            {float_type} norm_order3 = pow(m00, 3.0 / {ndim} + 1.0);"""
+            if not unit_scale:
+                source += """
+                norm_order2 *= scale * scale;
+                norm_order3 *= scale * scale * scale;\n"""
+
+            # normalize
+            source += """
+            // normalize the 2nd order central moments
+            out[offset + 2] = moments_central[offset + 2] / norm_order2;  // out[0, 2]
+            out[offset + 5] = moments_central[offset + 5] / norm_order2;  // out[1, 1]
+            out[offset + 8] = moments_central[offset + 8] / norm_order2;  // out[2, 0]
+            // normalize the 3rd order central moments
+            out[offset + 3] = moments_central[offset + 3] / norm_order3;    // out[0, 3]
+            out[offset + 6] = moments_central[offset + 6] / norm_order3;    // out[1, 2]
+            out[offset + 9] = moments_central[offset + 9] / norm_order3;    // out[2, 1]
+            out[offset + 12] = moments_central[offset + 12] / norm_order3;  // out[3, 0]\n"""  # noqa: E501
+        else:
+            raise ValueError("only order = 2 or 3 is supported")
+    elif ndim == 3:
+        if order == 2:
+            source += f"""
+            // retrieve the zeroth moment
+            {float_type} m000 = moments_central[offset];\n"""
+
+            # compute normalization factor
+            source += f"""
+            {float_type} norm_order2 = pow(m000, 2.0 / {ndim} + 1.0);"""
+            if not unit_scale:
+                source += """
+                norm_order2 *= scale * scale;\n"""
+
+            # normalize
+            source += """
+            // normalize the 2nd order central moments
+            out[offset + 2] = moments_central[offset + 2] / norm_order2;    // out[0, 0, 2]
+            out[offset + 4] = moments_central[offset + 4] / norm_order2;    // out[0, 1, 1]
+            out[offset + 6] = moments_central[offset + 6] / norm_order2;    // out[0, 2, 0]
+            out[offset + 10] = moments_central[offset + 10] / norm_order2;  // out[1, 0, 1]
+            out[offset + 12] = moments_central[offset + 12] / norm_order2;  // out[1, 1, 0]
+            out[offset + 18] = moments_central[offset + 18] / norm_order2;  // out[2, 0, 0]\n"""  # noqa: E501
+        elif order == 3:
+            source += f"""
+            // retrieve the zeroth moment
+            {float_type} m000 = moments_central[offset];\n"""
+
+            # compute normalization factor
+            source += f"""
+            {float_type} norm_order2 = pow(m000, 2.0 / {ndim} + 1.0);
+            {float_type} norm_order3 = pow(m000, 3.0 / {ndim} + 1.0);"""
+            if not unit_scale:
+                source += """
+                norm_order2 *= scale * scale;
+                norm_order3 *= scale * scale * scale;\n"""
+
+            # normalize
+            source += """
+            // normalize the 2nd order central moments
+            out[offset + 2] = moments_central[offset + 2] / norm_order2;    // out[0, 0, 2]
+            out[offset + 5] = moments_central[offset + 5] / norm_order2;    // out[0, 1, 1]
+            out[offset + 8] = moments_central[offset + 8] / norm_order2;    // out[0, 2, 0]
+            out[offset + 17] = moments_central[offset + 17] / norm_order2;  // out[1, 0, 1]
+            out[offset + 20] = moments_central[offset + 20] / norm_order2;  // out[1, 1, 0]
+            out[offset + 32] = moments_central[offset + 32] / norm_order2;  // out[2, 0, 0]
+            // normalize the 3rd order central moments
+            out[offset + 3] = moments_central[offset + 3] / norm_order3;    // out[0, 0, 3]
+            out[offset + 6] = moments_central[offset + 6] / norm_order3;    // out[0, 1, 2]
+            out[offset + 9] = moments_central[offset + 9] / norm_order3;    // out[0, 2, 1]
+            out[offset + 12] = moments_central[offset + 12] / norm_order3;  // out[0, 3, 0]
+            out[offset + 18] = moments_central[offset + 18] / norm_order3;  // out[1, 0, 2]
+            out[offset + 21] = moments_central[offset + 21] / norm_order3;  // out[1, 1, 1]
+            out[offset + 24] = moments_central[offset + 24] / norm_order3;  // out[1, 2, 0]
+            out[offset + 33] = moments_central[offset + 33] / norm_order3;  // out[2, 0, 1]
+            out[offset + 36] = moments_central[offset + 36] / norm_order3;  // out[2, 1, 0]
+            out[offset + 48] = moments_central[offset + 48] / norm_order3;  // out[3, 0, 0]\n"""  # noqa: E501
+        else:
+            raise ValueError("only order = 2 or 3 is supported")
+    else:
+        # note: ndim here is the number of spatial image dimensions
+        raise ValueError("only ndim = 2 or 3 is supported")
+    inputs = "raw X moments_central"
+    if not unit_scale:
+        inputs += ", float64 scale"
+    outputs = "raw X out"
+    name = f"cucim_moments_normalized_order{order}_{ndim}d"
+    return cp.ElementwiseKernel(
+        inputs, outputs, source, preamble=_includes, name=name
+    )
+
+
+def normalize_central_moments(moments_central, ndim, spacing=None):
+    if moments_central.ndim == 2 + ndim:
+        num_channels = moments_central.shape[1]
+    elif moments_central.ndim == 1 + ndim:
+        num_channels = 1
+    else:
+        raise ValueError(
+            f"{moments_central.shape=} does not have expected length of "
+            " `ndim + 1` (or `ndim + 2` for the multi-channel weighted moments "
+            "case)."
+        )
+    order = moments_central.shape[-1] - 1
+    if order < 2 or order > 3:
+        raise ValueError(
+            "normalized moment calculations only implemented for order=2 "
+            "and order=3"
+        )
+    if ndim < 2 or ndim > 3:
+        raise ValueError(
+            "moment normalization only implemented for 2D and 3D images"
+        )
+    max_label = moments_central.shape[0]
+
+    if moments_central.dtype.kind != "f":
+        raise ValueError("moments_central must have a floating point dtype")
+
+    if spacing is None:
+        unit_scale = True
+        inputs = (moments_central,)
+    else:
+        if spacing:
+            if isinstance(spacing, cp.ndarray):
+                scale = spacing.min()
+            else:
+                scale = float(min(spacing))
+        unit_scale = False
+        inputs = (moments_central, scale)
+
+    moments_norm_kernel = get_moments_normalize_kernel(
+        moments_central.dtype, ndim, order, unit_scale=unit_scale
+    )
+    # output is NaN except for locations with orders in range [2, order]
+    moments_norm = cp.full(
+        moments_central.shape, cp.nan, dtype=moments_central.dtype
+    )
+
+    # kernel loops over moments so size is max_label * num_channels
+    moments_norm_kernel(*inputs, moments_norm, size=max_label * num_channels)
+    return moments_norm
