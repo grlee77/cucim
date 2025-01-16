@@ -13,6 +13,7 @@ from cucim.skimage import data, measure
 from cucim.skimage.measure._regionprops_gpu import (
     area_bbox_from_slices,
     moments_to_moments_central,
+    normalize_central_moments,
     regionprops_area,
     regionprops_area_bbox,
     regionprops_bbox_coords,
@@ -310,42 +311,65 @@ def test_centroid(precompute_max, local, ndim):
         (True, cp.uint8, 3),
     ],
 )
-@pytest.mark.parametrize("central", [False, True])
+@pytest.mark.parametrize("norm_type", ["raw", "central", "normalized"])
 def test_moments_2d(
-    spacing, order, weighted, intensity_dtype, num_channels, central
+    spacing, order, weighted, intensity_dtype, num_channels, norm_type
 ):
     shape = (800, 600)
     labels = get_labels_nd(shape)
     max_label = int(cp.max(labels))
     kwargs = {"spacing": spacing}
+    prop = "moments"
+    if norm_type == "normalized" and order < 2:
+        pytest.skip("normalized case only supports order >=2")
     if weighted:
         intensity_image = get_intensity_image(
             shape, dtype=intensity_dtype, num_channels=num_channels
         )
         kwargs["intensity_image"] = intensity_image
-        prop = "moments_weighted_central" if central else "moments_weighted"
-    else:
-        prop = "moments_central" if central else "moments"
+        prop += "_weighted"
+    if norm_type == "central":
+        prop += "_central"
+    elif norm_type == "normalized":
+        prop += "_normalized"
     expected = measure.regionprops_table(labels, properties=[prop], **kwargs)
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
-    if central:
-        moments = moments_to_moments_central(moments, ndim=len(shape))
+    if norm_type in ["central", "normalized"]:
+        ndim = len(shape)
+        moments = moments_to_moments_central(moments, ndim=ndim)
+        if norm_type == "normalized":
+            moments = normalize_central_moments(
+                moments, ndim=ndim, spacing=spacing
+            )
+
+            # assert that np.nan values were set for non-computed orders
+            orders = cp.arange(order + 1)[:, cp.newaxis]
+            orders = orders + orders.T
+            mask = cp.logical_and(orders < 1, orders > order)
+            # prepend labels (and channels) axes
+            if num_channels > 1:
+                mask = mask[cp.newaxis, cp.newaxis, ...]
+                mask = cp.tile(mask, moments.shape[:2] + (1, 1))
+            else:
+                mask = mask[cp.newaxis, ...]
+                mask = cp.tile(mask, moments.shape[:1] + (1, 1))
+            assert cp.all(cp.isnan(moments[mask]))
 
     # regionprops does not use the more accurate analytical expressions for the
     # central moments, so need to relax tolerance in the "central" moments case
-    rtol = 1e-4 if central else 1e-6
-    atol = 1e-5 if central else 0
+    rtol = 1e-4 if norm_type != "raw" else 1e-6
+    atol = 1e-5 if norm_type != "raw" else 0
 
     allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
     if num_channels == 1:
         # zeroth moment
         allclose(moments[:, 0, 0], expected[prop + "-0-0"])
 
-        if order > 0:
+        if order > 0 and norm_type != "normalized":
             # first-order moments
-            if central:
+            if norm_type == "central":
                 assert_array_equal(moments[:, 0, 1], 0.0)
                 assert_array_equal(moments[:, 1, 0], 0.0)
             else:
@@ -367,9 +391,9 @@ def test_moments_2d(
             # zeroth moment
             allclose(moments[:, c, 0, 0], expected[prop + f"-0-0-{c}"])
 
-        if order > 0:
+        if order > 0 and norm_type != "normalized":
             # first-order moments
-            if central:
+            if norm_type == "central":
                 assert_array_equal(moments[:, c, 0, 1], 0.0)
                 assert_array_equal(moments[:, c, 1, 0], 0.0)
             else:
@@ -398,42 +422,69 @@ def test_moments_2d(
         (True, cp.uint8, 3),
     ],
 )
-@pytest.mark.parametrize("central", [False, True])
+@pytest.mark.parametrize("norm_type", ["raw", "central", "normalized"])
 def test_moments_3d(
-    spacing, order, weighted, intensity_dtype, num_channels, central
+    spacing, order, weighted, intensity_dtype, num_channels, norm_type
 ):
     shape = (96, 64, 48)
     labels = get_labels_nd(shape)
     max_label = int(cp.max(labels))
     kwargs = {"spacing": spacing}
+    prop = "moments"
+    if norm_type == "normalized" and order < 2:
+        pytest.skip("normalized case only supports order >=2")
     if weighted:
         intensity_image = get_intensity_image(
             shape, dtype=intensity_dtype, num_channels=num_channels
         )
         kwargs["intensity_image"] = intensity_image
-        prop = "moments_weighted_central" if central else "moments_weighted"
-    else:
-        prop = "moments_central" if central else "moments"
-    # regionprops_table always computes 3rd order moments
+        prop += "_weighted"
+    if norm_type == "central":
+        prop += "_central"
+    elif norm_type == "normalized":
+        prop += "_normalized"
     expected = measure.regionprops_table(labels, properties=[prop], **kwargs)
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
-    if central:
-        moments = moments_to_moments_central(moments, ndim=len(shape))
+    if norm_type in ["central", "normalized"]:
+        ndim = len(shape)
+        moments = moments_to_moments_central(moments, ndim=ndim)
+        if norm_type == "normalized":
+            moments = normalize_central_moments(
+                moments, ndim=ndim, spacing=spacing
+            )
+
+            # assert that np.nan values were set for non-computed orders
+            orders = cp.arange(order + 1)
+            orders = (
+                orders[:, cp.newaxis, cp.newaxis]
+                + orders[cp.newaxis, :, cp.newaxis]
+                + orders[cp.newaxis, cp.newaxis, :]
+            )
+            mask = cp.logical_and(orders < 1, orders > order)
+            # prepend labels (and channels) axes and replicate mask to match
+            # the moments shape
+            if num_channels > 1:
+                mask = mask[cp.newaxis, cp.newaxis, ...]
+                mask = cp.tile(mask, moments.shape[:2] + (1, 1, 1))
+            else:
+                mask = mask[cp.newaxis, ...]
+                mask = cp.tile(mask, moments.shape[:1] + (1, 1, 1))
+            assert cp.all(cp.isnan(moments[mask]))
 
     # regionprops does not use the more accurate analytical expressions for the
     # central moments, so need to relax tolerance in the "central" moments case
-    rtol = 1e-4 if central else 1e-6
-    atol = 1e-3 if central else 0
+    rtol = 1e-4 if norm_type != "raw" else 1e-6
+    atol = 1e-3 if norm_type != "raw" else 0
 
     allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
     if num_channels == 1:
         # zeroth moment
         allclose(moments[:, 0, 0, 0], expected[prop + "-0-0-0"])
-        if order > 0:
+        if order > 0 and norm_type != "normalized":
             # first-order moments
-            if central:
+            if norm_type == "central":
                 assert_array_equal(moments[:, 0, 0, 1], 0.0)
                 assert_array_equal(moments[:, 0, 1, 0], 0.0)
                 assert_array_equal(moments[:, 1, 0, 0], 0.0)
@@ -465,9 +516,9 @@ def test_moments_3d(
         for c in range(num_channels):
             # zeroth moment
             allclose(moments[:, c, 0, 0, 0], expected[prop + f"-0-0-0-{c}"])
-            if order > 0:
+            if order > 0 and norm_type != "normalized":
                 # first-order moments
-                if central:
+                if norm_type == "central":
                     assert_array_equal(moments[:, c, 0, 0, 1], 0.0)
                     assert_array_equal(moments[:, c, 0, 1, 0], 0.0)
                     assert_array_equal(moments[:, c, 1, 0, 0], 0.0)
