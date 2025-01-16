@@ -20,6 +20,8 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_bbox_coords,
     regionprops_centroid,
     regionprops_centroid_local,
+    regionprops_inertia_tensor,
+    regionprops_inertia_tensor_eigvals,
     regionprops_intensity_max,
     regionprops_intensity_mean,
     regionprops_intensity_min,
@@ -575,3 +577,70 @@ def test_moments_3d(
                 allclose(moments[:, c, 0, 1, 2], expected[prop + f"-0-1-2-{c}"])
                 allclose(moments[:, c, 0, 2, 1], expected[prop + f"-0-2-1-{c}"])
                 allclose(moments[:, c, 1, 1, 1], expected[prop + f"-1-1-1-{c}"])
+
+
+@pytest.mark.parametrize("spacing", [None, (0.8, 0.5, 1.2)])
+@pytest.mark.parametrize("order", [1, 2, 3])
+@pytest.mark.parametrize("shape", [(800, 600), (80, 60, 40)])
+def test_inertia_tensor(shape, spacing, order):
+    ndim = len(shape)
+    labels = get_labels_nd(shape)
+
+    max_label = int(cp.max(labels))
+    if spacing is not None:
+        # omit 3rd element for 2d images
+        spacing = spacing[:ndim]
+    kwargs = {"spacing": spacing}
+    expected = measure.regionprops_table(
+        labels,
+        properties=["inertia_tensor", "inertia_tensor_eigvals"],
+        **kwargs,
+    )
+    moments_raw = regionprops_moments(
+        labels, max_label=max_label, order=order, **kwargs
+    )
+    moments_central = moments_to_moments_central(moments_raw, ndim=ndim)
+
+    if order < 2:
+        # can't compute inertia tensor without 2nd order moments
+        with pytest.raises(ValueError):
+            regionprops_inertia_tensor(moments_central, ndim=ndim)
+        return
+
+    itensor = regionprops_inertia_tensor(moments_central, ndim=ndim)
+    assert itensor.shape[-2:] == (ndim, ndim)
+
+    eigvals = regionprops_inertia_tensor_eigvals(itensor)
+    assert eigvals.shape[-1] == ndim
+
+    # regionprops does not use the more accurate analytical expressions for the
+    # central moments, so need to relax tolerance in the "central" moments case
+    rtol = 1e-4
+    atol = 1e-5
+    allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
+    if ndim == 2:
+        # valida inertia tensor
+        allclose(itensor[:, 0, 0], expected["inertia_tensor-0-0"])
+        allclose(itensor[:, 0, 1], expected["inertia_tensor-0-1"])
+        allclose(itensor[:, 1, 0], expected["inertia_tensor-1-0"])
+        allclose(itensor[:, 1, 1], expected["inertia_tensor-1-1"])
+
+        # validate eigenvalues
+        allclose(eigvals[:, 0], expected["inertia_tensor_eigvals-0"])
+        allclose(eigvals[:, 1], expected["inertia_tensor_eigvals-1"])
+    elif ndim == 3:
+        # valida inertia tensor
+        allclose(itensor[:, 0, 0], expected["inertia_tensor-0-0"])
+        allclose(itensor[:, 0, 1], expected["inertia_tensor-0-1"])
+        allclose(itensor[:, 0, 2], expected["inertia_tensor-0-2"])
+        allclose(itensor[:, 1, 0], expected["inertia_tensor-1-0"])
+        allclose(itensor[:, 1, 1], expected["inertia_tensor-1-1"])
+        allclose(itensor[:, 1, 2], expected["inertia_tensor-1-2"])
+        allclose(itensor[:, 2, 0], expected["inertia_tensor-2-0"])
+        allclose(itensor[:, 2, 1], expected["inertia_tensor-2-1"])
+        allclose(itensor[:, 2, 2], expected["inertia_tensor-2-2"])
+
+        # validate eigenvalues
+        allclose(eigvals[:, 0], expected["inertia_tensor_eigvals-0"])
+        allclose(eigvals[:, 1], expected["inertia_tensor_eigvals-1"])
+        allclose(eigvals[:, 2], expected["inertia_tensor_eigvals-2"])
