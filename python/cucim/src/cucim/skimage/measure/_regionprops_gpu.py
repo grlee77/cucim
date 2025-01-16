@@ -1652,3 +1652,282 @@ def moments_hu(moments_normalized):
         moments_normalized, moments_hu, size=max_label * num_channels
     )
     return moments_hu
+
+
+def _get_inertia_tensor_2x2_kernel():
+    operation = """
+    F mu0, mxx, mxy, myy;
+    mu0 = mu[0];
+    mxx = mu[6];
+    myy = mu[2];
+    mxy = mu[4];
+
+    result[0] = myy / mu0;
+    result[1] = result[2] = -mxy / mu0;
+    result[3] = mxx / mu0;
+    """
+    return cp.ElementwiseKernel(
+        in_params="raw F mu",
+        out_params="raw F result",
+        operation=operation,
+        name="cucim_skimage_measure_inertia_tensor_2x2",
+    )
+
+
+def _get_inertia_tensor_3x3_kernel():
+    operation = """
+    F mu0, mxx, myy, mzz, mxy, mxz, myz;
+    mu0 = mu[0];   // mu[0, 0, 0]
+    mxx = mu[18];  // mu[2, 0, 0]
+    myy = mu[6];   // mu[0, 2, 0]
+    mzz = mu[2];   // mu[0, 0, 2]
+
+    mxy = mu[12];  // mu[1, 1, 0]
+    mxz = mu[10];  // mu[1, 0, 1]
+    myz = mu[4];   // mu[0, 1, 1]
+
+    result[0] = (myy + mzz) / mu0;
+    result[4] = (mxx + mzz) / mu0;
+    result[8] = (mxx + myy) / mu0;
+
+    result[1] = result[3] = -mxy / mu0;
+    result[2] = result[6] = -mxz / mu0;
+    result[5] = result[7] = -myz / mu0;
+    """
+    return cp.ElementwiseKernel(
+        in_params="raw F mu",
+        out_params="raw F result",
+        operation=operation,
+        name="cucim_skimage_measure_inertia_tensor_3x3",
+    )
+
+
+@cp.memoize(for_each_device=True)
+def get_inertia_tensor_kernel(moments_dtype, ndim):
+    """Normalizes central moments of order >=2"""
+    moments_dtype = cp.dtype(moments_dtype)
+
+    # assume moments input was truncated to only hold order<=2 moments
+    num_moments = 3**ndim
+
+    # size of the inertia_tensor matrix
+    num_out = ndim * ndim
+
+    if moments_dtype.kind != "f":
+        raise ValueError(
+            "`moments_dtype` must be a floating point type for central moments "
+            "calculations."
+        )
+
+    source = f"""
+            unsigned int offset = i * {num_moments};
+            unsigned int offset_out = i * {num_out};\n"""
+    if ndim == 2:
+        source += """
+        F mu0 = moments_central[offset];
+        F mxx = moments_central[offset + 6];
+        F myy = moments_central[offset + 2];
+        F mxy = moments_central[offset + 4];
+
+        out[offset_out + 0] = myy / mu0;
+        out[offset_out + 1] = -mxy / mu0;
+        out[offset_out + 2] = -mxy / mu0;
+        out[offset_out + 3] = mxx / mu0;\n"""
+    elif ndim == 3:
+        source += """
+        F mu0 = moments_central[offset];       // [0, 0, 0]
+        F mxx = moments_central[offset + 18];  // [2, 0, 0]
+        F myy = moments_central[offset + 6];   // [0, 2, 0]
+        F mzz = moments_central[offset + 2];   // [0, 0, 2]
+
+        F mxy = moments_central[offset + 12];  // [1, 1, 0]
+        F mxz = moments_central[offset + 10];  // [1, 0, 1]
+        F myz = moments_central[offset + 4];   // [0, 1, 1]
+
+        out[offset_out + 0] = (myy + mzz) / mu0;
+        out[offset_out + 4] = (mxx + mzz) / mu0;
+        out[offset_out + 8] = (mxx + myy) / mu0;
+        out[offset_out + 1] = -mxy / mu0;
+        out[offset_out + 3] = -mxy / mu0;
+        out[offset_out + 2] = -mxz / mu0;
+        out[offset_out + 6] = -mxz / mu0;
+        out[offset_out + 5] = -myz / mu0;
+        out[offset_out + 7] = -myz / mu0;\n"""
+    else:
+        # note: ndim here is the number of spatial image dimensions
+        raise ValueError("only ndim = 2 or 3 is supported")
+    inputs = "raw F moments_central"
+    outputs = "raw F out"
+    name = f"cucim_inertia_tensor_{ndim}d"
+    return cp.ElementwiseKernel(
+        inputs, outputs, source, preamble=_includes, name=name
+    )
+
+
+def regionprops_inertia_tensor(moments_central, ndim, spacing=None):
+    if ndim < 2 or ndim > 3:
+        raise ValueError("inertia tensor only implemented for 2D and 3D images")
+    nbatch = math.prod(moments_central.shape[:-2])
+
+    if moments_central.dtype.kind != "f":
+        raise ValueError("moments_central must have a floating point dtype")
+    order = moments_central.shape[-1] - 1
+    if order < 2:
+        raise ValueError(
+            f"inertia tensor calculation requires order>=2, found {order}"
+        )
+    if order > 2:
+        # truncate to only the 2nd order moments
+        slice_kept = (Ellipsis,) + (slice(0, 3),) * ndim
+        moments_central = cp.ascontiguousarray(moments_central[slice_kept])
+
+    kernel = get_inertia_tensor_kernel(moments_central.dtype, ndim)
+    itensor_shape = moments_central.shape[:-ndim] + (ndim, ndim)
+    itensor = cp.zeros(itensor_shape, dtype=moments_central.dtype)
+    kernel(moments_central, itensor, size=nbatch)
+    return itensor
+
+
+@cp.memoize(for_each_device=True)
+def get_inertia_tensor_eigvals_kernel(ndim):
+    """Compute inertia tensor eigenvalues
+
+    C. Deledalle, L. Denis, S. Tabti, F. Tupin. Closed-form expressions
+    of the eigen decomposition of 2 x 2 and 3 x 3 Hermitian matrices.
+
+    [Research Report] Université de Lyon. 2017.
+    https://hal.archives-ouvertes.fr/hal-01501221/file/matrix_exp_and_log_formula.pdf
+    """  # noqa: E501
+
+    # assume moments input was truncated to only hold order<=2 moments
+    num_itensor = ndim * ndim
+
+    # size of the inertia_tensor matrix
+    source = f"""
+            unsigned int offset = i * {num_itensor};
+            unsigned int offset_out = i * {ndim};\n"""
+    if ndim == 2:
+        source += """
+            F tmp1, tmp2;
+            double m00 = static_cast<double>(inertia_tensor[offset]);
+            double m01 = static_cast<double>(inertia_tensor[offset + 1]);
+            double m11 = static_cast<double>(inertia_tensor[offset + 3]);
+            tmp1 = m01 * m01;
+            tmp1 *= 4;
+
+            tmp2 = m00 - m11;
+            tmp2 *= tmp2;
+            tmp2 += tmp1;
+            tmp2 = sqrt(tmp2);
+            tmp2 /= 2;
+
+            tmp1 = m00 + m11;
+            tmp1 /= 2;
+
+            // store in "descending" order and clip to positive values
+            // (matrix is Hermitian, so negatives values can only be due to
+            //  numerical errors)
+            out[offset_out] = max(tmp1 + tmp2, 0.0);
+            out[offset_out + 1] = max(tmp1 - tmp2, 0.0);\n"""
+    elif ndim == 3:
+        source += """
+            double x1, x2, phi;
+            // extract triangle of (Hermitian) inertia tensor values
+            // [a, d, f]
+            // [-, b, e]
+            // [-, -, c]
+            double a = static_cast<double>(inertia_tensor[offset]);
+            double b = static_cast<double>(inertia_tensor[offset + 4]);
+            double c = static_cast<double>(inertia_tensor[offset + 8]);
+            double d = static_cast<double>(inertia_tensor[offset + 1]);
+            double e = static_cast<double>(inertia_tensor[offset + 5]);
+            double f = static_cast<double>(inertia_tensor[offset + 2]);
+            double d_sq = d * d;
+            double e_sq = e * e;
+            double f_sq = f * f;
+            double tmpa = (2*a - b - c);
+            double tmpb = (2*b - a - c);
+            double tmpc = (2*c - a - b);
+            x2 = - tmpa * tmpb * tmpc;
+            x2 += 9 * (tmpc*d_sq + tmpb*f_sq + tmpa*e_sq);
+            x2 -= 54 * (d * e * f);
+            x1 = a*a + b*b + c*c - a*b - a*c - b*c + 3 * (d_sq + e_sq + f_sq);
+
+            // grlee77: added max() here for numerical stability
+            // (avoid NaN values in ridge filter test cases)
+            x1 = max(x1, 0.0);
+
+            if (x2 == 0.0) {
+                phi = M_PI / 2.0;
+            } else {
+                // grlee77: added max() here for numerical stability
+                // (avoid NaN values in test_hessian_matrix_eigvals_3d)
+                double arg = max(4*x1*x1*x1 - x2*x2, 0.0);
+                phi = atan(sqrt(arg)/x2);
+                if (x2 < 0) {
+                    phi += M_PI;
+                }
+            }
+            double x1_term = (2.0 / 3.0) * sqrt(x1);
+            double abc = (a + b + c) / 3.0;
+            F lam1 = abc - x1_term * cos(phi / 3.0);
+            F lam2 = abc + x1_term * cos((phi - M_PI) / 3.0);
+            F lam3 = abc + x1_term * cos((phi + M_PI) / 3.0);
+
+            // abc = 141.94321771
+            // x1_term = 1279.25821493
+            // M_PI = 3.14159265
+            // phi = 1.91643394
+            // cos(phi/3.0) = 0.80280507
+            // cos((phi - M_PI) / 3.0) = 0.91776289
+
+            F stmp;
+            if (lam3 > lam2) {
+                stmp = lam2;
+                lam2 = lam3;
+                lam3 = stmp;
+            }
+            if (lam3 > lam1) {
+                stmp = lam1;
+                lam1 = lam3;
+                lam3 = stmp;
+            }
+            if (lam2 > lam1) {
+                stmp = lam1;
+                lam1 = lam2;
+                lam2 = stmp;
+            }
+            // clip to positive values
+            // (matrix is Hermitian, so negatives values can only be due to
+            //  numerical errors)
+            out[offset_out] = max(lam1, 0.0);
+            out[offset_out + 1] = max(lam2, 0.0);
+            out[offset_out + 2] = max(lam3, 0.0);\n"""
+    else:
+        # note: ndim here is the number of spatial image dimensions
+        raise ValueError("only ndim = 2 or 3 is supported")
+    inputs = "raw F inertia_tensor"
+    outputs = "raw F out"
+    name = f"cucim_inertia_tensor_{ndim}d"
+    return cp.ElementwiseKernel(
+        inputs, outputs, source, preamble=_includes, name=name
+    )
+
+
+def regionprops_inertia_tensor_eigvals(inertia_tensor, spacing=None):
+    # inertia tensor should have shape (ndim, ndim) on last two axes
+    ndim = inertia_tensor.shape[-1]
+    if ndim < 2 or ndim > 3:
+        raise ValueError("inertia tensor only implemented for 2D and 3D images")
+    nbatch = math.prod(inertia_tensor.shape[:-2])
+
+    if inertia_tensor.dtype.kind != "f":
+        raise ValueError("moments_central must have a floating point dtype")
+
+    kernel = get_inertia_tensor_eigvals_kernel(ndim)
+    eigvals_shape = inertia_tensor.shape[:-2] + (ndim,)
+    eigvals = cp.zeros(eigvals_shape, dtype=inertia_tensor.dtype)
+
+    # kernel loops over moments so size is max_label * num_channels
+    kernel(inertia_tensor, eigvals, size=nbatch)
+    return eigvals
