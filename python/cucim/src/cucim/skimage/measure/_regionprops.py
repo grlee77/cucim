@@ -629,7 +629,7 @@ class RegionProperties:
         elif self._ndim == 3:
             # equivalent to _inertia_eigvals_to_axes_lengths_3D(ev)[-1]
             ev = self.inertia_tensor_eigvals
-            return math.sqrt(10 * (-ev[0] + ev[1] + ev[2]))
+            return math.sqrt(10 * max(-ev[0] + ev[1] + ev[2], 0))
         else:
             raise ValueError("axis_minor_length only available in 2D and 3D")
 
