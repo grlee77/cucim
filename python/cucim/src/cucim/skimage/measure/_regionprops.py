@@ -704,13 +704,25 @@ class RegionProperties:
 
     @property
     def centroid_weighted(self):
-        ctr = self.centroid_weighted_local
-        return tuple(idx + slc.start for idx, slc in zip(ctr, self.slice))
+        ctr = cp.asnumpy(self.centroid_weighted_local)
+        return cp.asarray(
+            tuple(
+                idx + slc.start * spc
+                for idx, slc, spc in zip(ctr, self.slice, self._spacing)
+            )
+        )
 
     @property
     def centroid_weighted_local(self):
-        M = self.moments_weighted
-        return M[tuple(cp.eye(self._ndim, dtype=int))] / M[(0,) * self._ndim]
+        M = cp.asnumpy(self.moments_weighted)
+        M0 = M[(0,) * self._ndim]
+
+        def _get_element(axis):
+            return (0,) * axis + (1,) + (0,) * (self._ndim - 1 - axis)
+
+        return cp.asarray(
+            tuple(M[_get_element(axis)] / M0 for axis in range(self._ndim))
+        )
 
     @property
     @_cached
