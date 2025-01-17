@@ -8,18 +8,17 @@ from cupy.testing import (
     assert_array_equal,
 )
 from scipy.ndimage import find_objects as cpu_find_objects
+from skimage import measure as measure_cpu
 
 from cucim.skimage import data, measure
 from cucim.skimage.measure._regionprops_gpu import (
     area_bbox_from_slices,
-    moments_hu,
-    moments_to_moments_central,
-    normalize_central_moments,
     regionprops_area,
     regionprops_area_bbox,
     regionprops_bbox_coords,
     regionprops_centroid,
     regionprops_centroid_local,
+    regionprops_centroid_weighted,
     regionprops_inertia_tensor,
     regionprops_inertia_tensor_eigvals,
     regionprops_intensity_max,
@@ -27,6 +26,9 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_intensity_min,
     regionprops_intensity_std,
     regionprops_moments,
+    regionprops_moments_central,
+    regionprops_moments_hu,
+    regionprops_moments_normalized,
     regionprops_num_pixels,
 )
 
@@ -348,9 +350,9 @@ def test_moments_2d(
     )
     if norm_type in ["central", "normalized", "hu"]:
         ndim = len(shape)
-        moments = moments_to_moments_central(moments, ndim=ndim)
+        moments = regionprops_moments_central(moments, ndim=ndim)
         if norm_type in ["normalized", "hu"]:
-            moments = normalize_central_moments(
+            moments = regionprops_moments_normalized(
                 moments, ndim=ndim, spacing=spacing
             )
             if norm_type == "normalized":
@@ -368,7 +370,7 @@ def test_moments_2d(
                 assert cp.all(cp.isnan(moments[mask]))
 
             if norm_type == "hu":
-                moments = moments_hu(moments)
+                moments = regionprops_moments_hu(moments)
                 assert moments.shape[-1] == 7
 
     # regionprops does not use the more accurate analytical expressions for the
@@ -474,9 +476,9 @@ def test_moments_3d(
     )
     if norm_type in ["central", "normalized"]:
         ndim = len(shape)
-        moments = moments_to_moments_central(moments, ndim=ndim)
+        moments = regionprops_moments_central(moments, ndim=ndim)
         if norm_type == "normalized":
-            moments = normalize_central_moments(
+            moments = regionprops_moments_normalized(
                 moments, ndim=ndim, spacing=spacing
             )
 
@@ -599,7 +601,7 @@ def test_inertia_tensor(shape, spacing, order):
     moments_raw = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
-    moments_central = moments_to_moments_central(moments_raw, ndim=ndim)
+    moments_central = regionprops_moments_central(moments_raw, ndim=ndim)
 
     if order < 2:
         # can't compute inertia tensor without 2nd order moments
@@ -644,3 +646,68 @@ def test_inertia_tensor(shape, spacing, order):
         allclose(eigvals[:, 0], expected["inertia_tensor_eigvals-0"])
         allclose(eigvals[:, 1], expected["inertia_tensor_eigvals-1"])
         allclose(eigvals[:, 2], expected["inertia_tensor_eigvals-2"])
+
+
+@pytest.mark.parametrize("spacing", [None, (0.8, 0.5, 1.2)])
+# TODO (grlee77): enable num_channels > 1 case once bug is fixed
+@pytest.mark.parametrize(
+    "intensity_dtype, num_channels",
+    [(cp.float32, 1), (cp.uint8, 3)],
+)
+@pytest.mark.parametrize("shape", [(800, 600), (80, 60, 40)])
+@pytest.mark.parametrize("local", [False, True])
+def test_centroid_weighted(
+    shape, spacing, intensity_dtype, num_channels, local
+):
+    ndim = len(shape)
+    labels = get_labels_nd(shape)
+
+    max_label = int(cp.max(labels))
+    if spacing is not None:
+        # omit 3rd element for 2d images
+        spacing = spacing[:ndim]
+    intensity_image = get_intensity_image(
+        shape, dtype=intensity_dtype, num_channels=num_channels
+    )
+    kwargs = {"spacing": spacing, "intensity_image": intensity_image}
+    prop = "centroid_weighted"
+    if local:
+        prop += "_local"
+
+    validate_via_cpu_skimage = False
+    if not validate_via_cpu_skimage:
+        expected = measure.regionprops_table(
+            labels, properties=[prop], **kwargs
+        )
+    else:
+        expected = measure_cpu.regionprops_table(
+            cp.asnumpy(labels),
+            properties=[prop],
+            spacing=spacing,
+            intensity_image=cp.asnumpy(intensity_image),
+        )
+    moments_raw = regionprops_moments(
+        labels, max_label=max_label, order=1, **kwargs
+    )
+
+    if local:
+        bbox = None
+    else:
+        bbox, _ = regionprops_bbox_coords(
+            labels, max_label=max_label, return_slices=False
+        )
+    centroids = regionprops_centroid_weighted(
+        moments_raw, ndim=ndim, bbox=bbox, local=local, spacing=spacing
+    )
+    assert centroids.shape[-1] == ndim
+
+    rtol = 1e-7
+    atol = 0
+    allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
+    if num_channels == 1:
+        for d in range(ndim):
+            allclose(centroids[:, d], expected[prop + f"-{d}"])
+    else:
+        for c in range(num_channels):
+            for d in range(ndim):
+                allclose(centroids[:, c, d], expected[prop + f"-{d}-{c}"])

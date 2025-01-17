@@ -23,11 +23,16 @@ __all__ = [
     "regionprops_bbox_coords",
     "regionprops_centroid",
     "regionprops_centroid_local",
+    "regionprops_inertia_tensor",
+    "regionprops_inertia_tensor_eigvals",
     "regionprops_intensity_max",
     "regionprops_intensity_mean",
     "regionprops_intensity_min",
     "regionprops_intensity_std",
     "regionprops_moments",
+    "regionprops_moments_central",
+    "regionprops_moments_hu",
+    "regionprops_moments_normalized",
     "regionprops_num_pixels",
 ]
 
@@ -238,6 +243,11 @@ def regionprops_num_pixels(label_image, max_label=None, count_dtype=np.uint32):
     count_dtype, kernel_dtype = _check_count_dtype(count_dtype)
 
     kernel = get_num_pixels_kernel(kernel_dtype)
+
+    # make a copy if the labels array is not C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
+
     kernel(label_image, counts)
 
     # allow converting output to requested dtype if it was smaller than 32-bit
@@ -310,6 +320,13 @@ def regionprops_intensity_mean(
     sums = cp.zeros(sum_shape, dtype=sum_dtype)
 
     kernel = get_sum_kernel(count_dtype, sum_dtype, num_channels)
+
+    # make a copy if the inputs are not already C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
+    if not intensity_image.flags.c_contiguous:
+        intensity_image = cp.ascontiguousarray(intensity_image)
+
     kernel(label_image, intensity_image, counts, sums)
 
     if num_channels > 1:
@@ -393,6 +410,12 @@ def regionprops_intensity_std(
     )
     sums = cp.zeros(sum_shape, dtype=sum_dtype)
     sumsqs = cp.zeros(sum_shape, dtype=sum_dtype)
+
+    # make a copy if the inputs are not already C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
+    if not intensity_image.flags.c_contiguous:
+        intensity_image = cp.ascontiguousarray(intensity_image)
 
     approach = "naive"
     if approach == "naive":
@@ -520,6 +543,13 @@ def _regionprops_min_or_max_intensity(
     kernel = get_min_or_max_kernel(
         op_dtype, do_min=do_min, num_channels=num_channels
     )
+
+    # make a copy if the inputs are not already C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
+    if not intensity_image.flags.c_contiguous:
+        intensity_image = cp.ascontiguousarray(intensity_image)
+
     kernel(label_image, intensity_image, out)
     return out
 
@@ -648,6 +678,10 @@ def regionprops_bbox_coords(
     # The value for atomicMax columns is already 0 as desired.
     bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
 
+    # make a copy if the inputs are not already C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
+
     bbox_coords_kernel(label_image, bbox_coords, size=label_image.size)
     if return_slices:
         bbox_coords_cpu = cp.asnumpy(bbox_coords)
@@ -711,6 +745,10 @@ def regionprops_centroid(label_image, max_label=None, coord_dtype=cp.uint32):
     # Initialize value for atomicMin on even coordinates
     # The value for atomicMax columns is already 0 as desired.
     bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+
+    # make a copy if the inputs are not already C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
 
     bbox_coords_kernel(
         label_image,
@@ -793,6 +831,10 @@ def regionprops_centroid_local(
     # The value for atomicMax columns is already 0 as desired.
     bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
 
+    # make a copy if the inputs are not already C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
+
     bbox_coords_kernel(label_image, bbox_coords, size=label_image.size)
 
     counts = cp.zeros((max_label,), dtype=cp.uint32)
@@ -850,6 +892,10 @@ def regionprops_area_bbox(bbox, area_dtype=cp.float32, spacing=None):
             pixel_area = cp.product(spacing)
         else:
             pixel_area = math.prod(spacing)
+
+    # make a copy if the inputs are not already C-contiguous
+    if not bbox.flags.c_contiguous:
+        bbox = cp.ascontiguousarray(bbox)
 
     kernel = get_area_bbox_kernel(bbox.dtype, area_dtype, ndim)
     area_bbox = cp.empty((num_label,), dtype=area_dtype)
@@ -1114,9 +1160,16 @@ def regionprops_moments(
         compute_coordinate_sums=False,
     )
 
+    # make a copy if the inputs are not already C-contiguous
+    if not label_image.flags.c_contiguous:
+        label_image = cp.ascontiguousarray(label_image)
+
     ndim = label_image.ndim
     moments_shape = (max_label,) + (order + 1,) * ndim
     if intensity_image is not None:
+        if not intensity_image.flags.c_contiguous:
+            intensity_image = cp.ascontiguousarray(intensity_image)
+
         num_channels = _check_shapes(label_image, intensity_image)
         if num_channels > 1:
             moments_shape = (max_label,) + (num_channels,) + (order + 1,) * ndim
@@ -1339,7 +1392,7 @@ def get_moments_central_kernel(
     )
 
 
-def moments_to_moments_central(moments_raw, ndim):
+def regionprops_moments_central(moments_raw, ndim):
     if moments_raw.ndim == 2 + ndim:
         num_channels = moments_raw.shape[1]
     elif moments_raw.ndim == 1 + ndim:
@@ -1355,6 +1408,10 @@ def moments_to_moments_central(moments_raw, ndim):
     if moments_raw.dtype.kind != "f":
         float_dtype = cp.promote_types(cp.float32, moments_raw.dtype)
         moments_raw = moments_raw.astype(float_dtype)
+
+    # make a copy if the inputs are not already C-contiguous
+    if not moments_raw.flags.c_contiguous:
+        moments_raw = cp.ascontiguousarray(moments_raw)
 
     moments_kernel = get_moments_central_kernel(moments_raw.dtype, ndim, order)
     moments_central = cp.zeros_like(moments_raw)
@@ -1502,7 +1559,7 @@ def get_moments_normalize_kernel(moments_dtype, ndim, order, unit_scale=False):
     )
 
 
-def normalize_central_moments(moments_central, ndim, spacing=None):
+def regionprops_moments_normalized(moments_central, ndim, spacing=None):
     if moments_central.ndim == 2 + ndim:
         num_channels = moments_central.shape[1]
     elif moments_central.ndim == 1 + ndim:
@@ -1527,6 +1584,10 @@ def normalize_central_moments(moments_central, ndim, spacing=None):
 
     if moments_central.dtype.kind != "f":
         raise ValueError("moments_central must have a floating point dtype")
+
+    # make a copy if the inputs are not already C-contiguous
+    if not moments_central.flags.c_contiguous:
+        moments_central = cp.ascontiguousarray(moments_central)
 
     if spacing is None:
         unit_scale = True
@@ -1615,7 +1676,7 @@ def get_moments_hu_kernel(moments_dtype):
     )
 
 
-def moments_hu(moments_normalized):
+def regionprops_moments_hu(moments_normalized):
     if moments_normalized.ndim == 4:
         num_channels = moments_normalized.shape[1]
     elif moments_normalized.ndim == 3:
@@ -1642,6 +1703,10 @@ def moments_hu(moments_normalized):
     if moments_normalized.dtype.kind != "f":
         raise ValueError("moments_normalized must have a floating point dtype")
 
+    # make a copy if the inputs are not already C-contiguous
+    if not moments_normalized.flags.c_contiguous:
+        moments_normalized = cp.ascontiguousarray(moments_normalized)
+
     moments_hu_kernel = get_moments_hu_kernel(moments_normalized.dtype)
     # Hu's moments are a set of 7 moments stored instead of a moment matrix
     hu_shape = moments_normalized.shape[:-2] + (7,)
@@ -1652,54 +1717,6 @@ def moments_hu(moments_normalized):
         moments_normalized, moments_hu, size=max_label * num_channels
     )
     return moments_hu
-
-
-def _get_inertia_tensor_2x2_kernel():
-    operation = """
-    F mu0, mxx, mxy, myy;
-    mu0 = mu[0];
-    mxx = mu[6];
-    myy = mu[2];
-    mxy = mu[4];
-
-    result[0] = myy / mu0;
-    result[1] = result[2] = -mxy / mu0;
-    result[3] = mxx / mu0;
-    """
-    return cp.ElementwiseKernel(
-        in_params="raw F mu",
-        out_params="raw F result",
-        operation=operation,
-        name="cucim_skimage_measure_inertia_tensor_2x2",
-    )
-
-
-def _get_inertia_tensor_3x3_kernel():
-    operation = """
-    F mu0, mxx, myy, mzz, mxy, mxz, myz;
-    mu0 = mu[0];   // mu[0, 0, 0]
-    mxx = mu[18];  // mu[2, 0, 0]
-    myy = mu[6];   // mu[0, 2, 0]
-    mzz = mu[2];   // mu[0, 0, 2]
-
-    mxy = mu[12];  // mu[1, 1, 0]
-    mxz = mu[10];  // mu[1, 0, 1]
-    myz = mu[4];   // mu[0, 1, 1]
-
-    result[0] = (myy + mzz) / mu0;
-    result[4] = (mxx + mzz) / mu0;
-    result[8] = (mxx + myy) / mu0;
-
-    result[1] = result[3] = -mxy / mu0;
-    result[2] = result[6] = -mxz / mu0;
-    result[5] = result[7] = -myz / mu0;
-    """
-    return cp.ElementwiseKernel(
-        in_params="raw F mu",
-        out_params="raw F result",
-        operation=operation,
-        name="cucim_skimage_measure_inertia_tensor_3x3",
-    )
 
 
 @cp.memoize(for_each_device=True)
@@ -1767,10 +1784,15 @@ def get_inertia_tensor_kernel(moments_dtype, ndim):
 def regionprops_inertia_tensor(moments_central, ndim, spacing=None):
     if ndim < 2 or ndim > 3:
         raise ValueError("inertia tensor only implemented for 2D and 3D images")
-    nbatch = math.prod(moments_central.shape[:-2])
+    nbatch = math.prod(moments_central.shape[:-ndim])
 
     if moments_central.dtype.kind != "f":
         raise ValueError("moments_central must have a floating point dtype")
+
+    # make a copy if the inputs are not already C-contiguous
+    if not moments_central.flags.c_contiguous:
+        moments_central = cp.ascontiguousarray(moments_central)
+
     order = moments_central.shape[-1] - 1
     if order < 2:
         raise ValueError(
@@ -1924,6 +1946,9 @@ def regionprops_inertia_tensor_eigvals(inertia_tensor, spacing=None):
     if inertia_tensor.dtype.kind != "f":
         raise ValueError("moments_central must have a floating point dtype")
 
+    if not inertia_tensor.flags.c_contiguous:
+        inertia_tensor = cp.ascontiguousarray(inertia_tensor)
+
     kernel = get_inertia_tensor_eigvals_kernel(ndim)
     eigvals_shape = inertia_tensor.shape[:-2] + (ndim,)
     eigvals = cp.zeros(eigvals_shape, dtype=inertia_tensor.dtype)
@@ -1931,3 +1956,128 @@ def regionprops_inertia_tensor_eigvals(inertia_tensor, spacing=None):
     # kernel loops over moments so size is max_label * num_channels
     kernel(inertia_tensor, eigvals, size=nbatch)
     return eigvals
+
+
+@cp.memoize(for_each_device=True)
+def get_centroid_weighted_kernel(
+    moments_dtype, ndim, local=True, unit_spacing=True, num_channels=1
+):
+    """Centroid (in global or local coordinates) from 1st order moment matrix"""
+    moments_dtype = cp.dtype(moments_dtype)
+
+    # assume moments input was truncated to only hold order<=2 moments
+    num_moments = 2**ndim
+    if moments_dtype.kind != "f":
+        raise ValueError(
+            "`moments_dtype` must be a floating point type for central moments "
+            "calculations."
+        )
+    source = ""
+    if not local:
+        source += f"""
+        unsigned int offset_coords = i * {2 * ndim};\n"""
+
+    if num_channels > 1:
+        source += f"""
+        uint32_t num_channels = moments_raw.shape()[1];
+        for (int c = 0; c < num_channels; c++) {{
+            unsigned int offset = i * {num_moments} * num_channels + c * {num_moments};
+            unsigned int offset_out = i * {ndim} * num_channels + c * {ndim};
+            F m0 = moments_raw[offset];\n"""  # noqa: E501
+    else:
+        source += f"""
+            unsigned int offset = i * {num_moments};
+            unsigned int offset_out = i * {ndim};
+            F m0 = moments_raw[offset];\n"""
+
+    # general formula for the n-dimensional case
+    #
+    #   in 2D it gives:
+    #     out[offset_out + 1] = moments_raw[offset + 1] / m0;  // m[0, 1]
+    #     out[offset_out] = moments_raw[offset + 2] / m0;      // m[1, 0]
+    #
+    #   in 3D it gives:
+    #     out[offset_out + 2] = moments_raw[offset + 1] / m0;  // m[0, 0, 1]
+    #     out[offset_out + 1] = moments_raw[offset + 2] / m0;  // m[0, 1, 0]
+    #     out[offset_out] = moments_raw[offset + 4] / m0;      // m[1, 0, 0]
+    axis_offset = 1
+    for d in range(ndim - 1, -1, -1):
+        if local:
+            source += f"""
+            out[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0;"""  # noqa: E501
+        else:
+            spc = "" if unit_spacing else f" * spacing[{d}]"
+            source += f"""
+            out[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0 + bbox[offset_coords + {d * 2}]{spc};"""  # noqa: E501
+        axis_offset *= 2
+    if num_channels > 1:
+        source += """
+        }  // channels loop\n"""
+    inputs = "raw F moments_raw"
+    local_str = ""
+    spacing_str = ""
+    if not local:
+        local_str = "_local"
+        # bounding box coordinates
+        inputs += ", raw Y bbox"
+        if not unit_spacing:
+            spacing_str = "_spacing"
+            inputs += ", raw float64 spacing"
+    outputs = "raw F out"
+    name = f"cucim_centroid_weighted{local_str}{spacing_str}_{ndim}d"
+    return cp.ElementwiseKernel(
+        inputs, outputs, source, preamble=_includes, name=name
+    )
+
+
+def regionprops_centroid_weighted(
+    moments_raw, ndim, bbox=None, local=True, spacing=None
+):
+    max_label = moments_raw.shape[0]
+    if moments_raw.ndim == ndim + 2:
+        num_channels = moments_raw.shape[1]
+    elif moments_raw.ndim == ndim + 1:
+        num_channels = 1
+    else:
+        raise ValueError("moments_raw has unexpected shape")
+    if not local and bbox is None:
+        raise ValueError(
+            "bbox coordinates must be provided to get the non-local centroid"
+        )
+    if moments_raw.dtype.kind != "f":
+        raise ValueError("moments_raw must have a floating point dtype")
+    order = moments_raw.shape[-1] - 1
+    if order < 1:
+        raise ValueError(
+            f"inertia tensor calculation requires order>=1, found {order}"
+        )
+    if order >= 1:
+        # truncate to only the 1st order moments
+        slice_kept = (Ellipsis,) + (slice(0, 2),) * ndim
+        moments_raw = cp.ascontiguousarray(moments_raw[slice_kept])
+
+    # make a copy if the inputs are not already C-contiguous
+    if not moments_raw.flags.c_contiguous:
+        moments_raw = cp.ascontiguousarray(moments_raw)
+
+    unit_spacing = spacing is None
+
+    if local:
+        inputs = (moments_raw,)
+    else:
+        if not bbox.flags.c_contiguous:
+            bbox = cp.ascontiguousarray(bbox)
+        inputs = (moments_raw, bbox)
+        if not unit_spacing:
+            inputs = inputs + (cp.asarray(spacing),)
+    kernel = get_centroid_weighted_kernel(
+        moments_raw.dtype,
+        ndim,
+        local=local,
+        unit_spacing=unit_spacing,
+        num_channels=num_channels,
+    )
+    centroid_shape = moments_raw.shape[:-ndim] + (ndim,)
+    centroid = cp.zeros(centroid_shape, dtype=moments_raw.dtype)
+    kernel(*inputs, centroid, size=max_label)
+    return centroid
