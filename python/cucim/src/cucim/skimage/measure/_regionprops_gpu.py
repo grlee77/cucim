@@ -1720,7 +1720,7 @@ def regionprops_moments_hu(moments_normalized):
 
 
 @cp.memoize(for_each_device=True)
-def get_inertia_tensor_kernel(moments_dtype, ndim):
+def get_inertia_tensor_kernel(moments_dtype, ndim, compute_orientation):
     """Normalizes central moments of order >=2"""
     moments_dtype = cp.dtype(moments_dtype)
 
@@ -1746,11 +1746,29 @@ def get_inertia_tensor_kernel(moments_dtype, ndim):
         F myy = moments_central[offset + 2];
         F mxy = moments_central[offset + 4];
 
-        out[offset_out + 0] = myy / mu0;
-        out[offset_out + 1] = -mxy / mu0;
-        out[offset_out + 2] = -mxy / mu0;
-        out[offset_out + 3] = mxx / mu0;\n"""
+        F a = myy / mu0;
+        F b = -mxy / mu0;
+        F c = mxx / mu0;
+        out[offset_out + 0] = a;
+        out[offset_out + 1] = b;
+        out[offset_out + 2] = b;
+        out[offset_out + 3] = c;
+        """
+        if compute_orientation:
+            source += """
+        if (a - c == 0) {
+          // had to use <= 0 to get same result as Python's atan2 with < 0
+          if (b < 0) {
+            orientation[i] = -M_PI / 4.0;
+          } else {
+            orientation[i] = M_PI / 4.0;
+          }
+        } else {
+          orientation[i] = 0.5 * atan2(-2 * b, c - a);
+        }\n"""
     elif ndim == 3:
+        if compute_orientation:
+            raise ValueError("orientation can only be computed for 2d images")
         source += """
         F mu0 = moments_central[offset];       // [0, 0, 0]
         F mxx = moments_central[offset + 18];  // [2, 0, 0]
@@ -1775,13 +1793,17 @@ def get_inertia_tensor_kernel(moments_dtype, ndim):
         raise ValueError("only ndim = 2 or 3 is supported")
     inputs = "raw F moments_central"
     outputs = "raw F out"
+    if compute_orientation:
+        outputs += ", raw F orientation"
     name = f"cucim_inertia_tensor_{ndim}d"
     return cp.ElementwiseKernel(
         inputs, outputs, source, preamble=_includes, name=name
     )
 
 
-def regionprops_inertia_tensor(moments_central, ndim, spacing=None):
+def regionprops_inertia_tensor(
+    moments_central, ndim, compute_orientation=False
+):
     if ndim < 2 or ndim > 3:
         raise ValueError("inertia tensor only implemented for 2D and 3D images")
     nbatch = math.prod(moments_central.shape[:-ndim])
@@ -1803,15 +1825,26 @@ def regionprops_inertia_tensor(moments_central, ndim, spacing=None):
         slice_kept = (Ellipsis,) + (slice(0, 3),) * ndim
         moments_central = cp.ascontiguousarray(moments_central[slice_kept])
 
-    kernel = get_inertia_tensor_kernel(moments_central.dtype, ndim)
+    kernel = get_inertia_tensor_kernel(
+        moments_central.dtype, ndim, compute_orientation=compute_orientation
+    )
     itensor_shape = moments_central.shape[:-ndim] + (ndim, ndim)
     itensor = cp.zeros(itensor_shape, dtype=moments_central.dtype)
+    if compute_orientation:
+        if ndim != 2:
+            raise ValueError("orientation can only be computed for ndim=2")
+        orientation = cp.zeros(
+            moments_central.shape[:-ndim], dtype=moments_central.dtype
+        )
+        kernel(moments_central, itensor, orientation, size=nbatch)
+        return itensor, orientation
+
     kernel(moments_central, itensor, size=nbatch)
     return itensor
 
 
 @cp.memoize(for_each_device=True)
-def get_inertia_tensor_eigvals_kernel(ndim):
+def get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths=False):
     """Compute inertia tensor eigenvalues
 
     C. Deledalle, L. Denis, S. Tabti, F. Tupin. Closed-form expressions
@@ -1849,8 +1882,15 @@ def get_inertia_tensor_eigvals_kernel(ndim):
             // store in "descending" order and clip to positive values
             // (matrix is Hermitian, so negatives values can only be due to
             //  numerical errors)
-            out[offset_out] = max(tmp1 + tmp2, 0.0);
-            out[offset_out + 1] = max(tmp1 - tmp2, 0.0);\n"""
+            F lam1 = max(tmp1 + tmp2, 0.0);
+            F lam2 = max(tmp1 - tmp2, 0.0);
+            out[offset_out] = lam1;
+            out[offset_out + 1] = lam2;\n"""
+        if compute_axis_lengths:
+            source += """
+            axis_lengths[offset_out] = 4.0 * sqrt(lam1);
+            axis_lengths[offset_out + 1] = 4.0 * sqrt(lam2);
+            \n"""
     elif ndim == 3:
         source += """
             double x1, x2, phi;
@@ -1922,21 +1962,38 @@ def get_inertia_tensor_eigvals_kernel(ndim):
             // clip to positive values
             // (matrix is Hermitian, so negatives values can only be due to
             //  numerical errors)
-            out[offset_out] = max(lam1, 0.0);
-            out[offset_out + 1] = max(lam2, 0.0);
-            out[offset_out + 2] = max(lam3, 0.0);\n"""
+            lam1 = max(lam1, 0.0);
+            lam2 = max(lam2, 0.0);
+            lam3 = max(lam3, 0.0);
+            out[offset_out] = lam1;
+            out[offset_out + 1] = lam2;
+            out[offset_out + 2] = lam3;\n"""
+        if compute_axis_lengths:
+            source += """
+            // formula reference:
+            //   https://github.com/scikit-image/scikit-image/blob/v0.25.0/skimage/measure/_regionprops.py#L275-L295
+            // note: added max to clip possible small (e.g. 1e-7) negative value due to numerical error
+            axis_lengths[offset_out] = sqrt(10.0 * (lam1 + lam2 - lam3));
+            axis_lengths[offset_out + 1] = sqrt(10.0 * (lam1 - lam2 + lam3));
+            axis_lengths[offset_out + 2] = sqrt(10.0 * max(-lam1 + lam2 + lam3, 0.0));
+            \n"""  # noqa: E501
     else:
         # note: ndim here is the number of spatial image dimensions
         raise ValueError("only ndim = 2 or 3 is supported")
     inputs = "raw F inertia_tensor"
     outputs = "raw F out"
-    name = f"cucim_inertia_tensor_{ndim}d"
+    name = f"cucim_inertia_tensor_eigvals_{ndim}d"
+    if compute_axis_lengths:
+        outputs += ", raw F axis_lengths"
+        name += "_with_axis"
     return cp.ElementwiseKernel(
         inputs, outputs, source, preamble=_includes, name=name
     )
 
 
-def regionprops_inertia_tensor_eigvals(inertia_tensor, spacing=None):
+def regionprops_inertia_tensor_eigvals(
+    inertia_tensor, compute_axis_lengths=False
+):
     # inertia tensor should have shape (ndim, ndim) on last two axes
     ndim = inertia_tensor.shape[-1]
     if ndim < 2 or ndim > 3:
@@ -1949,10 +2006,13 @@ def regionprops_inertia_tensor_eigvals(inertia_tensor, spacing=None):
     if not inertia_tensor.flags.c_contiguous:
         inertia_tensor = cp.ascontiguousarray(inertia_tensor)
 
-    kernel = get_inertia_tensor_eigvals_kernel(ndim)
+    kernel = get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths)
     eigvals_shape = inertia_tensor.shape[:-2] + (ndim,)
-    eigvals = cp.zeros(eigvals_shape, dtype=inertia_tensor.dtype)
-
+    eigvals = cp.empty(eigvals_shape, dtype=inertia_tensor.dtype)
+    if compute_axis_lengths:
+        axis_lengths = cp.empty(eigvals_shape, dtype=inertia_tensor.dtype)
+        kernel(inertia_tensor, eigvals, axis_lengths, size=nbatch)
+        return eigvals, axis_lengths
     # kernel loops over moments so size is max_label * num_channels
     kernel(inertia_tensor, eigvals, size=nbatch)
     return eigvals
