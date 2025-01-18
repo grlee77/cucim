@@ -33,7 +33,13 @@ from cucim.skimage.measure._regionprops_gpu import (
 )
 
 
-def get_labels_nd(shape, blob_size_fraction=0.05, volume_fraction=0.25, rng=5):
+def get_labels_nd(
+    shape,
+    blob_size_fraction=0.05,
+    volume_fraction=0.25,
+    rng=5,
+    insert_holes=False,
+):
     ndim = len(shape)
     blobs_kwargs = dict(
         blob_size_fraction=blob_size_fraction,
@@ -43,6 +49,19 @@ def get_labels_nd(shape, blob_size_fraction=0.05, volume_fraction=0.25, rng=5):
     blobs = data.binary_blobs(max(shape), n_dim=ndim, **blobs_kwargs)
     # crop to rectangular
     blobs = blobs[tuple(slice(s) for s in shape)]
+
+    if insert_holes:
+        blobs2_kwargs = dict(
+            blob_size_fraction=blob_size_fraction / 5,
+            volume_fraction=0.1,
+            rng=rng,
+        )
+        # create smaller blobs and invert them to create a holes mask to apply
+        # to the original blobs
+        temp = data.binary_blobs(max(shape), n_dim=ndim, **blobs2_kwargs)
+        temp = temp[tuple(slice(s) for s in shape)]
+        mask = cp.logical_and(blobs > 0, temp == 0)
+        blobs = blobs * mask
 
     # binary blobs only creates square outputs
     labels = measure.label(blobs)
