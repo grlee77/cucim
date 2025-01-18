@@ -35,6 +35,7 @@ def correlate(
     origin=0,
     *,
     axes=None,
+    mask=None,
 ):
     """Multi-dimensional correlate.
 
@@ -60,6 +61,8 @@ def correlate(
             axes. When `axes` is specified, any tuples used for `mode` or
             `origin` must match the length of `axes`. The ith entry in any of
             these tuples corresponds to the ith entry in `axes`.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of correlate.
@@ -72,7 +75,7 @@ def correlate(
         from SciPy due to floating-point rounding of intermediate results.
     """
     return _correlate_or_convolve(
-        input, weights, output, mode, cval, origin, False, axes
+        input, weights, output, mode, cval, origin, False, axes, mask=mask
     )
 
 
@@ -85,6 +88,7 @@ def convolve(
     origin=0,
     *,
     axes=None,
+    mask=None,
 ):
     """Multi-dimensional convolution.
 
@@ -110,6 +114,8 @@ def convolve(
             axes. When `axes` is specified, any tuples used for `mode` or
             `origin` must match the length of `axes`. The ith entry in any of
             these tuples corresponds to the ith entry in `axes`.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of convolution.
@@ -122,7 +128,7 @@ def convolve(
         from SciPy due to floating-point rounding of intermediate results.
     """
     return _correlate_or_convolve(
-        input, weights, output, mode, cval, origin, True, axes
+        input, weights, output, mode, cval, origin, True, axes, mask=mask
     )
 
 
@@ -136,6 +142,7 @@ def correlate1d(
     origin=0,
     *,
     algorithm=None,
+    mask=None,
 ):
     """One-dimensional correlate.
 
@@ -155,6 +162,8 @@ def correlate1d(
         origin (int): The origin parameter controls the placement of the
             filter, relative to the center of the current element of the
             input. Default is ``0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the 1D correlation.
@@ -167,7 +176,16 @@ def correlate1d(
         from SciPy due to floating-point rounding of intermediate results.
     """
     return _correlate_or_convolve1d(
-        input, weights, axis, output, mode, cval, origin, False, algorithm
+        input,
+        weights,
+        axis,
+        output,
+        mode,
+        cval,
+        origin,
+        False,
+        algorithm,
+        mask=mask,
     )
 
 
@@ -181,6 +199,7 @@ def convolve1d(
     origin=0,
     *,
     algorithm=None,
+    mask=None,
 ):
     """One-dimensional convolution.
 
@@ -200,6 +219,9 @@ def convolve1d(
         origin (int): The origin parameter controls the placement of the
             filter, relative to the center of the current element of the
             input. Default is ``0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
+
     Returns:
         cupy.ndarray: The result of the 1D convolution.
 
@@ -211,12 +233,29 @@ def convolve1d(
         from SciPy due to floating-point rounding of intermediate results.
     """
     return _correlate_or_convolve1d(
-        input, weights, axis, output, mode, cval, origin, True, algorithm
+        input,
+        weights,
+        axis,
+        output,
+        mode,
+        cval,
+        origin,
+        True,
+        algorithm,
+        mask=mask,
     )
 
 
 def _correlate_or_convolve(
-    input, weights, output, mode, cval, origin, convolution=False, axes=None
+    input,
+    weights,
+    output,
+    mode,
+    cval,
+    origin,
+    convolution=False,
+    axes=None,
+    mask=None,
 ):
     axes, weights, origins, modes, int_type = _filters_core._check_nd_args(
         input, weights, mode, origin, axes=axes
@@ -239,14 +278,18 @@ def _correlate_or_convolve(
         # numpy.correlate conjugates weights rather than input.
         weights = weights.conj()
     weights_dtype = _util._get_weights_dtype(
-        input, weights, use_cucim_casting=True
+        input, weights, use_cucim_casting=False
     )  # noqa
     offsets = _filters_core._origins_to_offsets(origins, weights.shape)
+    has_mask = mask is not None
     kernel = _get_correlate_kernel(
-        modes, weights.shape, int_type, offsets, cval
+        modes, weights.shape, int_type, offsets, cval, has_mask=has_mask
     )
+    kwargs = dict(weights_dtype=weights_dtype)
+    if has_mask:
+        kwargs["mask"] = mask
     output = _filters_core._call_kernel(
-        kernel, input, weights, output, weights_dtype=weights_dtype
+        kernel, input, weights, output, **kwargs
     )
     return output
 
@@ -272,13 +315,23 @@ def _correlate_or_convolve1d(
     origin,
     convolution=False,
     algorithm=None,
+    *,
+    mask=None,
 ):
     # Calls fast shared-memory convolution when possible, otherwise falls back
     # to the vendored elementwise _correlate_or_convolve
     default_algorithm = False
     if algorithm is None:
         default_algorithm = True
-        if _is_not_windows and input.ndim == 2 and weights.size <= 256:
+        if (
+            _is_not_windows
+            and input.ndim == 2
+            and weights.size <= 256
+            and mask is None
+            and not (
+                cval < 0 and mode == "constant" and input.dtype.kind == "u"
+            )
+        ):
             algorithm = "shared_memory"
         else:
             algorithm = "elementwise"
@@ -297,6 +350,10 @@ def _correlate_or_convolve1d(
     if mode == "wrap":
         mode = "grid-wrap"
     if algorithm == "shared_memory":
+        if mask is not None:
+            raise NotImplementedError(
+                "algorithm 'shared_memory' does not support mask"
+            )
         if input.ndim not in [2, 3]:
             raise NotImplementedError(
                 f"shared_memory not implemented for ndim={input.ndim}"
@@ -327,15 +384,28 @@ def _correlate_or_convolve1d(
             input.ndim, weights, origin, axis
         )
         return _correlate_or_convolve(
-            input, weights, output, mode, cval, origins, convolution
+            input, weights, output, mode, cval, origins, convolution, mask=mask
         )
 
 
 @cupy.memoize(for_each_device=True)
-def _get_correlate_kernel(modes, w_shape, int_type, offsets, cval):
+def _get_correlate_kernel(
+    modes, w_shape, int_type, offsets, cval, *, has_mask=False
+):
+    pre = ""
+    if has_mask:
+        pre += """
+            // keep existing value if not within the mask
+            bool mv = (bool)mask[i];
+            if (!mv) {
+                y = cast<Y>(x[i]);
+                return;
+            }\n"""
+    pre += "W sum = (W)0;"
+    mask_str = "_masked" if has_mask else ""
     return _filters_core._generate_nd_kernel(
-        "correlate",
-        "W sum = (W)0;",
+        f"correlate{mask_str}",
+        pre,
         "sum += cast<W>({value}) * wval;",
         "y = cast<Y>(sum);",
         modes,
@@ -344,6 +414,7 @@ def _get_correlate_kernel(modes, w_shape, int_type, offsets, cval):
         offsets,
         cval,
         ctype="W",
+        has_mask=has_mask,
     )
 
 
@@ -393,6 +464,7 @@ def uniform_filter1d(
     origin=0,
     *,
     algorithm=None,
+    mask=None,
 ):
     """One-dimensional uniform filter along the given axis.
 
@@ -413,6 +485,8 @@ def uniform_filter1d(
         origin (int): The origin parameter controls the placement of the
             filter, relative to the center of the current element of the
             input. Default is ``0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -427,7 +501,15 @@ def uniform_filter1d(
     weights_dtype = cupy.promote_types(input.dtype, cupy.float32)
     weights = cupy.full(size, 1 / size, dtype=weights_dtype)
     return correlate1d(
-        input, weights, axis, output, mode, cval, origin, algorithm=algorithm
+        input,
+        weights,
+        axis,
+        output,
+        mode,
+        cval,
+        origin,
+        algorithm=algorithm,
+        mask=mask,
     )
 
 
@@ -441,6 +523,7 @@ def uniform_filter(
     axes=None,
     *,
     algorithm=None,
+    mask=None,
 ):
     """Multi-dimensional uniform filter.
 
@@ -469,6 +552,8 @@ def uniform_filter(
             ``mode`` and/or ``origin`` must match the length of ``axes``. The
             ith entry in any of these tuples corresponds to the ith entry in
             ``axes``. Default is ``None``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -505,6 +590,7 @@ def uniform_filter(
         cval,
         origins,
         algorithm=algorithm,
+        mask=mask,
     )
 
 
@@ -519,6 +605,7 @@ def gaussian_filter1d(
     truncate=4.0,
     *,
     algorithm=None,
+    mask=None,
 ):
     """One-dimensional Gaussian filter along the given axis.
 
@@ -541,6 +628,8 @@ def gaussian_filter1d(
             ``'constant'``. Default is ``0.0``.
         truncate (float): Truncate the filter at this many standard deviations.
             Default is ``4.0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -560,7 +649,14 @@ def gaussian_filter1d(
     weights_dtype = cupy.promote_types(input.dtype, cupy.float32)
     weights = _gaussian_kernel1d(sigma, int(order), radius, weights_dtype)
     return correlate1d(
-        input, weights, axis, output, mode, cval, algorithm=algorithm
+        input,
+        weights,
+        axis,
+        output,
+        mode,
+        cval,
+        algorithm=algorithm,
+        mask=mask,
     )
 
 
@@ -576,6 +672,7 @@ def gaussian_filter(
     axes=None,
     *,
     algorithm=None,
+    mask=None,
 ):
     """Multi-dimensional Gaussian filter.
 
@@ -611,6 +708,8 @@ def gaussian_filter(
             ``order``, ``mode`` and/or ``radius`` must match the length of
             ``axes``. The ith entry in any of these tuples corresponds to the
             ith entry in ``axes``. Default is ``None``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -670,6 +769,7 @@ def gaussian_filter(
         cval,
         0,
         algorithm=algorithm,
+        mask=mask,
     )
 
 
@@ -705,7 +805,14 @@ def _gaussian_kernel1d(sigma, order, radius, dtype=cupy.float64):
 
 
 def prewitt(
-    input, axis=-1, output=None, mode="reflect", cval=0.0, *, algorithm=None
+    input,
+    axis=-1,
+    output=None,
+    mode="reflect",
+    cval=0.0,
+    *,
+    algorithm=None,
+    mask=None,
 ):
     """Compute a Prewitt filter along the given axis.
 
@@ -719,6 +826,8 @@ def prewitt(
             ``'wrap'``). Default is ``'reflect'``.
         cval (scalar): Value to fill past edges of input if mode is
             ``'constant'``. Default is ``0.0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -732,11 +841,20 @@ def prewitt(
     """
     weights_dtype = cupy.promote_types(input.dtype, cupy.float32)
     smooth = cupy.ones(3, dtype=weights_dtype)
-    return _prewitt_or_sobel(input, axis, output, mode, cval, smooth, algorithm)
+    return _prewitt_or_sobel(
+        input, axis, output, mode, cval, smooth, algorithm, mask
+    )
 
 
 def sobel(
-    input, axis=-1, output=None, mode="reflect", cval=0.0, *, algorithm=None
+    input,
+    axis=-1,
+    output=None,
+    mode="reflect",
+    cval=0.0,
+    *,
+    algorithm=None,
+    mask=None,
 ):
     """Compute a Sobel filter along the given axis.
 
@@ -750,6 +868,8 @@ def sobel(
             ``'wrap'``). Default is ``'reflect'``.
         cval (scalar): Value to fill past edges of input if mode is
             ``'constant'``. Default is ``0.0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -763,10 +883,14 @@ def sobel(
     """
     weights_dtype = cupy.promote_types(input.dtype, cupy.float32)
     smooth = cupy.array([1, 2, 1], dtype=weights_dtype)
-    return _prewitt_or_sobel(input, axis, output, mode, cval, smooth, algorithm)
+    return _prewitt_or_sobel(
+        input, axis, output, mode, cval, smooth, algorithm, mask=mask
+    )
 
 
-def _prewitt_or_sobel(input, axis, output, mode, cval, weights, algorithm):
+def _prewitt_or_sobel(
+    input, axis, output, mode, cval, weights, algorithm, mask=None
+):
     axis = internal._normalize_axis_index(axis, input.ndim)
 
     weights_dtype = cupy.promote_types(input.dtype, cupy.float32)
@@ -787,6 +911,7 @@ def _prewitt_or_sobel(input, axis, output, mode, cval, weights, algorithm):
         modes,
         cval,
         algorithm=algorithm,
+        mask=mask,
     )
 
 
@@ -878,7 +1003,14 @@ def generic_laplace(
 
 
 def laplace(
-    input, output=None, mode="reflect", cval=0.0, *, axes=None, algorithm=None
+    input,
+    output=None,
+    mode="reflect",
+    cval=0.0,
+    *,
+    axes=None,
+    algorithm=None,
+    mask=None,
 ):
     """Multi-dimensional Laplace filter based on approximate second
     derivatives.
@@ -895,6 +1027,8 @@ def laplace(
         axes (tuple of int or None): The axes over which to apply the filter.
             If a `mode` tuple is provided, its length must match the number of
             axes.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -911,7 +1045,14 @@ def laplace(
 
     def derivative2(input, axis, output, mode, cval):
         return correlate1d(
-            input, weights, axis, output, mode, cval, algorithm=algorithm
+            input,
+            weights,
+            axis,
+            output,
+            mode,
+            cval,
+            algorithm=algorithm,
+            mask=mask,
         )
 
     return generic_laplace(input, derivative2, output, mode, cval, axes=axes)
@@ -926,6 +1067,7 @@ def gaussian_laplace(
     *,
     axes=None,
     algorithm=None,
+    mask=None,
     **kwargs,
 ):
     """Multi-dimensional Laplace filter using Gaussian second derivatives.
@@ -946,6 +1088,8 @@ def gaussian_laplace(
             the number of axes.
         kwargs (dict, optional):
             dict of extra keyword arguments to pass ``gaussian_filter()``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -969,6 +1113,7 @@ def gaussian_laplace(
             mode,
             cval,
             algorithm=algorithm,
+            mask=mask,
             **kwargs,
         )
 
@@ -1093,6 +1238,7 @@ def gaussian_gradient_magnitude(
     *,
     axes=None,
     algorithm=None,
+    mask=None,
     **kwargs,
 ):
     """Multi-dimensional gradient magnitude using Gaussian derivatives.
@@ -1113,6 +1259,8 @@ def gaussian_gradient_magnitude(
         axes (tuple of int or None): The axes over which to apply the filter.
             If a `mode` tuple is provided, its length must match the number of
             axes.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1136,6 +1284,7 @@ def gaussian_gradient_magnitude(
             mode,
             cval,
             algorithm=algorithm,
+            mask=mask,
             **kwargs,
         )
 
@@ -1153,6 +1302,8 @@ def minimum_filter(
     cval=0.0,
     origin=0,
     axes=None,
+    *,
+    mask=None,
 ):
     """Multi-dimensional minimum filter.
 
@@ -1185,6 +1336,8 @@ def minimum_filter(
             ``mode`` and/or ``origin`` must match the length of ``axes``. The
             ith entry in any of these tuples corresponds to the ith entry in
             ``axes``. Default is ``None``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1202,6 +1355,7 @@ def minimum_filter(
         origin,
         "min",
         axes,
+        mask=mask,
     )
 
 
@@ -1214,6 +1368,8 @@ def maximum_filter(
     cval=0.0,
     origin=0,
     axes=None,
+    *,
+    mask=None,
 ):
     """Multi-dimensional maximum filter.
 
@@ -1246,6 +1402,8 @@ def maximum_filter(
             ``mode`` and/or ``origin`` must match the length of ``axes``. The
             ith entry in any of these tuples corresponds to the ith entry in
             ``axes``. Default is ``None``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1263,6 +1421,7 @@ def maximum_filter(
         origin,
         "max",
         axes,
+        mask=mask,
     )
 
 
@@ -1277,6 +1436,8 @@ def _min_or_max_filter(
     origin,
     func,
     axes,
+    *,
+    mask=None,
 ):
     # structure is used by morphology.grey_erosion() and grey_dilation()
     # and not by the regular min/max filters
@@ -1314,6 +1475,7 @@ def _min_or_max_filter(
             modes,
             cval,
             origins,
+            mask=mask,
         )
 
     if ftprnt.size == 0:
@@ -1331,6 +1493,7 @@ def _min_or_max_filter(
         )
 
     offsets = _filters_core._origins_to_offsets(origins, ftprnt.shape)
+    has_mask = mask is not None
     kernel = _get_min_or_max_kernel(
         modes,
         ftprnt.shape,
@@ -1340,14 +1503,26 @@ def _min_or_max_filter(
         int_type,
         has_structure=structure is not None,
         has_central_value=bool(ftprnt[offsets]),
+        has_mask=has_mask,
     )
+    kwargs = dict(weights_dtype=bool)
+    if has_mask:
+        kwargs["mask"] = mask
     return _filters_core._call_kernel(
-        kernel, input, ftprnt, output, structure, weights_dtype=bool
+        kernel, input, ftprnt, output, structure, **kwargs
     )
 
 
 def minimum_filter1d(
-    input, size, axis=-1, output=None, mode="reflect", cval=0.0, origin=0
+    input,
+    size,
+    axis=-1,
+    output=None,
+    mode="reflect",
+    cval=0.0,
+    origin=0,
+    *,
+    mask=None,
 ):
     """Compute the minimum filter along a single axis.
 
@@ -1365,17 +1540,29 @@ def minimum_filter1d(
         origin (int): The origin parameter controls the placement of the
             filter, relative to the center of the current element of the
             input. Default is ``0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
 
     .. seealso:: :func:`scipy.ndimage.minimum_filter1d`
     """
-    return _min_or_max_1d(input, size, axis, output, mode, cval, origin, "min")
+    return _min_or_max_1d(
+        input, size, axis, output, mode, cval, origin, "min", mask=mask
+    )
 
 
 def maximum_filter1d(
-    input, size, axis=-1, output=None, mode="reflect", cval=0.0, origin=0
+    input,
+    size,
+    axis=-1,
+    output=None,
+    mode="reflect",
+    cval=0.0,
+    origin=0,
+    *,
+    mask=None,
 ):
     """Compute the maximum filter along a single axis.
 
@@ -1393,13 +1580,17 @@ def maximum_filter1d(
         origin (int): The origin parameter controls the placement of the
             filter, relative to the center of the current element of the
             input. Default is ``0``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
 
     .. seealso:: :func:`scipy.ndimage.maximum_filter1d`
     """
-    return _min_or_max_1d(input, size, axis, output, mode, cval, origin, "max")
+    return _min_or_max_1d(
+        input, size, axis, output, mode, cval, origin, "max", mask=mask
+    )
 
 
 def _min_or_max_1d(
@@ -1411,6 +1602,8 @@ def _min_or_max_1d(
     cval=0.0,
     origin=0,
     func="min",
+    *,
+    mask=None,
 ):
     ftprnt = cupy.ones(size, dtype=bool)
     ftprnt, origin = _filters_core._convert_1d_args(
@@ -1420,6 +1613,7 @@ def _min_or_max_1d(
         input, ftprnt, mode, origin, "footprint", axes=None
     )
     offsets = _filters_core._origins_to_offsets(origins, ftprnt.shape)
+    has_mask = mask is not None
     kernel = _get_min_or_max_kernel(
         modes,
         ftprnt.shape,
@@ -1428,10 +1622,12 @@ def _min_or_max_1d(
         float(cval),
         int_type,
         has_weights=False,
+        has_mask=has_mask,
     )
-    return _filters_core._call_kernel(
-        kernel, input, None, output, weights_dtype=bool
-    )
+    kwargs = dict(weights_dtype=bool)
+    if has_mask:
+        kwargs["mask"] = mask
+    return _filters_core._call_kernel(kernel, input, None, output, **kwargs)
 
 
 @cupy._util.memoize(for_each_device=True)
@@ -1445,6 +1641,7 @@ def _get_min_or_max_kernel(
     has_weights=True,
     has_structure=False,
     has_central_value=True,
+    has_mask=False,
 ):
     # When there are no 'weights' (the footprint, for the 1D variants) then
     # we need to make sure intermediate results are stored as doubles for
@@ -1458,20 +1655,32 @@ def _get_min_or_max_kernel(
     if has_structure:
         value += ("-" if func == "min" else "+") + "cast<X>(sval)"
 
+    pre = ""
+    if has_mask:
+        pre += """
+            // keep existing value if not within the mask
+            bool mv = (bool)mask[i];
+            if (!mv) {
+                y = cast<Y>(x[i]);
+                return;
+            }\n"""
+
     if has_central_value:
-        pre = "{} value = x[i];"
-        found = "value = {func}({value}, value);"
+        pre += f"{ctype} value = x[i];"
+        found = f"value = {func}({value}, value);"
     else:
         # If the central pixel is not included in the footprint we cannot
         # assume `x[i]` is not below the min or above the max and thus cannot
         # seed with that value. Instead we keep track of having set `value`.
-        pre = "{} value; bool set = false;"
-        found = "value = set ? {func}({value}, value) : {value}; set=true;"
+        pre += f"{ctype} value; bool set = false;"
+        found = f"value = set ? {func}({value}, value) : {value}; set=true;"
 
+    mask_str = "_masked" if has_mask else ""
+    name = f"{func}{mask_str}"
     return _filters_core._generate_nd_kernel(
-        func,
-        pre.format(ctype),
-        found.format(func=func, value=value),
+        name,
+        pre,
+        found,
         "y = cast<Y>(value);",
         modes,
         w_shape,
@@ -1479,6 +1688,7 @@ def _get_min_or_max_kernel(
         offsets,
         cval,
         ctype=ctype,
+        has_mask=has_mask,
         has_weights=has_weights,
         has_structure=has_structure,
     )
@@ -1494,6 +1704,8 @@ def rank_filter(
     cval=0.0,
     origin=0,
     axes=None,
+    *,
+    mask=None,
 ):
     """Multi-dimensional rank filter.
 
@@ -1524,6 +1736,8 @@ def rank_filter(
             ``origin`` must match the length of ``axes``. The ith entry in any
             of these tuples corresponds to the ith entry in ``axes``. Default
             is ``None``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1541,6 +1755,7 @@ def rank_filter(
         cval,
         origin,
         axes,
+        mask=mask,
     )
 
 
@@ -1553,6 +1768,8 @@ def median_filter(
     cval=0.0,
     origin=0,
     axes=None,
+    *,
+    mask=None,
 ):
     """Multi-dimensional median filter.
 
@@ -1581,6 +1798,8 @@ def median_filter(
             ``origin`` must match the length of ``axes``. The ith entry in any
             of these tuples corresponds to the ith entry in ``axes``. Default
             is ``None``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1597,6 +1816,7 @@ def median_filter(
         cval,
         origin,
         axes,
+        mask=mask,
     )
 
 
@@ -1610,6 +1830,8 @@ def percentile_filter(
     cval=0.0,
     origin=0,
     axes=None,
+    *,
+    mask=None,
 ):
     """Multi-dimensional percentile filter.
 
@@ -1640,6 +1862,8 @@ def percentile_filter(
             ``origin`` must match the length of ``axes``. The ith entry in any
             of these tuples corresponds to the ith entry in ``axes``. Default
             is ``None``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1662,7 +1886,16 @@ def percentile_filter(
             return int(float(fs) * percentile / 100.0)
 
     return _rank_filter(
-        input, get_rank, size, footprint, output, mode, cval, origin, axes
+        input,
+        get_rank,
+        size,
+        footprint,
+        output,
+        mode,
+        cval,
+        origin,
+        axes,
+        mask=mask,
     )
 
 
@@ -1676,6 +1909,8 @@ def _rank_filter(
     cval=0.0,
     origin=0,
     axes=None,
+    *,
+    mask=None,
 ):
     ndim = input.ndim
     axes = _util._check_axes(axes, ndim)
@@ -1758,6 +1993,7 @@ def _rank_filter(
                 origins,
                 min_max_op,
                 axes,
+                mask=mask,
             )
         else:
             return _min_or_max_filter(
@@ -1771,7 +2007,12 @@ def _rank_filter(
                 origins,
                 min_max_op,
                 axes,
+                mask=mask,
             )
+    elif mask is not None:
+        raise NotImplementedError(
+            "mask support not yet implemented in this case"
+        )
     offsets = _filters_core._origins_to_offsets(origins, footprint_shape)
     if num_axes < ndim and not has_weights:
         offsets = tuple(_util._expand_origin(ndim, axes, offsets))
@@ -1780,6 +2021,7 @@ def _rank_filter(
         for s, ax in zip(footprint_shape, axes):
             footprint_shape_temp[ax] = s
         footprint_shape = tuple(footprint_shape_temp)
+    has_mask = mask is not None
     kernel = _get_rank_kernel(
         filter_size,
         rank,
@@ -1789,9 +2031,13 @@ def _rank_filter(
         float(cval),
         int_type,
         has_weights=has_weights,
+        has_mask=has_mask,
     )
+    kwargs = dict(weights_dtype=bool)
+    if has_mask:
+        kwargs["mask"] = mask
     return _filters_core._call_kernel(
-        kernel, input, footprint, output, weights_dtype=bool
+        kernel, input, footprint, output, **kwargs
     )
 
 
@@ -1823,7 +2069,16 @@ def _get_shell_gap(filter_size):
 
 @cupy._util.memoize(for_each_device=True)
 def _get_rank_kernel(
-    filter_size, rank, modes, w_shape, offsets, cval, int_type, has_weights
+    filter_size,
+    rank,
+    modes,
+    w_shape,
+    offsets,
+    cval,
+    int_type,
+    has_weights,
+    *,
+    has_mask=False,
 ):
     s_rank = min(rank, filter_size - rank - 1)
     # The threshold was set based on the measurements on a V100
@@ -1869,10 +2124,22 @@ def _get_rank_kernel(
         post = f"sort(values,{filter_size});\ny=cast<Y>(values[{rank}]);"
         sorter = __SHELL_SORT.format(gap=_get_shell_gap(filter_size))
 
+    pre = ""
+    if has_mask:
+        pre += """
+            // keep existing value if not within the mask
+            bool mv = (bool)mask[i];
+            if (!mv) {
+                y = cast<Y>(x[i]);
+                return;
+            }\n"""
+    pre += f"int iv = 0;\nX values[{array_size}];"
+    found = "values[iv++] = {value};" + found_post
+    mask_str = "_masked" if has_mask else ""
     return _filters_core._generate_nd_kernel(
-        f"rank_{filter_size}_{rank}",
-        f"int iv = 0;\nX values[{array_size}];",
-        "values[iv++] = {value};" + found_post,
+        f"rank_{filter_size}_{rank}{mask_str}",
+        pre,
+        found,
         post,
         modes,
         w_shape,
@@ -1880,5 +2147,6 @@ def _get_rank_kernel(
         offsets,
         cval,
         has_weights=has_weights,
+        has_mask=has_mask,
         preamble=sorter,
     )
