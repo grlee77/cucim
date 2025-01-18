@@ -74,6 +74,8 @@ def _get_binary_erosion_kernel(
     name = "binary_erosion"
     if false_val:
         name += "_invert"
+    if has_mask:
+        name += "_masked"
     has_weights = not all_weights_nonzero
 
     return _filters_core._generate_nd_kernel(
@@ -797,6 +799,8 @@ def grey_erosion(
     mode="reflect",
     cval=0.0,
     origin=0,
+    *,
+    mask=None,
 ):
     """Calculates a greyscale erosion.
 
@@ -822,6 +826,8 @@ def grey_erosion(
             placement of the filter, relative to the center of the current
             element of the input. Default of 0 is equivalent to
             ``(0,)*input.ndim``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of greyscale erosion.
@@ -832,7 +838,16 @@ def grey_erosion(
         raise ValueError("size, footprint or structure must be specified")
 
     return _filters._min_or_max_filter(
-        input, size, footprint, structure, output, mode, cval, origin, "min"
+        input,
+        size,
+        footprint,
+        structure,
+        output,
+        mode,
+        cval,
+        origin,
+        "min",
+        mask=mask,
     )
 
 
@@ -845,6 +860,8 @@ def grey_dilation(
     mode="reflect",
     cval=0.0,
     origin=0,
+    *,
+    mask=None,
 ):
     """Calculates a greyscale dilation.
 
@@ -870,6 +887,8 @@ def grey_dilation(
             placement of the filter, relative to the center of the current
             element of the input. Default of 0 is equivalent to
             ``(0,)*input.ndim``.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of greyscale dilation.
@@ -901,7 +920,16 @@ def grey_dilation(
             origin[i] -= 1
 
     return _filters._min_or_max_filter(
-        input, size, footprint, structure, output, mode, cval, origin, "max"
+        input,
+        size,
+        footprint,
+        structure,
+        output,
+        mode,
+        cval,
+        origin,
+        "max",
+        mask=mask,
     )
 
 
