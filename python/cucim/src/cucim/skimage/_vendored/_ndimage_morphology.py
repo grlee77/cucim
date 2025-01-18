@@ -75,6 +75,8 @@ def _get_binary_erosion_kernel(
     name = "binary_erosion"
     if false_val:
         name += "_invert"
+    if has_mask:
+        name += "_masked"
     has_weights = not all_weights_nonzero
 
     modes = ("constant",) * len(w_shape)
@@ -879,6 +881,7 @@ def grey_erosion(
     origin=0,
     *,
     axes=None,
+    mask=None,
 ):
     """Calculates a greyscale erosion.
 
@@ -907,6 +910,8 @@ def grey_erosion(
         axes (tuple of int or None): The axes over which to apply the filter.
             If None, `input` is filtered along all axes. If an `origin` tuple
             is provided, its length must match the number of axes.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of greyscale erosion.
@@ -928,6 +933,7 @@ def grey_erosion(
         origin,
         "min",
         axes=axes,
+        mask=mask,
     )
 
 
@@ -942,6 +948,7 @@ def grey_dilation(
     origin=0,
     *,
     axes=None,
+    mask=None,
 ):
     """Calculates a greyscale dilation.
 
@@ -970,6 +977,8 @@ def grey_dilation(
         axes (tuple of int or None): The axes over which to apply the filter.
             If None, `input` is filtered along all axes. If an `origin` tuple
             is provided, its length must match the number of axes.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True.
 
     Returns:
         cupy.ndarray: The result of greyscale dilation.
@@ -1012,6 +1021,7 @@ def grey_dilation(
         origin,
         "max",
         axes=axes,
+        mask=mask,
     )
 
 
