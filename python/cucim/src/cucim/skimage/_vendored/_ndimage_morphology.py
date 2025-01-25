@@ -75,7 +75,7 @@ def _get_binary_erosion_kernel(
     name = "binary_erosion"
     if false_val:
         name += "_invert"
-    if has_mask:
+    if masked:
         name += "_masked"
     has_weights = not all_weights_nonzero
 

@@ -5,6 +5,8 @@ import cupy as cp
 import numpy as np
 from packaging.version import parse
 
+from cucim.skimage._vendored import ndimage as ndi, pad
+
 CUPY_GTE_13_3_0 = parse(cp.__version__) >= parse("13.3.0")
 
 if CUPY_GTE_13_3_0:
@@ -37,22 +39,254 @@ __all__ = [
 ]
 
 
-@cp.memoize(for_each_device=True)
-def get_num_pixels_kernel(count_dtype):
-    count_dtype = cp.dtype(count_dtype)
+def _get_bbox_code(uint_t, ndim, array_size):
+    """
+    Notes
+    -----
+    Local variables created:
 
+        - bbox_min : shape (array_size, ndim)
+            local minimum coordinates across the local set of labels encountered
+        - bbox_max : shape (array_size, ndim)
+            local maximum coordinates across the local set of labels encountered
+
+    Output variables written to:
+
+        - bbox : shape (max_label, 2 * ndim)
+    """
+
+    # declaration uses external variable:
+    #    labels_size : total number of pixels in the label image
+    source_pre = f"""
+    // bounding box variables
+    {uint_t} bbox_min[{ndim * array_size}];
+    {uint_t} bbox_max[{ndim * array_size}] = {{0}};
+    // initialize minimum coordinate to array size
+    for (size_t ii = 0; ii < {ndim * array_size}; ii++) {{
+      bbox_min[ii] = labels_size;
+    }}\n"""
+
+    # op uses external coordinate array variables:
+    #    in_coord[0]...in_coord[ndim - 1] : coordinates
+    #        coordinates in the labeled image at the current index
+    source_operation = f"""
+          bbox_min[{ndim}*offset] = min(in_coord[0], bbox_min[{ndim}*offset]);
+          bbox_max[{ndim}*offset] = max(in_coord[0] + 1, bbox_max[{ndim}*offset]);"""  # noqa: E501
+    for d in range(1, ndim):
+        source_operation += f"""
+          bbox_min[{ndim}*offset + {d}] = min(in_coord[{d}], bbox_min[{ndim}*offset + {d}]);
+          bbox_max[{ndim}*offset + {d}] = max(in_coord[{d}] + 1, bbox_max[{ndim}*offset + {d}]);"""  # noqa: E501
+
+    # post_operation uses external variables:
+    #     ii : index into num_pixels array
+    #     lab : label value that corresponds to location ii
+    #     bbox : output with shape (max_label, 2 * ndim)
+    source_post = f"""
+          // bounding box outputs
+          atomicMin(&bbox[(lab - 1)*{2 * ndim}], bbox_min[{ndim}*ii]);
+          atomicMax(&bbox[(lab - 1)*{2 * ndim} + 1], bbox_max[{ndim}*ii]);"""
+    for d in range(1, ndim):
+        source_post += f"""
+          atomicMin(&bbox[(lab - 1)*{2*ndim} + {2*d}], bbox_min[{ndim}*ii + {d}]);
+          atomicMax(&bbox[(lab - 1)*{2*ndim} + {2*d + 1}], bbox_max[{ndim}*ii + {d}]);"""  # noqa: E501
+    return source_pre, source_operation, source_post
+
+
+def _get_num_pixels_code(pixels_per_thread, array_size):
+    """
+    Notes
+    -----
+    Local variables created:
+
+        - num_pixels : shape (array_size, )
+            The number of pixels encountered per label value
+
+    Output variables written to:
+
+        - counts : shape (max_label,)
+    """
+    pixel_count_dtype = "int8_t" if pixels_per_thread < 256 else "int16_t"
+
+    source_pre = f"""
+    // num_pixels variables
+    {pixel_count_dtype} num_pixels[{array_size}] = {{0}};\n"""
+
+    source_operation = """
+        num_pixels[offset] += 1;\n"""
+
+    # post_operation requires external variables:
+    #     ii : index into num_pixels array
+    #     lab : label value that corresponds to location ii
+    #     counts : output with shape (max_label,)
+    source_post = """
+        atomicAdd(&counts[lab - 1], num_pixels[ii]);;"""
+    return source_pre, source_operation, source_post
+
+
+def _get_coord_sums_code(coord_sum_ctype, ndim, array_size):
+    """
+    Notes
+    -----
+    Local variables created:
+
+        - bbox_min : shape (array_size, ndim)
+            local minimum coordinates across the local set of labels encountered
+        - bbox_max : shape (array_size, ndim)
+            local maximum coordinates across the local set of labels encountered
+
+    Output variables written to:
+
+        - bbox : shape (max_label, 2 * ndim)
+    """
+
+    source_pre = f"""
+    {coord_sum_ctype} coord_sum[{ndim * array_size}] = {{0}};\n"""
+
+    # op uses external coordinate array variables:
+    #    in_coord[0]...in_coord[ndim - 1] : coordinates
+    #        coordinates in the labeled image at the current index
+    source_operation = f"""
+        coord_sum[{ndim}*offset] += in_coord[0];"""
+    for d in range(1, ndim):
+        source_operation += f"""
+        coord_sum[{ndim}*offset + {d}] += in_coord[{d}];"""
+    # post_operation uses external variables:
+    #     ii : index into num_pixels array
+    #     lab : label value that corresponds to location ii
+    #     coord_sums : output with shape (max_label, ndim)
+    source_post = f"""
+        // bounding box outputs
+        atomicAdd(&coord_sums[(lab - 1) * {ndim}], coord_sum[{ndim}*ii]);"""
+    for d in range(1, ndim):
+        source_post += f"""
+        atomicAdd(&coord_sums[(lab - 1) * {ndim} + {d}],
+                  coord_sum[{ndim}*ii + {d}]);"""
+    return source_pre, source_operation, source_post
+
+
+@cp.memoize(for_each_device=True)
+def get_bbox_coords_kernel(
+    ndim,
+    coord_dtype=None,
+    count_dtype=None,
+    compute_bbox=True,
+    compute_num_pixels=False,
+    compute_coordinate_sums=False,
+    pixels_per_thread=8,
+):
+    coord_dtype = cp.dtype(coord_dtype)
+    if count_dtype is None and compute_num_pixels:
+        count_dtype = cp.dtype(cp.uint32)
+    if compute_coordinate_sums:
+        coord_sum_dtype = cp.dtype(cp.uint64)
+        coord_sum_ctype = "uint64_t"
+
+    if pixels_per_thread < 10:
+        array_size = pixels_per_thread
+    else:
+        # highly unlikely for array to repeatedly swap labels at every pixel,
+        # so use a smaller size
+        array_size = pixels_per_thread // 2
+
+    if coord_dtype.itemsize <= 4:
+        uint_t = "unsigned int"
+    else:
+        uint_t = "unsigned long long"
+
+    if not (compute_bbox or compute_num_pixels or compute_coordinate_sums):
+        raise ValueError("no computation requested")
+
+    if compute_bbox:
+        bbox_pre, bbox_op, bbox_post = _get_bbox_code(
+            uint_t=uint_t, ndim=ndim, array_size=array_size
+        )
+    if compute_num_pixels:
+        count_pre, count_op, count_post = _get_num_pixels_code(
+            pixels_per_thread=pixels_per_thread, array_size=array_size
+        )
+    if compute_coordinate_sums:
+        coord_sums_pre, coord_sums_op, coord_sums_post = _get_coord_sums_code(
+            coord_sum_ctype=coord_sum_ctype, ndim=ndim, array_size=array_size
+        )
     # store only counts for label > 0  (label = 0 is the background)
-    source = """
-      if (label != 0) {
-        atomicAdd(&counts[label - 1], 1);
+    source = f"""
+      uint64_t start_index = {pixels_per_thread}*i;
+    """
+    if compute_bbox:
+        source += bbox_pre
+    if compute_num_pixels:
+        source += count_pre
+    if compute_coordinate_sums:
+        source += coord_sums_pre
+
+    inner_op = ""
+    if compute_bbox:
+        source += _unravel_loop_index_declarations(
+            "labels", ndim, uint_t=uint_t
+        )
+
+        inner_op += _unravel_loop_index(
+            "labels",
+            ndim=ndim,
+            uint_t=uint_t,
+            raveled_index="ii",
+            omit_declarations=True,
+        )
+        inner_op += bbox_op
+    if compute_num_pixels:
+        inner_op += count_op
+    if compute_coordinate_sums:
+        inner_op += coord_sums_op
+
+    source += f"""
+      X encountered_labels[{array_size}] = {{0}};
+      X current_label;
+      X prev_label = labels[start_index];
+      int offset = 0;
+      encountered_labels[0] = prev_label;
+      uint64_t ii_max = min(start_index + {pixels_per_thread}, labels_size);
+      for (uint64_t ii = start_index; ii < ii_max; ii++) {{
+        current_label = labels[ii];
+        if (current_label == 0) {{ continue; }}
+        if (current_label != prev_label) {{
+            offset += 1;
+            prev_label = current_label;
+            encountered_labels[offset] = current_label;
+        }}
+        {inner_op}
+      }}"""
+    source += """
+      for (size_t ii = 0; ii <= offset; ii++) {
+        X lab = encountered_labels[ii];
+        if (lab != 0) {"""
+
+    if compute_bbox:
+        source += bbox_post
+    if compute_num_pixels:
+        source += count_post
+    if compute_coordinate_sums:
+        source += coord_sums_post
+    source += """
+        }
       }\n"""
 
-    name = f"cucim_num_pixels_{count_dtype.name}"
+    # print(source)
+    inputs = "raw X labels, raw uint64 labels_size"
+    outputs = []
+    name = "cucim_"
+    if compute_bbox:
+        outputs.append(f"raw {coord_dtype.name} bbox")
+        name += f"_bbox{ndim}d"
+    if compute_num_pixels:
+        outputs.append(f"raw {count_dtype.name} counts")
+        name += f"_numpix_dtype{count_dtype.char}"
+    if compute_coordinate_sums:
+        outputs.append(f"raw {coord_sum_dtype.name} coord_sums")
+        name += f"_csums_dtype{coord_sum_dtype.char}"
+    outputs = ", ".join(outputs)
+    name += f"_batch{pixels_per_thread}"
     return cp.ElementwiseKernel(
-        "X label",  # inputs
-        f"raw {count_dtype.name} counts",  # outputs
-        source,
-        name=name,
+        inputs, outputs, source, preamble=_includes, name=name
     )
 
 
@@ -234,7 +468,9 @@ def _check_count_dtype(dtype):
     return dtype, kernel_dtype
 
 
-def regionprops_num_pixels(label_image, max_label=None, count_dtype=np.uint32):
+def regionprops_num_pixels(
+    label_image, max_label=None, count_dtype=np.uint32, pixels_per_thread=16
+):
     if max_label is None:
         max_label = int(label_image.max())
     num_counts = max_label
@@ -242,13 +478,25 @@ def regionprops_num_pixels(label_image, max_label=None, count_dtype=np.uint32):
 
     count_dtype, kernel_dtype = _check_count_dtype(count_dtype)
 
-    kernel = get_num_pixels_kernel(kernel_dtype)
+    pixels_kernel = get_bbox_coords_kernel(
+        count_dtype=count_dtype,
+        ndim=label_image.ndim,
+        compute_bbox=False,
+        compute_num_pixels=True,
+        compute_coordinate_sums=False,
+        pixels_per_thread=pixels_per_thread,
+    )
 
     # make a copy if the labels array is not C-contiguous
     if not label_image.flags.c_contiguous:
         label_image = cp.ascontiguousarray(label_image)
 
-    kernel(label_image, counts)
+    pixels_kernel(
+        label_image,
+        label_image.size,
+        counts,
+        size=math.ceil(label_image.size / pixels_per_thread),
+    )
 
     # allow converting output to requested dtype if it was smaller than 32-bit
     if kernel_dtype != count_dtype:
@@ -257,7 +505,11 @@ def regionprops_num_pixels(label_image, max_label=None, count_dtype=np.uint32):
 
 
 def regionprops_area(
-    label_image, spacing=None, max_label=None, dtype=cp.float32
+    label_image,
+    spacing=None,
+    max_label=None,
+    dtype=cp.float32,
+    pixels_per_thread=16,
 ):
     # integer atomicAdd is faster than floating point so better to convert
     # after counting
@@ -265,6 +517,7 @@ def regionprops_area(
         label_image,
         max_label=max_label,
         count_dtype=np.uint32,
+        pixels_per_thread=pixels_per_thread,
     )
     area = area.astype(dtype)
     if spacing is not None:
@@ -566,74 +819,50 @@ def regionprops_intensity_max(label_image, intensity_image, max_label=None):
     )
 
 
-def _unravel_loop_index(var_name, ndim, uint_t="unsigned int"):
+def _unravel_loop_index_declarations(var_name, ndim, uint_t="unsigned int"):
+    code = f"""
+        // variables for unraveling a linear index to a coordinate array
+        {uint_t} in_coord[{ndim}];
+        {uint_t} temp_floor;"""
+    for d in range(ndim):
+        code += f"""
+        {uint_t} dim{d}_size = {var_name}.shape()[{d}];"""
+    return code
+
+
+def _unravel_loop_index(
+    var_name,
+    ndim,
+    uint_t="unsigned int",
+    raveled_index="i",
+    omit_declarations=False,
+):
     """
     declare a multi-index array in_coord and unravel the 1D index, i into it.
     This code assumes that the array is a C-ordered array.
     """
-    code = f"""
-        {uint_t} in_coord[{ndim}];
-        {uint_t} s, t, idx = i;"""
-    for j in range(ndim - 1, 0, -1):
+    code = (
+        ""
+        if omit_declarations
+        else _unravel_loop_index_declarations(var_name, ndim, uint_t)
+    )
+    code += f"{uint_t} temp_idx = {raveled_index};"
+    for d in range(ndim - 1, 0, -1):
         code += f"""
-        s = {var_name}.shape()[{j}];
-        t = idx / s;
-        in_coord[{j}] = idx - t * s;
-        idx = t;"""
+        temp_floor = temp_idx / dim{d}_size;
+        in_coord[{d}] = temp_idx - temp_floor * dim{d}_size;
+        temp_idx = temp_floor;"""
     code += """
-        in_coord[0] = idx;"""
+        in_coord[0] = temp_idx;"""
     return code
 
 
-@cp.memoize(for_each_device=True)
-def get_bbox_coords_kernel(coord_dtype, ndim, compute_coordinate_sums=False):
-    coord_dtype = cp.dtype(coord_dtype)
-    if compute_coordinate_sums:
-        coord_sum_dtype = cp.dtype(cp.uint64)
-        count_dtype = cp.dtype(cp.uint32)
-
-    uint_t = (
-        "unsigned int" if coord_dtype.itemsize <= 4 else "unsigned long long"
-    )
-
-    source = """
-          if (label[i] != 0) {"""
-    source += _unravel_loop_index("label", ndim, uint_t=uint_t)
-    for d in range(ndim):
-        source += f"""
-            atomicMin(&bbox[(label[i] - 1) * {2 * ndim} + {2*d}],
-                      in_coord[{d}]);
-            atomicMax(&bbox[(label[i] - 1) * {2 * ndim} + {2*d + 1}],
-                      in_coord[{d}] + 1);"""
-        if compute_coordinate_sums:
-            source += f"""
-            atomicAdd(&coord_sums[(label[i] - 1) * {ndim} + {d}],
-                      in_coord[{d}]);"""
-    if compute_coordinate_sums:
-        source += """
-            atomicAdd(&counts[label[i] - 1], 1);"""
-    source += """
-          }\n"""
-
-    inputs = "raw X label"
-    if compute_coordinate_sums:
-        outputs = f"raw {coord_dtype.name} bbox, "
-        outputs += f"raw {count_dtype.name} counts, "
-        outputs += f"raw {coord_sum_dtype.name} coord_sums"
-    else:
-        outputs = f"raw {coord_dtype.name} bbox"
-    if compute_coordinate_sums:
-        name = f"cucim_centroid_{ndim}d_{coord_dtype.name}"
-        name += f"_{count_dtype.name}_{coord_sum_dtype.name}"
-    else:
-        name = f"cucim_bbox_{ndim}d_{coord_dtype.name}"
-    return cp.ElementwiseKernel(
-        inputs, outputs, source, preamble=_includes, name=name
-    )
-
-
 def regionprops_bbox_coords(
-    label_image, max_label=None, coord_dtype=cp.uint32, return_slices=False
+    label_image,
+    max_label=None,
+    coord_dtype=cp.uint32,
+    return_slices=False,
+    pixels_per_thread=16,
 ):
     """
     Parameters
@@ -669,7 +898,11 @@ def regionprops_bbox_coords(
     if max_label is None:
         max_label = int(label_image.max())
 
-    bbox_coords_kernel = get_bbox_coords_kernel(coord_dtype, label_image.ndim)
+    bbox_kernel = get_bbox_coords_kernel(
+        label_image.ndim,
+        coord_dtype=coord_dtype,
+        pixels_per_thread=pixels_per_thread,
+    )
 
     ndim = label_image.ndim
     bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
@@ -682,7 +915,12 @@ def regionprops_bbox_coords(
     if not label_image.flags.c_contiguous:
         label_image = cp.ascontiguousarray(label_image)
 
-    bbox_coords_kernel(label_image, bbox_coords, size=label_image.size)
+    bbox_kernel(
+        label_image,
+        label_image.size,
+        bbox_coords,
+        size=math.ceil(label_image.size / pixels_per_thread),
+    )
     if return_slices:
         bbox_coords_cpu = cp.asnumpy(bbox_coords)
         if ndim == 2:
@@ -709,7 +947,9 @@ def regionprops_bbox_coords(
     return bbox_coords, bbox_slices
 
 
-def regionprops_centroid(label_image, max_label=None, coord_dtype=cp.uint32):
+def regionprops_centroid(
+    label_image, max_label=None, coord_dtype=cp.uint32, pixels_per_thread=16
+):
     """
     Parameters
     ----------
@@ -734,7 +974,11 @@ def regionprops_centroid(label_image, max_label=None, coord_dtype=cp.uint32):
         max_label = int(label_image.max())
 
     bbox_coords_kernel = get_bbox_coords_kernel(
-        coord_dtype, label_image.ndim, compute_coordinate_sums=True
+        label_image.ndim,
+        coord_dtype=coord_dtype,
+        compute_num_pixels=True,
+        compute_coordinate_sums=True,
+        pixels_per_thread=pixels_per_thread,
     )
 
     ndim = label_image.ndim
@@ -752,10 +996,11 @@ def regionprops_centroid(label_image, max_label=None, coord_dtype=cp.uint32):
 
     bbox_coords_kernel(
         label_image,
+        label_image.size,
         bbox_coords,
         centroid_counts,
         centroid_sums,
-        size=label_image.size,
+        size=math.ceil(label_image.size / pixels_per_thread),
     )
 
     centroid = centroid_sums / centroid_counts[:, cp.newaxis]
@@ -793,7 +1038,10 @@ def get_centroid_local_kernel(coord_dtype, ndim):
 
 
 def regionprops_centroid_local(
-    label_image, max_label=None, coord_dtype=cp.uint32
+    label_image,
+    max_label=None,
+    coord_dtype=cp.uint32,
+    pixels_per_thread=16,
 ):
     """
     Parameters
@@ -819,9 +1067,12 @@ def regionprops_centroid_local(
         max_label = int(label_image.max())
 
     bbox_coords_kernel = get_bbox_coords_kernel(
-        coord_dtype,
         label_image.ndim,
+        coord_dtype=coord_dtype,
+        compute_bbox=True,
+        compute_num_pixels=False,
         compute_coordinate_sums=False,
+        pixels_per_thread=pixels_per_thread,
     )
 
     ndim = label_image.ndim
@@ -835,7 +1086,12 @@ def regionprops_centroid_local(
     if not label_image.flags.c_contiguous:
         label_image = cp.ascontiguousarray(label_image)
 
-    bbox_coords_kernel(label_image, bbox_coords, size=label_image.size)
+    bbox_coords_kernel(
+        label_image,
+        label_image.size,
+        bbox_coords,
+        size=math.ceil(label_image.size / pixels_per_thread),
+    )
 
     counts = cp.zeros((max_label,), dtype=cp.uint32)
     centroids_sums = cp.zeros((max_label, ndim), dtype=cp.uint64)
@@ -1094,6 +1350,7 @@ def regionprops_moments(
     order=2,
     spacing=None,
     coord_dtype=cp.uint32,
+    pixels_per_thread=16,
 ):
     """
     Parameters
@@ -1154,10 +1411,13 @@ def regionprops_moments(
     if max_label is None:
         max_label = int(label_image.max())
 
-    bbox_coords_kernel = get_bbox_coords_kernel(
-        coord_dtype,
+    bbox_kernel = get_bbox_coords_kernel(
         label_image.ndim,
+        coord_dtype=coord_dtype,
+        compute_bbox=True,
+        compute_num_pixels=False,
         compute_coordinate_sums=False,
+        pixels_per_thread=pixels_per_thread,
     )
 
     # make a copy if the inputs are not already C-contiguous
@@ -1184,7 +1444,12 @@ def regionprops_moments(
     # The value for atomicMax columns is already 0 as desired.
     bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
 
-    bbox_coords_kernel(label_image, bbox_coords, size=label_image.size)
+    bbox_kernel(
+        label_image,
+        label_image.size,
+        bbox_coords,
+        size=math.ceil(label_image.size / pixels_per_thread),
+    )
 
     # total number of elements in the moments matrix
     moments = cp.zeros(moments_shape, dtype=cp.float64)
@@ -1421,7 +1686,9 @@ def regionprops_moments_central(moments_raw, ndim):
 
 
 @cp.memoize(for_each_device=True)
-def get_moments_normalize_kernel(moments_dtype, ndim, order, unit_scale=False):
+def get_moments_normalize_kernel(
+    moments_dtype, ndim, order, unit_scale=False, pixel_correction=False
+):
     """Normalizes central moments of order >=2"""
     moments_dtype = cp.dtype(moments_dtype)
 
@@ -1440,6 +1707,16 @@ def get_moments_normalize_kernel(moments_dtype, ndim, order, unit_scale=False):
     # floating point type used for the intermediate computations
     float_type = "double"
 
+    # pixel correction for out[2, 0], out[0, 2] in 2D
+    #                      out[2, 0, 0], out[0, 2, 0] and out[0, 0, 2] in 3D
+    # See ITK paper:
+    # Padfield2008 - A Label Geometry Image Filter for Multiple Object
+    # Measurement
+    if pixel_correction:
+        correction_term = " + 0.08333333333333333"  # add 1/12
+    else:
+        correction_term = ""
+
     source = f"""
             {uint_t} offset = i * {num_moments};\n"""
     if ndim == 2:
@@ -1456,11 +1733,11 @@ def get_moments_normalize_kernel(moments_dtype, ndim, order, unit_scale=False):
                 norm_order2 *= scale * scale;\n"""
 
             # normalize
-            source += """
+            source += f"""
             // normalize the 2nd order central moments
-            out[offset + 2] = moments_central[offset + 2] / norm_order2;  // out[0, 2]
+            out[offset + 2] = moments_central[offset + 2] / norm_order2{correction_term};  // out[0, 2]
             out[offset + 4] = moments_central[offset + 4] / norm_order2;  // out[1, 1]
-            out[offset + 6] = moments_central[offset + 6] / norm_order2;  // out[2, 0]\n"""  # noqa: E501
+            out[offset + 6] = moments_central[offset + 6] / norm_order2{correction_term};  // out[2, 0]\n"""  # noqa: E501
         elif order == 3:
             source += f"""
             // retrieve zeroth moment
@@ -1502,14 +1779,14 @@ def get_moments_normalize_kernel(moments_dtype, ndim, order, unit_scale=False):
                 norm_order2 *= scale * scale;\n"""
 
             # normalize
-            source += """
+            source += f"""
             // normalize the 2nd order central moments
-            out[offset + 2] = moments_central[offset + 2] / norm_order2;    // out[0, 0, 2]
+            out[offset + 2] = moments_central[offset + 2] / norm_order2{correction_term};    // out[0, 0, 2]
             out[offset + 4] = moments_central[offset + 4] / norm_order2;    // out[0, 1, 1]
-            out[offset + 6] = moments_central[offset + 6] / norm_order2;    // out[0, 2, 0]
+            out[offset + 6] = moments_central[offset + 6] / norm_order2{correction_term};    // out[0, 2, 0]
             out[offset + 10] = moments_central[offset + 10] / norm_order2;  // out[1, 0, 1]
             out[offset + 12] = moments_central[offset + 12] / norm_order2;  // out[1, 1, 0]
-            out[offset + 18] = moments_central[offset + 18] / norm_order2;  // out[2, 0, 0]\n"""  # noqa: E501
+            out[offset + 18] = moments_central[offset + 18] / norm_order2{correction_term};  // out[2, 0, 0]\n"""  # noqa: E501
         elif order == 3:
             source += f"""
             // retrieve the zeroth moment
@@ -1559,7 +1836,26 @@ def get_moments_normalize_kernel(moments_dtype, ndim, order, unit_scale=False):
     )
 
 
-def regionprops_moments_normalized(moments_central, ndim, spacing=None):
+def regionprops_moments_normalized(
+    moments_central, ndim, spacing=None, pixel_correction=False
+):
+    """
+
+    Notes
+    -----
+    Default setting of `pixel_correction=False` matches the scikit-image
+    behavior (as of v0.25).
+
+    The `pixel_correction` is to account for pixel/voxel size and is only
+    implemented for 2nd order moments currently based on the derivation in:
+
+    The correction should need to be updated to take 'spacing' into account as
+    it currently assumes unit size.
+
+    Padfield D., Miller J. "A Label Geometry Image Filter for Multiple Object
+    Measurement". The Insight Journal. 2013 Mar.
+    https://doi.org/10.54294/saa3nn
+    """
     if moments_central.ndim == 2 + ndim:
         num_channels = moments_central.shape[1]
     elif moments_central.ndim == 1 + ndim:
@@ -1602,7 +1898,11 @@ def regionprops_moments_normalized(moments_central, ndim, spacing=None):
         inputs = (moments_central, scale)
 
     moments_norm_kernel = get_moments_normalize_kernel(
-        moments_central.dtype, ndim, order, unit_scale=unit_scale
+        moments_central.dtype,
+        ndim,
+        order,
+        unit_scale=unit_scale,
+        pixel_correction=pixel_correction,
     )
     # output is NaN except for locations with orders in range [2, order]
     moments_norm = cp.full(
@@ -1844,8 +2144,12 @@ def regionprops_inertia_tensor(
 
 
 @cp.memoize(for_each_device=True)
-def get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths=False):
-    """Compute inertia tensor eigenvalues
+def get_spd_matrix_eigvals_kernel(
+    rank, compute_eigenvectors=False, compute_axis_lengths=False
+):
+    """Compute symmetric positive definite (SPD) matrix eigenvalues
+
+    Implements closed-form analytical solutions for 2x2 and 3x3 matrices.
 
     C. Deledalle, L. Denis, S. Tabti, F. Tupin. Closed-form expressions
     of the eigen decomposition of 2 x 2 and 3 x 3 Hermitian matrices.
@@ -1855,18 +2159,18 @@ def get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths=False):
     """  # noqa: E501
 
     # assume moments input was truncated to only hold order<=2 moments
-    num_itensor = ndim * ndim
+    num_elements = rank * rank
 
     # size of the inertia_tensor matrix
     source = f"""
-            unsigned int offset = i * {num_itensor};
-            unsigned int offset_out = i * {ndim};\n"""
-    if ndim == 2:
+            unsigned int offset = i * {num_elements};
+            unsigned int offset_out = i * {rank};\n"""
+    if rank == 2:
         source += """
             F tmp1, tmp2;
-            double m00 = static_cast<double>(inertia_tensor[offset]);
-            double m01 = static_cast<double>(inertia_tensor[offset + 1]);
-            double m11 = static_cast<double>(inertia_tensor[offset + 3]);
+            double m00 = static_cast<double>(spd_matrix[offset]);
+            double m01 = static_cast<double>(spd_matrix[offset + 1]);
+            double m11 = static_cast<double>(spd_matrix[offset + 3]);
             tmp1 = m01 * m01;
             tmp1 *= 4;
 
@@ -1880,30 +2184,40 @@ def get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths=False):
             tmp1 /= 2;
 
             // store in "descending" order and clip to positive values
-            // (matrix is Hermitian, so negatives values can only be due to
+            // (matrix is spd, so negatives values can only be due to
             //  numerical errors)
             F lam1 = max(tmp1 + tmp2, 0.0);
             F lam2 = max(tmp1 - tmp2, 0.0);
             out[offset_out] = lam1;
             out[offset_out + 1] = lam2;\n"""
+        if compute_eigenvectors:
+            source += """
+            double ev_denom = max(m01, 1.0e-15);
+            // first eigenvector
+            evecs[offset] = (lam2 - m11) / ev_denom;
+            evecs[offset + 2] = 1.0;
+            // second eigenvector
+            evecs[offset + 1] = (lam1 - m11) / ev_denom;
+            evecs[offset + 3] = 1.0;
+            \n"""
         if compute_axis_lengths:
             source += """
             axis_lengths[offset_out] = 4.0 * sqrt(lam1);
             axis_lengths[offset_out + 1] = 4.0 * sqrt(lam2);
             \n"""
-    elif ndim == 3:
+    elif rank == 3:
         source += """
             double x1, x2, phi;
-            // extract triangle of (Hermitian) inertia tensor values
+            // extract triangle of (spd) inertia tensor values
             // [a, d, f]
             // [-, b, e]
             // [-, -, c]
-            double a = static_cast<double>(inertia_tensor[offset]);
-            double b = static_cast<double>(inertia_tensor[offset + 4]);
-            double c = static_cast<double>(inertia_tensor[offset + 8]);
-            double d = static_cast<double>(inertia_tensor[offset + 1]);
-            double e = static_cast<double>(inertia_tensor[offset + 5]);
-            double f = static_cast<double>(inertia_tensor[offset + 2]);
+            double a = static_cast<double>(spd_matrix[offset]);
+            double b = static_cast<double>(spd_matrix[offset + 4]);
+            double c = static_cast<double>(spd_matrix[offset + 8]);
+            double d = static_cast<double>(spd_matrix[offset + 1]);
+            double e = static_cast<double>(spd_matrix[offset + 5]);
+            double f = static_cast<double>(spd_matrix[offset + 2]);
             double d_sq = d * d;
             double e_sq = e * e;
             double f_sq = f * f;
@@ -1960,7 +2274,7 @@ def get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths=False):
                 lam2 = stmp;
             }
             // clip to positive values
-            // (matrix is Hermitian, so negatives values can only be due to
+            // (matrix is spd, so negatives values can only be due to
             //  numerical errors)
             lam1 = max(lam1, 0.0);
             lam2 = max(lam2, 0.0);
@@ -1968,6 +2282,45 @@ def get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths=False):
             out[offset_out] = lam1;
             out[offset_out + 1] = lam2;
             out[offset_out + 2] = lam3;\n"""
+        if compute_eigenvectors:
+            source += """
+            double f_denom = f;
+            if (f_denom == 0) {
+                f = 1.0e-15;
+            }
+            double de = d * e;
+            double ef = e * f;
+
+            // first eigenvector
+            double m_denom = f * (b - lam1) - de;
+            if (m_denom == 0) {
+                m_denom = 1.0e-15;
+            }
+            double m = (d * (c - lam1) - ef) / m_denom;
+            evecs[offset] = (lam1 - c - e * m) / f_denom;
+            evecs[offset + 3] = m;
+            evecs[offset + 6] = 1.0;
+
+            // second eigenvector
+            m_denom = f * (b - lam2) - de;
+            if (m_denom == 0) {
+                m_denom = 1.0e-15;
+            }
+            m = (d * (c - lam2) - ef) / m_denom;
+            evecs[offset + 1] = (lam2 - c - e * m) / f_denom;
+            evecs[offset + 4] = m;
+            evecs[offset + 7] = 1.0;
+
+            // third eigenvector
+            m_denom = f * (b - lam3) - de;
+            if (m_denom == 0) {
+                m_denom = 1.0e-15;
+            }
+            m = (d * (c - lam3) - ef) / m_denom;
+            evecs[offset + 2] = (lam3 - c - e * m) / f_denom;
+            evecs[offset + 5] = m;
+            evecs[offset + 8] = 1.0;
+            \n"""
         if compute_axis_lengths:
             source += """
             // formula reference:
@@ -1979,10 +2332,15 @@ def get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths=False):
             \n"""  # noqa: E501
     else:
         # note: ndim here is the number of spatial image dimensions
-        raise ValueError("only ndim = 2 or 3 is supported")
-    inputs = "raw F inertia_tensor"
+        raise ValueError("only rank = 2 or 3 is supported")
+    inputs = "raw F spd_matrix"
     outputs = "raw F out"
-    name = f"cucim_inertia_tensor_eigvals_{ndim}d"
+    if compute_eigenvectors:
+        outputs += ", raw F eigvecs"
+        ev_str = "eigvecs_"
+    else:
+        ev_str = ""
+    name = f"cucim_spd_matrix_eigvals_{ev_str}{rank}d"
     if compute_axis_lengths:
         outputs += ", raw F axis_lengths"
         name += "_with_axis"
@@ -2006,7 +2364,11 @@ def regionprops_inertia_tensor_eigvals(
     if not inertia_tensor.flags.c_contiguous:
         inertia_tensor = cp.ascontiguousarray(inertia_tensor)
 
-    kernel = get_inertia_tensor_eigvals_kernel(ndim, compute_axis_lengths)
+    kernel = get_spd_matrix_eigvals_kernel(
+        rank=ndim,
+        compute_axis_lengths=compute_axis_lengths,
+        compute_eigenvectors=False,
+    )
     eigvals_shape = inertia_tensor.shape[:-2] + (ndim,)
     eigvals = cp.empty(eigvals_shape, dtype=inertia_tensor.dtype)
     if compute_axis_lengths:
@@ -2141,3 +2503,346 @@ def regionprops_centroid_weighted(
     centroid = cp.zeros(centroid_shape, dtype=moments_raw.dtype)
     kernel(*inputs, centroid, size=max_label)
     return centroid
+
+
+def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
+    """Calculate total perimeter of all objects in binary image.
+
+    Parameters
+    ----------
+    labels : (M, N) ndarray
+        Binary input image.
+    neighborhood : 4 or 8, optional
+        Neighborhood connectivity for border pixel determination. It is used to
+        compute the contour. A higher neighborhood widens the border on which
+        the perimeter is computed.
+    max_label : int or None, optional
+        The maximum label in labels can be provided to avoid recomputing it if
+        it was already known.
+    robust : bool, optional
+        If True, extra computation will be done to detect if any labeled
+        regions are <=2 pixel spacing from another. Any regions that meet that
+        criteria will have their perimeter recomputed in isolation to avoid
+        possible error that would otherwise occur in this case. Turning this
+        on will make the run time substantially longer, so it should only be
+        used when labeled regions may have a non-negligible portion of their
+        boundary within a <2 pixel gap from another label.
+
+    Returns
+    -------
+    perimeter : float
+        Total perimeter of all objects in binary image.
+
+    Notes
+    -----
+    The `perimeter` method does not consider the boundary along the image edge
+    as image as part of the perimeter, while the `perimeter_crofton` method
+    does. In any case, an object touching the image edge likely extends outside
+    of the field of view, so an accurate perimeter cannot be measured for such
+    objects.
+
+    References
+    ----------
+    .. [1] K. Benkrid, D. Crookes. Design and FPGA Implementation of
+           a Perimeter Estimator. The Queen's University of Belfast.
+           http://www.cs.qub.ac.uk/~d.crookes/webpubs/papers/perimeter.doc
+
+    See Also
+    --------
+    perimeter_crofton
+
+    Examples
+    --------
+    >>> import cupy as cp
+    >>> from skimage import data
+    >>> from cucim.skimage import util
+    >>> from cucim.skimage.measure import label
+    >>> # coins image (binary)
+    >>> img_coins = cp.array(data.coins() > 110)
+    >>> # total perimeter of all objects in the image
+    >>> perimeter(img_coins, neighborhood=4)  # doctest: +ELLIPSIS
+    array(7796.86799644)
+    >>> perimeter(img_coins, neighborhood=8)  # doctest: +ELLIPSIS
+    array(8806.26807333)
+    """
+    if max_label is None:
+        max_label = int(labels.max())
+
+    # maximum possible value for XF_labeled input to bincount
+    # need to choose integer range large enough that this won't overflow
+    max_val = (max_label + 1) * 16
+    if max_val < 256:
+        image_dtype = cp.uint8
+    elif max_val < 65536:
+        image_dtype = cp.uint16
+    elif max_val < 2**32:
+        image_dtype = cp.uint32
+    else:
+        image_dtype = cp.uint64
+
+    if image_dtype == cp.uint8:
+        # can directly view bool as uint8 without a copy
+        image = (labels > 0).view(cp.uint8)
+    else:
+        image = (labels > 0).astype(image_dtype)
+
+    if neighborhood == 4:
+        footprint = cp.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+    else:
+        footprint = 3
+
+    eroded_image = ndi.binary_erosion(image, footprint, border_value=0)
+    border_image = image - eroded_image
+
+    perimeter_weights = np.zeros(50, dtype=cp.float64)
+    perimeter_weights[[5, 7, 15, 17, 25, 27]] = 1
+    perimeter_weights[[21, 33]] = math.sqrt(2)
+    perimeter_weights[[13, 23]] = (1 + math.sqrt(2)) / 2
+    perimeter_weights = cp.asarray(perimeter_weights)
+
+    perimeter_image = ndi.convolve(
+        border_image,
+        cp.array([[10, 2, 10], [2, 1, 2], [10, 2, 10]]),
+        mode="constant",
+        cval=0,
+    )
+
+    # dilate labels by 1 pixel so we can sum with values in XF to give
+    # unique histogram bins for each labeled regions (as long as no labeled
+    # regions are within < 2 pixels from another labeled region)
+    labels_dilated = ndi.grey_dilation(labels, 3, mode="constant")
+
+    if robust:
+        # check possibly too-close regions for which we may need to manually
+        # recompute the regions perimeter in isolation
+        labels_dilated2 = ndi.grey_dilation(labels_dilated, 5, mode="constant")
+        labels2 = labels_dilated2 * image
+        diffs = labels != labels2
+
+        labels_to_recompute = []
+        # regions to recompute
+        if cp.any(diffs):
+            labels_to_recompute = cp.asnumpy(cp.unique(labels[diffs]))
+            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
+            warnings.warn(
+                "some labeled regions are <= 2 pixels from another region. The "
+                "perimeter may be underestimated for one of the labels when "
+                "two labels are < 2 pixels from touching"
+            )
+
+    # values in XF are guaranteed to be in range [0, 15] so need to multiply
+    # each label by 16 to make sure all labels have a unique set of values
+    # during bincount
+    perimeter_image = perimeter_image + 50 * labels_dilated
+
+    minlength = 50 * (max_label + 1)
+    h = cp.bincount(perimeter_image.ravel(), minlength=minlength)
+    # values for label=1 start at index 50
+    h = h[50:minlength].reshape((max_label, 50))
+
+    perimeters = perimeter_weights @ h.T
+    if robust:
+        # recompute perimeter in isolation for each region that may be too
+        # close to another one
+        shape = image.shape
+        for lab in labels_to_recompute:
+            sl = slices[lab - 1]
+
+            # keep boundary of 1 so object is not at 'edge' of cropped
+            # region (unless it is at a true image edge)
+            ld = labels_dilated[
+                max(sl[0].start - 1, 0) : min(sl[0].stop + 1, shape[0]),
+                max(sl[0].start - 1, 0) : min(sl[1].stop + 1, shape[1]),
+            ]
+            p = regionprops_perimeter(ld == lab, neighborhood=neighborhood)
+            # print(f"label {lab}: old perimeter={perimeters[lab - 1]}, new_perimeter={p}")  # noqa: E501
+            perimeters[lab - 1] = p[0]
+    return perimeters
+
+
+def regionprops_perimeter_crofton(
+    labels, directions=4, max_label=None, robust=False, omit_image_edges=False
+):
+    """Calculate total Crofton perimeter of all objects in binary image.
+
+    Parameters
+    ----------
+    labels : (M, N) ndarray
+        Input image. If image is not binary, all values greater than zero
+        are considered as the object.
+    directions : 2 or 4, optional
+        Number of directions used to approximate the Crofton perimeter. By
+        default, 4 is used: it should be more accurate than 2.
+        Computation time is the same in both cases.
+    max_label : int or None, optional
+        The maximum label in labels can be provided to avoid recomputing it if
+        it was already known.
+    robust : bool, optional
+        If True, extra computation will be done to detect if any labeled
+        regions are <=2 pixel spacing from another. Any regions that meet that
+        criteria will have their perimeter recomputed in isolation to avoid
+        possible error that would otherwise occur in this case. Turning this
+        on will make the run time substantially longer, so it should only be
+        used when labeled regions may have a non-negligible portion of their
+        boundary within a <2 pixel gap from another label.
+    omit_image_edges : bool, optional
+        This can be set to avoid an additional padding step that includes the
+        edges of objects that correspond to the image edge as part of the
+        perimeter. We cannot accurately estimate the perimeter of objects
+        falling partly outside of `image`, so it seems acceptable to just set
+        this to True. The default remains False for consistency with upstream
+        scikit-image.
+
+    Returns
+    -------
+    perimeter : float
+        Total perimeter of all objects in binary image.
+
+    Notes
+    -----
+    This measure is based on Crofton formula [1], which is a measure from
+    integral geometry. It is defined for general curve length evaluation via
+    a double integral along all directions. In a discrete
+    space, 2 or 4 directions give a quite good approximation, 4 being more
+    accurate than 2 for more complex shapes.
+
+    Similar to :func:`~.measure.perimeter`, this function returns an
+    approximation of the perimeter in continuous space.
+
+    The `perimeter` method does not consider the boundary along the image edge
+    as image as part of the perimeter, while the `perimeter_crofton` method
+    does. In any case, an object touching the image edge likely extends outside
+    of the field of view, so an accurate perimeter cannot be measured for such
+    objects.
+
+    See Also
+    --------
+    perimeter
+
+    References
+    ----------
+    .. [1] https://en.wikipedia.org/wiki/Crofton_formula
+    .. [2] S. Rivollier. Analyse d’image geometrique et morphometrique par
+           diagrammes de forme et voisinages adaptatifs generaux. PhD thesis,
+           2010.
+           Ecole Nationale Superieure des Mines de Saint-Etienne.
+           https://tel.archives-ouvertes.fr/tel-00560838
+    """
+    if max_label is None:
+        max_label = int(labels.max())
+
+    # maximum possible value for XF_labeled input to bincount
+    # need to choose integer range large enough that this won't overflow
+    max_val = (max_label + 1) * 16
+    if max_val < 256:
+        image_dtype = cp.uint8
+    elif max_val < 65536:
+        image_dtype = cp.uint16
+    elif max_val < 2**32:
+        image_dtype = cp.uint32
+    else:
+        image_dtype = cp.uint64
+
+    if image_dtype == cp.uint8:
+        # can directly view bool as uint8 without a copy
+        image = (labels > 0).view(cp.uint8)
+    else:
+        image = (labels > 0).astype(image_dtype)
+
+    if not omit_image_edges:
+        image = pad(image, pad_width=1, mode="constant")
+    image_filtered = ndi.convolve(
+        image,
+        cp.array([[0, 0, 0], [0, 1, 4], [0, 2, 8]]),
+        mode="constant",
+        cval=0,
+    )
+
+    # dilate labels by 1 pixel so we can sum with values in XF to give
+    # unique histogram bins for each labeled regions (as long as no labeled
+    # regions are within < 2 pixels from another labeled region)
+    if not omit_image_edges:
+        labels_pad = cp.pad(labels, pad_width=1, mode="constant")
+        labels_dilated = ndi.grey_dilation(labels_pad, 3, mode="constant")
+    else:
+        labels_dilated = ndi.grey_dilation(labels, 3, mode="constant")
+
+    if robust:
+        # check possibly too-close regions for which we may need to manually
+        # recompute the regions perimeter in isolation
+        if omit_image_edges:
+            labels_dilated2 = ndi.grey_dilation(labels, 5, mode="constant")
+            labels2 = labels_dilated2 * image
+        else:
+            labels_dilated2 = ndi.grey_dilation(
+                labels_dilated, 5, mode="constant"
+            )
+            labels2 = labels_dilated2 * image
+            labels2 = labels2[1:-1, 1:-1]
+        diffs = labels != labels2
+
+        labels_to_recompute = []
+        # regions to recompute
+        if cp.any(diffs):
+            labels_to_recompute = cp.asnumpy(cp.unique(labels[diffs]))
+            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
+            warnings.warn(
+                "some labeled regions are <= 2 pixels from another region. The "
+                "perimeter may be underestimated for one of the labels when "
+                "two labels are < 2 pixels from touching"
+            )
+
+    # values in XF are guaranteed to be in range [0, 15] so need to multiply
+    # each label by 16 to make sure all labels have a unique set of values
+    # during bincount
+    image_filtered_labeled = image_filtered + 16 * labels_dilated
+
+    minlength = 16 * (max_label + 1)
+    h = cp.bincount(image_filtered_labeled.ravel(), minlength=minlength)
+    # values for label=1 start at index 16
+    h = h[16:minlength].reshape((max_label, 16))
+
+    # definition of the LUT
+    # fmt: off
+    if directions == 2:
+        coefs = [0, np.pi / 2, 0, 0, 0, np.pi / 2, 0, 0,
+                 np.pi / 2, np.pi, 0, 0, np.pi / 2, np.pi, 0, 0]
+    else:
+        sq2 = math.sqrt(2)
+        coefs = [0, np.pi / 4 * (1 + 1 / sq2),
+                 np.pi / (4 * sq2),
+                 np.pi / (2 * sq2), 0,
+                 np.pi / 4 * (1 + 1 / sq2),
+                 0, np.pi / (4 * sq2), np.pi / 4, np.pi / 2,
+                 np.pi / (4 * sq2), np.pi / (4 * sq2),
+                 np.pi / 4, np.pi / 2, 0, 0]
+
+    coefs = cp.asarray(coefs, dtype=cp.float32)
+    perimeters = coefs @ h.T
+    if robust:
+        # recompute perimeter in isolation for each region that may be too
+        # close to another one
+        shape = labels_dilated.shape
+        for lab in labels_to_recompute:
+            sl = slices[lab - 1]
+            if omit_image_edges:
+                # keep boundary of 1 so object is not at 'edge' of cropped
+                # region (unless it is at a true image edge)
+                ld = labels_dilated[
+                    max(sl[0].start - 1, 0):min(sl[0].stop + 1, shape[0]),
+                    max(sl[0].start - 1, 0):min(sl[1].stop + 1, shape[1])
+                ]
+            else:
+                # keep boundary of 1 so object is not at 'edge' of cropped
+                # region (unless it is at a true image edge)
+                # + 2 is because labels_pad is padded, but labels was not
+                ld = labels_pad[
+                    sl[0].start:sl[0].stop + 2, sl[1].start:sl[1].stop + 2
+                ]
+            p = regionprops_perimeter_crofton(
+                ld == lab,
+                directions=directions,
+                omit_image_edges=omit_image_edges)
+            # print(f"label {lab}: old perimeter={perimeters[lab - 1]}, new_perimeter={p}")  # noqa: E501
+            perimeters[lab - 1] = p[0]
+    return perimeters
