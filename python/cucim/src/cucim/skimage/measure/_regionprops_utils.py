@@ -1,10 +1,14 @@
 import math
+import warnings
 
 import cupy as cp
-import cupyx.scipy.ndimage as ndi
+
+# import cupyx.scipy.ndimage as ndi
 import numpy as np
 
-from cucim.skimage._vendored import pad
+from cucim.skimage._vendored import ndimage as ndi, pad
+
+from ._regionprops_gpu import regionprops_bbox_coords
 
 # Don't allocate STREL_* on GPU as we don't know in advance which device
 # fmt: off
@@ -263,7 +267,7 @@ def perimeter(image, neighborhood=4):
     return total_perimeter
 
 
-def perimeter_crofton(image, directions=4):
+def perimeter_crofton(image, directions=4, omit_image_edges=False):
     """Calculate total Crofton perimeter of all objects in binary image.
 
     Parameters
@@ -275,6 +279,13 @@ def perimeter_crofton(image, directions=4):
         Number of directions used to approximate the Crofton perimeter. By
         default, 4 is used: it should be more accurate than 2.
         Computation time is the same in both cases.
+    omit_image_edges : bool, optional
+        This can be set to avoid an additional padding step that includes the
+        edges of objects that correspond to the image edge as part of the
+        perimeter. We cannot accurately estimate the perimeter of objects
+        falling partly outside of `image`, so it seems acceptable to just set
+        this to True. The default remains False for consistency with upstream
+        scikit-image.
 
     Returns
     -------
@@ -319,8 +330,9 @@ def perimeter_crofton(image, directions=4):
         raise NotImplementedError("`perimeter_crofton` supports 2D images only")
 
     # as image could be a label image, transform it to binary image
-    image = (image > 0).astype(cp.uint8)
-    image = pad(image, pad_width=1, mode="constant")
+    image = (image > 0).view(cp.uint8)
+    if not omit_image_edges:
+        image = pad(image, pad_width=1, mode="constant")
     XF = ndi.convolve(
         image,
         cp.array([[0, 0, 0], [0, 1, 4], [0, 2, 8]]),
@@ -345,6 +357,105 @@ def perimeter_crofton(image, directions=4):
                  np.pi / (4 * sq2), np.pi / (4 * sq2),
                  np.pi / 4, np.pi / 2, 0, 0]
     # fmt: on
-
     total_perimeter = cp.asarray(coefs) @ h
     return total_perimeter
+
+
+def regionprops_perimeter_crofton(
+    labels, max_label=None, directions=4, robust=False
+):
+    if max_label is None:
+        max_label = int(labels.max())
+
+    # maximum possible value for XF_labeled input to bincount
+    # need to choose integer range large enough that this won't overflow
+    max_val = (max_label + 1) * 16
+    if max_val < 256:
+        image_dtype = cp.uint8
+    elif max_val < 65536:
+        image_dtype = cp.uint16
+    elif max_val < 2**32:
+        image_dtype = cp.uint32
+    else:
+        image_dtype = cp.uint64
+
+    if image_dtype == cp.uint8:
+        # can directly view bool as uint8 without a copy
+        image = (labels > 0).view(cp.uint8)
+    else:
+        image = (labels > 0).astype(image_dtype)
+
+    image = pad(image, pad_width=1, mode="constant")
+    XF = ndi.convolve(
+        image,
+        cp.array([[0, 0, 0], [0, 1, 4], [0, 2, 8]]),
+        mode="constant",
+        cval=0,
+    )
+
+    # dilate labels by 1 pixel so we can sum with values in XF to give
+    # unique histogram bins for each labeled regions (as long as no labeled
+    # regions are within < 2 pixels from another labeled region)
+    labels_pad = cp.pad(labels, pad_width=1, mode="constant")
+    labels_dilated = ndi.grey_dilation(labels_pad, 3, mode="constant")
+
+    if robust:
+        # check possibly too-close regions for which we may need to manually
+        # recompute the regions perimeter in isolation
+        labels_dilated2 = ndi.grey_dilation(labels_dilated, 5, mode="constant")
+        labels2 = labels_dilated2 * image
+        labels2 = labels2[1:-1, 1:-1]
+        diffs = labels != labels2
+
+        labels_to_recompute = []
+        # regions to recompute
+        if cp.any(diffs):
+            labels_to_recompute = cp.asnumpy(cp.unique(labels[diffs]))
+            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
+            warnings.warn(
+                "some labeled regions are <= 2 pixels from another region. The "
+                "perimeter may be underestimated for one of the labels when "
+                "two labels are < 2 pixels from touching"
+            )
+
+    # values in XF are guaranteed to be in range [0, 15] so need to multiply
+    # each label by 16 to make sure all labels have a unique set of values
+    # during bincount
+    XF_labeled = XF + 16 * labels_dilated
+
+    minlength = 16 * (max_label + 1)
+    h = cp.bincount(XF_labeled.ravel(), minlength=minlength)
+    # values for label=1 start at index 16
+    h = h[16:minlength].reshape((max_label, 16))
+
+    # definition of the LUT
+    # fmt: off
+    if directions == 2:
+        coefs = [0, np.pi / 2, 0, 0, 0, np.pi / 2, 0, 0,
+                 np.pi / 2, np.pi, 0, 0, np.pi / 2, np.pi, 0, 0]
+    else:
+        sq2 = math.sqrt(2)
+        coefs = [0, np.pi / 4 * (1 + 1 / sq2),
+                 np.pi / (4 * sq2),
+                 np.pi / (2 * sq2), 0,
+                 np.pi / 4 * (1 + 1 / sq2),
+                 0, np.pi / (4 * sq2), np.pi / 4, np.pi / 2,
+                 np.pi / (4 * sq2), np.pi / (4 * sq2),
+                 np.pi / 4, np.pi / 2, 0, 0]
+
+    coefs = cp.asarray(coefs, dtype=cp.float32)
+    perimeters = coefs @ h.T
+    if robust:
+        # recompute perimeter in isolation for each region that may be too
+        # close to another one
+        for lab in labels_to_recompute:
+            sl = slices[lab - 1]
+
+            # + 2 is because labels_pad is padded, but labels was not
+            ld = labels_pad[
+                sl[0].start:sl[0].stop + 2, sl[1].start:sl[1].stop + 2
+            ]
+            p = perimeter_crofton(ld == lab)
+            # print(f"label {lab}: old perimeter={perimeters[lab - 1]}, new_perimeter={p}")  # noqa: E501
+            perimeters[lab - 1] = p
+    return perimeters
