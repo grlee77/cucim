@@ -36,6 +36,8 @@ __all__ = [
     "regionprops_moments_hu",
     "regionprops_moments_normalized",
     "regionprops_num_pixels",
+    "regionprops_perimeter",
+    "regionprops_perimeter_crofton",
 ]
 
 
@@ -290,154 +292,311 @@ def get_bbox_coords_kernel(
     )
 
 
-@cp.memoize(for_each_device=True)
-def get_sum_kernel(count_dtype, sum_dtype, num_channels):
-    count_dtype = cp.dtype(count_dtype)
-    sum_dtype = cp.dtype(sum_dtype)
+def _get_img_sums_code(
+    sum_c_type,
+    pixels_per_thread,
+    array_size,
+    num_channels=1,
+    compute_num_pixels=True,
+    compute_sum=True,
+    compute_sum_sq=False,
+):
+    """
+    Notes
+    -----
+    Local variables created:
 
-    if sum_dtype.kind == "f":
-        c_type = "double" if sum_dtype == cp.float64 else "float"
-    elif sum_dtype.kind in "bu":
-        itemsize = sum_dtype.itemsize
+        - num_pixels : shape (array_size, )
+            The number of pixels encountered per label value
+
+    Output variables written to:
+
+        - counts : shape (max_label,)
+    """
+    pixel_count_dtype = "int8_t" if pixels_per_thread < 256 else "int16_t"
+
+    source_pre = ""
+    if compute_num_pixels:
+        source_pre += f"""
+    {pixel_count_dtype} num_pixels[{array_size}] = {{0}};"""
+    if compute_sum:
+        source_pre += f"""
+    {sum_c_type} img_sums[{array_size * num_channels}] = {{0}};"""
+    if compute_sum_sq:
+        source_pre += f"""
+    {sum_c_type} img_sum_sqs[{array_size * num_channels}] = {{0}};"""
+    if compute_sum or compute_sum_sq:
+        source_pre += f"""
+    {sum_c_type} v = 0;\n"""
+
+    # source_operation requires external variables:
+    #     ii : index into labels array
+    source_operation = ""
+    if compute_num_pixels:
+        source_operation += """
+            num_pixels[offset] += 1;"""
+    nc = f"{num_channels}*" if num_channels > 1 else ""
+    if compute_sum or compute_sum_sq:
+        for c in range(num_channels):
+            source_operation += f"""
+            v = static_cast<{sum_c_type}>(img[{nc}ii + {c}]);"""
+            if compute_sum:
+                source_operation += f"""
+            img_sums[{nc}offset + {c}] += v;"""
+            if compute_sum_sq:
+                source_operation += f"""
+            img_sum_sqs[{nc}offset + {c}] += v * v;\n"""
+
+    # post_operation requires external variables:
+    #     jj : index into num_pixels array
+    #     lab : label value that corresponds to location ii
+    #     counts : output with shape (max_label,)
+    #     sums : output with shape (max_label, nc)
+    #     sumsqs : output with shape (max_label, nc)
+    source_post = ""
+    if compute_num_pixels:
+        source_post += """
+            atomicAdd(&counts[lab - 1], num_pixels[jj]);"""
+    if compute_sum:
+        for c in range(num_channels):
+            source_post += f"""
+            atomicAdd(&sums[{nc}(lab - 1) + {c}], img_sums[{nc}jj + {c}]);"""
+    if compute_sum_sq:
+        for c in range(num_channels):
+            source_post += f"""
+            atomicAdd(&sumsqs[{nc}(lab - 1) + {c}], img_sum_sqs[{nc}jj + {c}]);"""  # noqa: E501
+    return source_pre, source_operation, source_post
+
+
+def _get_intensity_min_max_code(
+    min_max_dtype,
+    array_size,
+    initial_min_val,
+    initial_max_val,
+    compute_min=True,
+    compute_max=True,
+    num_channels=1,
+):
+    min_max_dtype = cp.dtype(min_max_dtype)
+
+    if min_max_dtype.kind == "f":
+        c_type = "double" if min_max_dtype == cp.float64 else "float"
+    elif min_max_dtype.kind in "bu":
+        itemsize = min_max_dtype.itemsize
         c_type = "uint32_t" if itemsize <= 4 else "uint64_t"
-    elif sum_dtype.kind in "i":
-        itemsize = sum_dtype.itemsize
+    elif min_max_dtype.kind in "i":
+        itemsize = min_max_dtype.itemsize
         c_type = "int32_t" if itemsize <= 4 else "int64_t"
     else:
         raise ValueError(
-            "invalid sum_dtype. Must be unsigned, integer or floating point"
+            "invalid min_max_dtype. Must be unsigned, integer or floating point"
         )
 
-    if num_channels == 1:
-        channels_line = "uint32_t num_channels = 1;"
-    else:
-        channels_line = "uint32_t num_channels = sums.shape()[1];"
+    # Note: CuPy provides atomicMin and atomicMax for float and double in
+    #       cupy/_core/include/atomics.cuh
+    #       The integer variants are part of CUDA itself.
 
-    # store only counts for label > 0  (label = 0 is the background)
-    source = f"""
-      if (label != 0) {{
-        atomicAdd(&counts[label - 1], 1);
-        {channels_line}
-        uint32_t sum_offset = (label - 1) * num_channels;
-        uint32_t img_offset = i * num_channels;
-        atomicAdd(&sums[sum_offset],
-                  static_cast<{c_type}>(img[img_offset]));\n"""
-    if num_channels > 1:
-        source += f"""
-        for (int c = 1; c < num_channels; c++) {{
-            atomicAdd(&sums[sum_offset + c],
-                      static_cast<{c_type}>(img[img_offset + c]));
-        }}\n"""
-    source += """
-      }\n"""
-    inputs = "X label, raw Y img"
-    outputs = f"raw {count_dtype.name} counts, raw {sum_dtype.name} sums"
-    name = f"cucim_sum_and_count_{sum_dtype.name}_{count_dtype.name}"
-    if num_channels > 1:
-        name += "_multichannel"
-    return cp.ElementwiseKernel(
-        inputs, outputs, source, preamble=_includes, name=name
-    )
+    source_pre = ""
+    if compute_min:
+        source_pre += f"""
+    {c_type} min_vals[{array_size * num_channels}];
+    // initialize minimum coordinate to array size
+    for (size_t ii = 0; ii < {array_size * num_channels}; ii++) {{
+      min_vals[ii] = {initial_min_val};
+    }}"""
+    if compute_max:
+        source_pre += f"""
+    {c_type} max_vals[{array_size * num_channels}];
+    // initialize minimum coordinate to array size
+    for (size_t ii = 0; ii < {array_size * num_channels}; ii++) {{
+      max_vals[ii] = {initial_max_val};
+    }}"""
+    source_pre += f"""
+    {c_type} v = 0;\n"""
+
+    # source_operation requires external variables:
+    #     ii : index into labels array
+    source_operation = ""
+    nc = f"{num_channels}*" if num_channels > 1 else ""
+    if compute_min or compute_max:
+        for c in range(num_channels):
+            source_operation += f"""
+            v = static_cast<{c_type}>(img[{nc}ii + {c}]);"""
+            if compute_min:
+                source_operation += f"""
+            min_vals[{nc}offset + {c}] = min(v, min_vals[{nc}offset + {c}]);"""
+            if compute_max:
+                source_operation += f"""
+            max_vals[{nc}offset + {c}] = max(v, max_vals[{nc}offset + {c}]);\n"""  # noqa: E501
+
+    # post_operation requires external variables:
+    #     jj : index into num_pixels array
+    #     lab : label value that corresponds to location ii
+    #     counts : output with shape (max_label,)
+    #     sums : output with shape (max_label, nc)
+    #     sumsqs : output with shape (max_label, nc)
+    source_post = ""
+    if compute_min:
+        for c in range(num_channels):
+            source_post += f"""
+            atomicMin(&minimums[{nc}(lab - 1) + {c}], min_vals[{nc}jj + {c}]);"""  # noqa: E501
+    if compute_max:
+        for c in range(num_channels):
+            source_post += f"""
+            atomicMax(&maximums[{nc}(lab - 1) + {c}], max_vals[{nc}jj + {c}]);"""  # noqa: E501
+    return source_pre, source_operation, source_post
 
 
 @cp.memoize(for_each_device=True)
-def get_mean_kernel(count_dtype, sum_dtype, num_channels=1):
-    count_dtype = cp.dtype(count_dtype)
-    sum_dtype = cp.dtype(sum_dtype)
+def get_intensity_measure_kernel(
+    count_dtype=None,
+    sum_dtype=None,
+    min_max_dtype=None,
+    initial_max_val=None,
+    initial_min_val=None,
+    num_channels=1,
+    int32_coords=True,
+    compute_num_pixels=True,
+    compute_sum=True,
+    compute_sum_sq=False,
+    compute_min=False,
+    compute_max=False,
+    pixels_per_thread=8,
+):
+    if compute_num_pixels:
+        if count_dtype is None:
+            raise ValueError("must specify count_dtype to compute num_pixels")
+        count_dtype = cp.dtype(count_dtype)
 
-    if sum_dtype.kind == "f":
-        c_type = "double" if sum_dtype == cp.float64 else "float"
-    elif sum_dtype.kind in "bu":
-        itemsize = sum_dtype.itemsize
-        c_type = "uint32_t" if itemsize <= 4 else "uint64_t"
-    elif sum_dtype.kind in "i":
-        itemsize = sum_dtype.itemsize
-        c_type = "int32_t" if itemsize <= 4 else "int64_t"
+    if compute_sum or compute_sum_sq:
+        if sum_dtype is None:
+            raise ValueError(
+                "must specify sum_dtype to compute sums or squared sums"
+            )
+        sum_dtype = cp.dtype(sum_dtype)
+
+        if sum_dtype.kind == "f":
+            c_type = "double" if sum_dtype == cp.float64 else "float"
+        elif sum_dtype.kind in "bu":
+            itemsize = sum_dtype.itemsize
+            c_type = "uint32_t" if itemsize <= 4 else "uint64_t"
+        elif sum_dtype.kind in "i":
+            itemsize = sum_dtype.itemsize
+            c_type = "int32_t" if itemsize <= 4 else "int64_t"
+        else:
+            raise ValueError(
+                "invalid sum_dtype. Must be unsigned, integer or floating point"
+            )
     else:
-        raise ValueError(
-            "invalid sum_dtype. Must be unsigned, integer or floating point"
+        c_type = None
+
+    if pixels_per_thread < 10:
+        array_size = pixels_per_thread
+    else:
+        # highly unlikely for array to repeatedly swap labels at every pixel,
+        # so use a smaller size
+        array_size = pixels_per_thread // 2
+
+    any_sums = compute_num_pixels or compute_sum or compute_sum_sq
+
+    if any_sums:
+        sums_pre, sums_op, sums_post = _get_img_sums_code(
+            c_type,
+            pixels_per_thread=pixels_per_thread,
+            array_size=array_size,
+            num_channels=num_channels,
+            compute_num_pixels=compute_num_pixels,
+            compute_sum=compute_sum,
+            compute_sum_sq=compute_sum_sq,
         )
 
-    if num_channels == 1:
-        channels_line = "uint32_t num_channels = 1;"
-    else:
-        channels_line = "uint32_t num_channels = sums.shape()[1];"
+    any_min_max = compute_min or compute_max
+    if any_min_max:
+        if min_max_dtype is None:
+            raise ValueError("min_max_dtype must be specified")
+        min_max_dtype = cp.dtype(min_max_dtype)
+        min_max_pre, min_max_op, min_max_post = _get_intensity_min_max_code(
+            min_max_dtype,
+            array_size=array_size,
+            num_channels=num_channels,
+            initial_max_val=initial_max_val,
+            initial_min_val=initial_min_val,
+            compute_min=compute_min,
+            compute_max=compute_max,
+        )
+
+    if not (any_min_max or any_sums):
+        raise ValueError("no output values requested")
 
     # store only counts for label > 0  (label = 0 is the background)
     source = f"""
-      if (label != 0) {{
-        atomicAdd(&counts[label - 1], 1);
-        {channels_line}
-        uint32_t sum_offset = (label - 1) * num_channels;
-        uint32_t img_offset = i * num_channels;
-        atomicAdd(&sums[sum_offset],
-                  static_cast<{c_type}>(img[img_offset]));\n"""
-    if num_channels > 1:
-        source += f"""
-        for (int c = 1; c < num_channels; c++) {{
-            atomicAdd(&sums[sum_offset + c],
-                      static_cast<{c_type}>(img[img_offset + c]));
-        }}\n"""
+      uint64_t start_index = {pixels_per_thread}*i;
+    """
+
+    if any_sums:
+        source += sums_pre
+    if any_min_max:
+        source += min_max_pre
+
+    inner_op = ""
+    if any_sums:
+        inner_op += sums_op
+    if any_min_max:
+        inner_op += min_max_op
+
+    source += f"""
+      X encountered_labels[{array_size}] = {{0}};
+      X current_label;
+      X prev_label = labels[start_index];
+      int offset = 0;
+      encountered_labels[0] = prev_label;
+      uint64_t ii_max = min(start_index + {pixels_per_thread}, labels_size);
+      for (uint64_t ii = start_index; ii < ii_max; ii++) {{
+        current_label = labels[ii];
+        if (current_label == 0) {{ continue; }}
+        if (current_label != prev_label) {{
+            offset += 1;
+            prev_label = current_label;
+            encountered_labels[offset] = current_label;
+        }}
+        {inner_op}
+      }}"""
     source += """
-      }\n"""
-    inputs = "X label, raw Y img"
-    outputs = f"raw {count_dtype.name} counts, raw {sum_dtype.name} sums"
-    name = f"cucim_sum_and_count_{sum_dtype.name}_{count_dtype.name}"
-    if num_channels > 1:
-        name += "_multichannel"
-    return cp.ElementwiseKernel(
-        inputs, outputs, source, preamble=_includes, name=name
-    )
+      for (size_t jj = 0; jj <= offset; jj++) {
+        X lab = encountered_labels[jj];
+        if (lab != 0) {"""
 
-
-@cp.memoize(for_each_device=True)
-def get_sum_and_sumsq_kernel(count_dtype, sum_dtype, num_channels=1):
-    count_dtype = cp.dtype(count_dtype)
-    sum_dtype = cp.dtype(sum_dtype)
-
-    if sum_dtype.kind == "f":
-        c_type = "double" if sum_dtype == cp.float64 else "float"
-    elif sum_dtype.kind in "bu":
-        itemsize = sum_dtype.itemsize
-        c_type = "uint32_t" if itemsize <= 4 else "uint64_t"
-    elif sum_dtype.kind in "i":
-        itemsize = sum_dtype.itemsize
-        c_type = "int32_t" if itemsize <= 4 else "int64_t"
-    else:
-        raise ValueError(
-            "invalid sum_dtype. Must be unsigned, integer or floating point"
-        )
-
-    if num_channels == 1:
-        channels_line = "uint32_t num_channels = 1;"
-    else:
-        channels_line = "uint32_t num_channels = sums.shape()[1];"
-
-    # store only counts for label > 0  (label = 0 is the background)
-    source = f"""
-      if (label != 0) {{
-        atomicAdd(&counts[label - 1], 1);
-        {channels_line}
-        uint32_t sum_offset = (label - 1) * num_channels;
-        uint32_t img_offset = i * num_channels;
-        auto val = static_cast<{c_type}>(img[img_offset]);
-        atomicAdd(&sums[sum_offset], val);
-        atomicAdd(&sumsqs[sum_offset], val*val);\n"""
-    if num_channels > 1:
-        source += f"""
-        for (int c = 1; c < num_channels; c++) {{
-            val = static_cast<{c_type}>(img[img_offset + c]);
-            atomicAdd(&sums[sum_offset + c], val);
-            atomicAdd(&sumsqs[sum_offset + c], val*val);
-        }}\n"""
+    if any_sums:
+        source += sums_post
+    if any_min_max:
+        source += min_max_post
     source += """
+        }
       }\n"""
-    name = f"cucim_sum_and_count_{sum_dtype.name}_{count_dtype.name}"
-    if num_channels > 1:
-        name += "_multichannel"
-    inputs = "X label, raw Y img"
-    outputs = f"raw {count_dtype.name} counts, raw {sum_dtype.name} sums, "
-    outputs += f"raw {sum_dtype.name} sumsqs"
+
+    # print(source)
+    inputs = "raw X labels, raw uint64 labels_size, raw Y img"
+    outputs = []
+    name = "cucim_"
+    if compute_num_pixels:
+        outputs.append(f"raw {count_dtype.name} counts")
+        name += f"_numpix_dtype{count_dtype.char}"
+    if compute_sum:
+        outputs.append(f"raw {sum_dtype.name} sums")
+        name += f"_sum_dtype{sum_dtype.char}"
+    if compute_sum_sq:
+        outputs.append(f"raw {sum_dtype.name} sumsqs")
+        name += "_sumsq"
+    if compute_min:
+        outputs.append(f"raw {min_max_dtype.name} minimums")
+        name += "_mins"
+    if compute_max:
+        outputs.append(f"raw {min_max_dtype.name} maximums")
+        name += "_maxs"
+    if compute_min or compute_max:
+        name += f"{min_max_dtype.char}"
+    outputs = ", ".join(outputs)
+    name += f"_batch{pixels_per_thread}"
     return cp.ElementwiseKernel(
         inputs, outputs, source, preamble=_includes, name=name
     )
@@ -552,6 +711,7 @@ def regionprops_intensity_mean(
     max_label=None,
     sum_dtype=None,
     mean_dtype=cp.float32,
+    pixels_per_thread=16,
 ):
     if max_label is None:
         max_label = int(label_image.max())
@@ -572,7 +732,15 @@ def regionprops_intensity_mean(
     )
     sums = cp.zeros(sum_shape, dtype=sum_dtype)
 
-    kernel = get_sum_kernel(count_dtype, sum_dtype, num_channels)
+    kernel = get_intensity_measure_kernel(
+        count_dtype=count_dtype,
+        sum_dtype=sum_dtype,
+        num_channels=num_channels,
+        compute_num_pixels=True,
+        compute_sum=True,
+        compute_sum_sq=False,
+        pixels_per_thread=pixels_per_thread,
+    )
 
     # make a copy if the inputs are not already C-contiguous
     if not label_image.flags.c_contiguous:
@@ -580,7 +748,14 @@ def regionprops_intensity_mean(
     if not intensity_image.flags.c_contiguous:
         intensity_image = cp.ascontiguousarray(intensity_image)
 
-    kernel(label_image, intensity_image, counts, sums)
+    kernel(
+        label_image,
+        label_image.size,
+        intensity_image,
+        counts,
+        sums,
+        size=math.ceil(label_image.size / pixels_per_thread),
+    )
 
     if num_channels > 1:
         means = sums / counts[:, cp.newaxis]
@@ -641,6 +816,7 @@ def regionprops_intensity_std(
     max_label=None,
     sum_dtype=None,
     std_dtype=cp.float64,
+    pixels_per_thread=4,
 ):
     if max_label is None:
         max_label = int(label_image.max())
@@ -672,10 +848,24 @@ def regionprops_intensity_std(
 
     approach = "naive"
     if approach == "naive":
-        kernel = get_sum_and_sumsq_kernel(
-            count_dtype, sum_dtype, num_channels=num_channels
+        kernel = get_intensity_measure_kernel(
+            count_dtype=count_dtype,
+            sum_dtype=sum_dtype,
+            num_channels=num_channels,
+            compute_num_pixels=True,
+            compute_sum=True,
+            compute_sum_sq=True,
+            pixels_per_thread=pixels_per_thread,
         )
-        kernel(label_image, intensity_image, counts, sums, sumsqs)
+        kernel(
+            label_image,
+            label_image.size,
+            intensity_image,
+            counts,
+            sums,
+            sumsqs,
+            size=math.ceil(label_image.size / pixels_per_thread),
+        )
 
         if cp.dtype(std_dtype).kind != "f":
             raise ValueError("mean_dtype must be a floating point type")
@@ -699,66 +889,13 @@ def regionprops_intensity_std(
     return counts, means, stds
 
 
-@cp.memoize(for_each_device=True)
-def get_min_or_max_kernel(min_dtype, do_min=True, num_channels=1):
-    min_dtype = cp.dtype(min_dtype)
-
-    if min_dtype.kind == "f":
-        c_type = "double" if min_dtype == cp.float64 else "float"
-    elif min_dtype.kind in "bu":
-        itemsize = min_dtype.itemsize
-        c_type = "uint32_t" if itemsize <= 4 else "uint64_t"
-    elif min_dtype.kind in "i":
-        itemsize = min_dtype.itemsize
-        c_type = "int32_t" if itemsize <= 4 else "int64_t"
-    else:
-        raise ValueError(
-            "invalid min_dtype. Must be unsigned, integer or floating point"
-        )
-
-    # Note: CuPy provides atomicMin and atomicMax for float and double in
-    #       cupy/_core/include/atomics.cuh
-    #       The integer variants are part of CUDA itself.
-    if do_min:
-        func_name = "atomicMin"
-    else:
-        func_name = "atomicMax"
-
-    if num_channels == 1:
-        channels_line = "uint32_t num_channels = 1;"
-    else:
-        channels_line = "uint32_t num_channels = out.shape()[1];"
-
-    # store only counts for label > 0  (label = 0 is the background)
-    source = f"""
-      if (label != 0) {{
-        {channels_line}
-        uint32_t out_offset = (label - 1) * num_channels;
-        uint32_t img_offset = i * num_channels;
-        {func_name}(&out[out_offset],
-                    static_cast<{c_type}>(img[img_offset]));\n"""
-    if num_channels > 1:
-        source += f"""
-        for (int c = 1; c < num_channels; c++) {{
-            {func_name}(&out[out_offset + c],
-                        static_cast<{c_type}>(img[img_offset + c]));
-        }}\n"""
-    source += """
-      }\n"""
-    op_name = "min" if do_min else "max"
-
-    inputs = "X label, raw Y img"
-    outputs = f"raw {min_dtype.name} out"
-    name = f"cucim_{op_name}_{min_dtype.name}"
-    if num_channels > 1:
-        name += "_multichannel"
-    return cp.ElementwiseKernel(
-        inputs, outputs, source, preamble=_includes, name=name
-    )
-
-
 def _regionprops_min_or_max_intensity(
-    label_image, intensity_image, do_min=True, max_label=None
+    label_image,
+    intensity_image,
+    max_label=None,
+    compute_min=True,
+    compute_max=False,
+    pixels_per_thread=8,
 ):
     if max_label is None:
         max_label = int(label_image.max())
@@ -769,32 +906,49 @@ def _regionprops_min_or_max_intensity(
     # use a data type supported by atomicMin and atomicMax
     if intensity_image.dtype.kind in "bu":
         if intensity_image.dtype.itemsize > 4:
-            op_dtype = cp.uint64
+            min_max_dtype = cp.uint64
         else:
-            op_dtype = cp.uint32
-        dtype_info = cp.iinfo(op_dtype)
+            min_max_dtype = cp.uint32
+        dtype_info = cp.iinfo(min_max_dtype)
     elif intensity_image.dtype.kind == "i":
         if intensity_image.dtype.itemsize > 4:
-            op_dtype = cp.int64
+            min_max_dtype = cp.int64
         else:
-            op_dtype = cp.int32
-        dtype_info = cp.iinfo(op_dtype)
+            min_max_dtype = cp.int32
+        dtype_info = cp.iinfo(min_max_dtype)
     elif intensity_image.dtype.kind == "f":
         if intensity_image.dtype.itemsize > 4:
-            op_dtype = cp.float64
+            min_max_dtype = cp.float64
         else:
-            op_dtype = cp.float32
-        dtype_info = cp.finfo(op_dtype)
-
-    initial_val = dtype_info.max if do_min else dtype_info.min
+            min_max_dtype = cp.float32
+        dtype_info = cp.finfo(min_max_dtype)
 
     out_shape = (
         (num_counts,) if num_channels == 1 else (num_counts, num_channels)
     )
-    out = cp.full(out_shape, initial_val, dtype=op_dtype)
 
-    kernel = get_min_or_max_kernel(
-        op_dtype, do_min=do_min, num_channels=num_channels
+    if compute_min:
+        initial_min_val = dtype_info.max
+        minimums = cp.full(out_shape, initial_min_val, dtype=min_max_dtype)
+    else:
+        initial_min_val = 0
+    if compute_max:
+        initial_max_val = dtype_info.min
+        maximums = cp.full(out_shape, initial_max_val, dtype=min_max_dtype)
+    else:
+        initial_max_val = 0
+
+    kernel = get_intensity_measure_kernel(
+        min_max_dtype=min_max_dtype,
+        num_channels=num_channels,
+        compute_num_pixels=False,
+        compute_sum=False,
+        compute_sum_sq=False,
+        initial_min_val=initial_min_val,
+        initial_max_val=initial_max_val,
+        compute_min=compute_min,
+        compute_max=compute_max,
+        pixels_per_thread=pixels_per_thread,
     )
 
     # make a copy if the inputs are not already C-contiguous
@@ -803,19 +957,44 @@ def _regionprops_min_or_max_intensity(
     if not intensity_image.flags.c_contiguous:
         intensity_image = cp.ascontiguousarray(intensity_image)
 
-    kernel(label_image, intensity_image, out)
-    return out
+    lab_size = label_image.size
+    sz = math.ceil(label_image.size / pixels_per_thread)
+    if compute_min and compute_max:
+        kernel(
+            label_image, lab_size, intensity_image, minimums, maximums, size=sz
+        )  # noqa: E501
+        return minimums, maximums
+    elif compute_min:
+        kernel(label_image, lab_size, intensity_image, minimums, size=sz)
+        return minimums
+    elif compute_max:
+        kernel(label_image, lab_size, intensity_image, maximums, size=sz)
+        return maximums
 
 
-def regionprops_intensity_min(label_image, intensity_image, max_label=None):
+def regionprops_intensity_min(
+    label_image, intensity_image, max_label=None, pixels_per_thread=8
+):
     return _regionprops_min_or_max_intensity(
-        label_image, intensity_image, True, max_label
+        label_image,
+        intensity_image,
+        max_label=max_label,
+        compute_min=True,
+        compute_max=False,
+        pixels_per_thread=pixels_per_thread,
     )
 
 
-def regionprops_intensity_max(label_image, intensity_image, max_label=None):
+def regionprops_intensity_max(
+    label_image, intensity_image, max_label=None, pixels_per_thread=8
+):
     return _regionprops_min_or_max_intensity(
-        label_image, intensity_image, False, max_label
+        label_image,
+        intensity_image,
+        max_label=max_label,
+        compute_min=False,
+        compute_max=True,
+        pixels_per_thread=pixels_per_thread,
     )
 
 
