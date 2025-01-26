@@ -97,15 +97,12 @@ def get_intensity_image(shape, dtype=cp.float32, seed=5, num_channels=None):
 
 @pytest.mark.parametrize("precompute_max", [False, True])
 @pytest.mark.parametrize("ndim", [2, 3])
-@pytest.mark.parametrize("count_dtype", [cp.uint32, cp.int32, cp.uint64])
-def test_num_pixels(precompute_max, ndim, count_dtype):
+def test_num_pixels(precompute_max, ndim):
     shape = (256, 512) if ndim == 2 else (15, 63, 37)
     labels = get_labels_nd(shape)
 
     max_label = int(cp.max(labels)) if precompute_max else None
-    num_pixels = regionprops_num_pixels(
-        labels, max_label=max_label, count_dtype=count_dtype
-    )
+    num_pixels = regionprops_num_pixels(labels, max_label=max_label)
     expected = measure.regionprops_table(labels, properties=["num_pixels"])
     assert_allclose(num_pixels, expected["num_pixels"])
 
@@ -258,9 +255,8 @@ def test_bbox_coords_and_area(precompute_max, ndim, dtype, return_slices):
         labels,
         max_label=max_label,
         return_slices=return_slices,
-        coord_dtype=dtype,
     )
-    assert bbox.dtype == dtype
+    assert bbox.dtype == cp.uint32
     if not return_slices:
         slices is None
     else:
