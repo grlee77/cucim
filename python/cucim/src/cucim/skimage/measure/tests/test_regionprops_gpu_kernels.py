@@ -20,6 +20,7 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_centroid,
     regionprops_centroid_local,
     regionprops_centroid_weighted,
+    regionprops_euler,
     regionprops_inertia_tensor,
     regionprops_inertia_tensor_eigvals,
     regionprops_intensity_max,
@@ -856,3 +857,56 @@ def test_perimeter_crofton(shape, robust, volume_fraction, blob_size_fraction):
     atol = 1e-5
     allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
     allclose(values, expected["perimeter_crofton"])
+
+
+@pytest.mark.parametrize(
+    "shape, connectivity",
+    [
+        ((256, 512), None),
+        ((256, 512), 1),
+        ((256, 512), 2),
+        ((96, 64, 48), None),
+        ((96, 64, 48), 1),
+        ((96, 64, 48), 3),
+    ],
+)
+@pytest.mark.parametrize("volume_fraction", [0.25])
+@pytest.mark.parametrize("blob_size_fraction", [0.04])
+@pytest.mark.parametrize("insert_holes", [False, True])
+@pytest.mark.parametrize("robust", [False, True])
+def test_euler(
+    shape,
+    connectivity,
+    robust,
+    volume_fraction,
+    blob_size_fraction,
+    insert_holes,
+):
+    labels = get_labels_nd(
+        shape,
+        blob_size_fraction=blob_size_fraction,
+        volume_fraction=volume_fraction,
+        insert_holes=insert_holes,
+    )
+
+    max_label = int(cp.max(labels))
+    if not robust:
+        # remove any regions that are to close for non-robust algorithm
+        labels_close = _find_close_labels(labels, labels > 0, max_label)
+        for value in labels_close:
+            labels[labels == value] = 0
+
+        # relabel to ensure sequential
+        labels = measure.label(labels > 0)
+        max_label = int(cp.max(labels))
+
+    values = regionprops_euler(
+        labels, connectivity, max_label=max_label, robust=robust
+    )
+    if connectivity is None or connectivity == labels.ndim:
+        # regionprops_table has hard-coded connectivity, can't use it to verify
+        # other values
+        expected = measure.regionprops_table(
+            labels, properties=["euler_number"]
+        )
+        assert_array_equal(values, expected["euler_number"])
