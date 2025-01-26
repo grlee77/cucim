@@ -1,11 +1,11 @@
 import math
-import warnings
 
 import cupy as cp
 import numpy as np
 from packaging.version import parse
 
 from cucim.skimage._vendored import ndimage as ndi, pad
+from cucim.skimage.util import map_array
 
 CUPY_GTE_13_3_0 = parse(cp.__version__) >= parse("13.3.0")
 
@@ -2663,6 +2663,27 @@ def regionprops_centroid_weighted(
     return centroid
 
 
+def _find_close_labels(labels, binary_image, max_label, labels_pad=None):
+    # check possibly too-close regions for which we may need to
+    # manually recompute the regions perimeter in isolation
+    labels_orig = labels
+    if labels_pad is not None:
+        labels = labels_pad
+
+    labels_dilated2 = ndi.grey_dilation(labels, 5, mode="constant")
+    labels2 = labels_dilated2 * binary_image
+    rev_labels = _reverse_label_values(labels, max_label=max_label)
+    rev_labels = ndi.grey_dilation(rev_labels, 5, mode="constant")
+    rev_labels = rev_labels * binary_image
+    labels3 = _reverse_label_values(rev_labels, max_label=max_label)
+    if labels_pad is not None:
+        labels2 = labels2[1:-1, 1:-1]
+        labels3 = labels3[1:-1, 1:-1]
+    diffs = cp.logical_or(labels_orig != labels2, labels_orig != labels3)
+    labels_to_recompute = cp.asnumpy(cp.unique(labels_orig[diffs]))
+    return labels_to_recompute
+
+
 def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
     """Calculate total perimeter of all objects in binary image.
 
@@ -2698,6 +2719,9 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
     does. In any case, an object touching the image edge likely extends outside
     of the field of view, so an accurate perimeter cannot be measured for such
     objects.
+
+    TODO(grelee): should be able to make this an order of magnitude faster with
+    a customized filter/kernel instead of convolve + bincount, etc.
 
     References
     ----------
@@ -2740,17 +2764,17 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
 
     if image_dtype == cp.uint8:
         # can directly view bool as uint8 without a copy
-        image = (labels > 0).view(cp.uint8)
+        binary_image = (labels > 0).view(cp.uint8)
     else:
-        image = (labels > 0).astype(image_dtype)
+        binary_image = (labels > 0).astype(image_dtype)
 
     if neighborhood == 4:
         footprint = cp.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
     else:
         footprint = 3
 
-    eroded_image = ndi.binary_erosion(image, footprint, border_value=0)
-    border_image = image - eroded_image
+    eroded_image = ndi.binary_erosion(binary_image, footprint, border_value=0)
+    border_image = binary_image - eroded_image
 
     perimeter_weights = np.zeros(50, dtype=cp.float64)
     perimeter_weights[[5, 7, 15, 17, 25, 27]] = 1
@@ -2771,22 +2795,16 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
     labels_dilated = ndi.grey_dilation(labels, 3, mode="constant")
 
     if robust:
-        # check possibly too-close regions for which we may need to manually
-        # recompute the regions perimeter in isolation
-        labels_dilated2 = ndi.grey_dilation(labels_dilated, 5, mode="constant")
-        labels2 = labels_dilated2 * image
-        diffs = labels != labels2
-
-        labels_to_recompute = []
+        labels_to_recompute = _find_close_labels(
+            labels, binary_image, max_label
+        )
         # regions to recompute
-        if cp.any(diffs):
-            labels_to_recompute = cp.asnumpy(cp.unique(labels[diffs]))
-            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
-            warnings.warn(
-                "some labeled regions are <= 2 pixels from another region. The "
-                "perimeter may be underestimated for one of the labels when "
-                "two labels are < 2 pixels from touching"
+        if labels_to_recompute.size > 0:
+            print(
+                f"recomputing {labels_to_recompute.size} of {max_label} labels"
+                " due to close proximity."
             )
+            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     # values in XF are guaranteed to be in range [0, 15] so need to multiply
     # each label by 16 to make sure all labels have a unique set of values
@@ -2802,20 +2820,32 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
     if robust:
         # recompute perimeter in isolation for each region that may be too
         # close to another one
-        shape = image.shape
+        shape = binary_image.shape
         for lab in labels_to_recompute:
             sl = slices[lab - 1]
 
             # keep boundary of 1 so object is not at 'edge' of cropped
             # region (unless it is at a true image edge)
-            ld = labels_dilated[
+            ld = labels[
                 max(sl[0].start - 1, 0) : min(sl[0].stop + 1, shape[0]),
-                max(sl[0].start - 1, 0) : min(sl[1].stop + 1, shape[1]),
+                max(sl[1].start - 1, 0) : min(sl[1].stop + 1, shape[1]),
             ]
+
+            # print(f"{lab=}, {sl=}")
+            # import matplotlib.pyplot as plt
+            # plt.figure(); plt.imshow(ld.get()); plt.show()
+
             p = regionprops_perimeter(ld == lab, neighborhood=neighborhood)
             # print(f"label {lab}: old perimeter={perimeters[lab - 1]}, new_perimeter={p}")  # noqa: E501
             perimeters[lab - 1] = p[0]
     return perimeters
+
+
+def _reverse_label_values(label_image, max_label):
+    dtype = label_image.dtype
+    labs = cp.asarray(tuple(range(max_label + 1)), dtype=dtype)
+    rev_labs = cp.asarray((0,) + tuple(range(max_label, 0, -1)), dtype=dtype)
+    return map_array(label_image, labs, rev_labs)
 
 
 def regionprops_perimeter_crofton(
@@ -2873,6 +2903,9 @@ def regionprops_perimeter_crofton(
     of the field of view, so an accurate perimeter cannot be measured for such
     objects.
 
+    TODO(grelee): should be able to make this an order of magnitude faster with
+    a customized filter/kernel instead of convolve + bincount, etc.
+
     See Also
     --------
     perimeter
@@ -2903,14 +2936,14 @@ def regionprops_perimeter_crofton(
 
     if image_dtype == cp.uint8:
         # can directly view bool as uint8 without a copy
-        image = (labels > 0).view(cp.uint8)
+        binary_image = (labels > 0).view(cp.uint8)
     else:
-        image = (labels > 0).astype(image_dtype)
+        binary_image = (labels > 0).astype(image_dtype)
 
     if not omit_image_edges:
-        image = pad(image, pad_width=1, mode="constant")
+        binary_image = pad(binary_image, pad_width=1, mode="constant")
     image_filtered = ndi.convolve(
-        image,
+        binary_image,
         cp.array([[0, 0, 0], [0, 1, 4], [0, 2, 8]]),
         mode="constant",
         cval=0,
@@ -2929,26 +2962,20 @@ def regionprops_perimeter_crofton(
         # check possibly too-close regions for which we may need to manually
         # recompute the regions perimeter in isolation
         if omit_image_edges:
-            labels_dilated2 = ndi.grey_dilation(labels, 5, mode="constant")
-            labels2 = labels_dilated2 * image
+            labels_to_recompute = _find_close_labels(
+                labels, binary_image, max_label
+            )
         else:
-            labels_dilated2 = ndi.grey_dilation(
-                labels_dilated, 5, mode="constant"
+            labels_to_recompute = _find_close_labels(
+                labels, binary_image, max_label, labels_pad=labels_pad
             )
-            labels2 = labels_dilated2 * image
-            labels2 = labels2[1:-1, 1:-1]
-        diffs = labels != labels2
 
-        labels_to_recompute = []
-        # regions to recompute
-        if cp.any(diffs):
-            labels_to_recompute = cp.asnumpy(cp.unique(labels[diffs]))
-            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
-            warnings.warn(
-                "some labeled regions are <= 2 pixels from another region. The "
-                "perimeter may be underestimated for one of the labels when "
-                "two labels are < 2 pixels from touching"
+        if labels_to_recompute.size > 0:
+            print(
+                f"recomputing {labels_to_recompute.size} of {max_label} labels"
+                " due to close proximity."
             )
+            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     # values in XF are guaranteed to be in range [0, 15] so need to multiply
     # each label by 16 to make sure all labels have a unique set of values
@@ -2988,14 +3015,15 @@ def regionprops_perimeter_crofton(
                 # region (unless it is at a true image edge)
                 ld = labels_dilated[
                     max(sl[0].start - 1, 0):min(sl[0].stop + 1, shape[0]),
-                    max(sl[0].start - 1, 0):min(sl[1].stop + 1, shape[1])
+                    max(sl[1].start - 1, 0):min(sl[1].stop + 1, shape[1])
                 ]
             else:
                 # keep boundary of 1 so object is not at 'edge' of cropped
                 # region (unless it is at a true image edge)
                 # + 2 is because labels_pad is padded, but labels was not
                 ld = labels_pad[
-                    sl[0].start:sl[0].stop + 2, sl[1].start:sl[1].stop + 2
+                    max(sl[0].start, 0):min(sl[0].stop + 2, shape[0]),
+                    max(sl[1].start, 0):min(sl[1].stop + 2, shape[1])
                 ]
             p = regionprops_perimeter_crofton(
                 ld == lab,

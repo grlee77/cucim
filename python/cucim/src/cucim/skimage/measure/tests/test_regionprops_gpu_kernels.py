@@ -12,6 +12,7 @@ from skimage import measure as measure_cpu
 
 from cucim.skimage import data, measure
 from cucim.skimage.measure._regionprops_gpu import (
+    _find_close_labels,
     area_bbox_from_slices,
     regionprops_area,
     regionprops_area_bbox,
@@ -30,6 +31,8 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_moments_hu,
     regionprops_moments_normalized,
     regionprops_num_pixels,
+    regionprops_perimeter,
+    regionprops_perimeter_crofton,
 )
 
 
@@ -788,3 +791,68 @@ def test_centroid_weighted(
         for c in range(num_channels):
             for d in range(ndim):
                 allclose(centroids[:, c, d], expected[prop + f"-{d}-{c}"])
+
+
+@pytest.mark.parametrize("shape", [(256, 512), (4096, 1024)])
+@pytest.mark.parametrize("volume_fraction", [0.1, 0.25, 0.5])
+@pytest.mark.parametrize("blob_size_fraction", [0.025, 0.05, 0.1])
+@pytest.mark.parametrize("robust", [False, True])
+def test_perimeter(shape, robust, volume_fraction, blob_size_fraction):
+    labels = get_labels_nd(
+        shape,
+        blob_size_fraction=blob_size_fraction,
+        volume_fraction=volume_fraction,
+    )
+
+    max_label = int(cp.max(labels))
+    if not robust:
+        # remove any regions that are to close for non-robust algorithm
+        labels_close = _find_close_labels(labels, labels > 0, max_label)
+        for value in labels_close:
+            labels[labels == value] = 0
+
+        # relabel to ensure sequential
+        labels = measure.label(labels > 0)
+        max_label = int(cp.max(labels))
+
+    max_label = int(cp.max(labels))
+    values = regionprops_perimeter(labels, max_label=max_label, robust=robust)
+    expected = measure.regionprops_table(labels, properties=["perimeter"])
+    rtol = 1e-5
+    atol = 1e-5
+    allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
+    allclose(values, expected["perimeter"])
+
+
+@pytest.mark.parametrize("shape", [(256, 512), (4096, 1024)])
+@pytest.mark.parametrize("volume_fraction", [0.1, 0.25, 0.5])
+@pytest.mark.parametrize("blob_size_fraction", [0.025, 0.05, 0.1])
+@pytest.mark.parametrize("robust", [False, True])
+def test_perimeter_crofton(shape, robust, volume_fraction, blob_size_fraction):
+    labels = get_labels_nd(
+        shape,
+        blob_size_fraction=blob_size_fraction,
+        volume_fraction=volume_fraction,
+    )
+
+    max_label = int(cp.max(labels))
+    if not robust:
+        # remove any regions that are to close for non-robust algorithm
+        labels_close = _find_close_labels(labels, labels > 0, max_label)
+        for value in labels_close:
+            labels[labels == value] = 0
+
+        # relabel to ensure sequential
+        labels = measure.label(labels > 0)
+        max_label = int(cp.max(labels))
+
+    values = regionprops_perimeter_crofton(
+        labels, max_label=max_label, robust=robust
+    )
+    expected = measure.regionprops_table(
+        labels, properties=["perimeter_crofton"]
+    )
+    rtol = 1e-5
+    atol = 1e-5
+    allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
+    allclose(values, expected["perimeter_crofton"])
