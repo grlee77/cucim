@@ -2672,28 +2672,23 @@ def _reverse_label_values(label_image, max_label):
     return map_array(label_image, labs, rev_labs)
 
 
-def _find_close_labels(labels, binary_image, max_label, labels_pad=None):
+def _find_close_labels(labels, binary_image, max_label):
     # check possibly too-close regions for which we may need to
     # manually recompute the regions perimeter in isolation
-    labels_orig = labels
-    if labels_pad is not None:
-        labels = labels_pad
-
     labels_dilated2 = ndi.grey_dilation(labels, 5, mode="constant")
     labels2 = labels_dilated2 * binary_image
     rev_labels = _reverse_label_values(labels, max_label=max_label)
     rev_labels = ndi.grey_dilation(rev_labels, 5, mode="constant")
     rev_labels = rev_labels * binary_image
     labels3 = _reverse_label_values(rev_labels, max_label=max_label)
-    if labels_pad is not None:
-        labels2 = labels2[(slice(1, -1),) * labels.ndim]
-        labels3 = labels3[(slice(1, -1),) * labels.ndim]
-    diffs = cp.logical_or(labels_orig != labels2, labels_orig != labels3)
-    labels_to_recompute = cp.asnumpy(cp.unique(labels_orig[diffs]))
-    return labels_to_recompute
+    diffs = cp.logical_or(labels != labels2, labels != labels3)
+    labels_close = cp.asnumpy(cp.unique(labels[diffs]))
+    return labels_close
 
 
-def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
+def regionprops_perimeter(
+    labels, neighborhood=4, max_label=None, robust=True, labels_close=None
+):
     """Calculate total perimeter of all objects in binary image.
 
     Parameters
@@ -2715,6 +2710,10 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
         on will make the run time substantially longer, so it should only be
         used when labeled regions may have a non-negligible portion of their
         boundary within a <2 pixel gap from another label.
+    labels_close : numpy.ndarray or sequence of int
+        List of labeled regions that are less than 2 pixel gap from another
+        label. Used when robust=True. If not provided and robust=True, it
+        will be computed internally.
 
     Returns
     -------
@@ -2729,8 +2728,8 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
     of the field of view, so an accurate perimeter cannot be measured for such
     objects.
 
-    TODO(grelee): should be able to make this an order of magnitude faster with
-    a customized filter/kernel instead of convolve + bincount, etc.
+    TODO(grelee): should be able to make this faster with a customized
+    filter/kernel instead of convolve + bincount, etc.
 
     References
     ----------
@@ -2759,31 +2758,14 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
     if max_label is None:
         max_label = int(labels.max())
 
-    # maximum possible value for XF_labeled input to bincount
-    # need to choose integer range large enough that this won't overflow
-    max_val = (max_label + 1) * 16
-    if max_val < 256:
-        image_dtype = cp.uint8
-    elif max_val < 65536:
-        image_dtype = cp.uint16
-    elif max_val < 2**32:
-        image_dtype = cp.uint32
-    else:
-        image_dtype = cp.uint64
-
-    if image_dtype == cp.uint8:
-        # can directly view bool as uint8 without a copy
-        binary_image = (labels > 0).view(cp.uint8)
-    else:
-        binary_image = (labels > 0).astype(image_dtype)
-
+    binary_image = labels > 0
     if neighborhood == 4:
         footprint = cp.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
     else:
         footprint = 3
 
     eroded_image = ndi.binary_erosion(binary_image, footprint, border_value=0)
-    border_image = binary_image - eroded_image
+    border_image = binary_image.view(cp.uint8) - eroded_image
 
     perimeter_weights = np.zeros(50, dtype=cp.float64)
     perimeter_weights[[5, 7, 15, 17, 25, 27]] = 1
@@ -2804,33 +2786,37 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
     labels_dilated = ndi.grey_dilation(labels, 3, mode="constant")
 
     if robust:
-        labels_to_recompute = _find_close_labels(
-            labels, binary_image, max_label
-        )
+        if labels_close is None:
+            labels_close = _find_close_labels(labels, binary_image, max_label)
         # regions to recompute
-        if labels_to_recompute.size > 0:
+        if labels_close.size > 0:
             print(
-                f"recomputing {labels_to_recompute.size} of {max_label} labels"
-                " due to close proximity."
+                f"recomputing {labels_close.size} of {max_label} "
+                "labels due to close proximity."
             )
             bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
-    # values in XF are guaranteed to be in range [0, 15] so need to multiply
-    # each label by 16 to make sure all labels have a unique set of values
-    # during bincount
-    perimeter_image = perimeter_image + 50 * labels_dilated
+    max_val = 50  # 1 + sum of kernel used by ndi.convolve above
+    # values in perimeter_image are guaranteed to be in range [0, max_val) so
+    # need to multiply each label by max_val to make sure all labels have a
+    # unique set of values during bincount
+    perimeter_image = perimeter_image + max_val * labels_dilated
 
-    minlength = 50 * (max_label + 1)
-    h = cp.bincount(perimeter_image.ravel(), minlength=minlength)
-    # values for label=1 start at index 50
-    h = h[50:minlength].reshape((max_label, 50))
+    minlength = max_val * (max_label + 1)
+
+    # only need to bincount masked region near image boundary
+    binary_image_mask = ndi.binary_dilation(border_image, 3)
+    h = cp.bincount(perimeter_image[binary_image_mask], minlength=minlength)
+
+    # values for label=1 start at index `max_val`
+    h = h[max_val:minlength].reshape((max_label, max_val))
 
     perimeters = perimeter_weights @ h.T
     if robust:
         # recompute perimeter in isolation for each region that may be too
         # close to another one
         shape = binary_image.shape
-        for lab in labels_to_recompute:
+        for lab in labels_close:
             sl = slices[lab - 1]
 
             # keep boundary of 1 so object is not at 'edge' of cropped
@@ -2847,13 +2833,17 @@ def regionprops_perimeter(labels, neighborhood=4, max_label=None, robust=False):
             p = regionprops_perimeter(
                 ld == lab, max_label=1, neighborhood=neighborhood, robust=False
             )
-            # print(f"label {lab}: old perimeter={perimeters[lab - 1]}, new_perimeter={p}")  # noqa: E501
             perimeters[lab - 1] = p[0]
     return perimeters
 
 
 def regionprops_perimeter_crofton(
-    labels, directions=4, max_label=None, robust=False, omit_image_edges=False
+    labels,
+    directions=4,
+    max_label=None,
+    robust=True,
+    omit_image_edges=False,
+    labels_close=None,
 ):
     """Calculate total Crofton perimeter of all objects in binary image.
 
@@ -2884,6 +2874,10 @@ def regionprops_perimeter_crofton(
         falling partly outside of `image`, so it seems acceptable to just set
         this to True. The default remains False for consistency with upstream
         scikit-image.
+    labels_close : numpy.ndarray or sequence of int
+        List of labeled regions that are less than 2 pixel gap from another
+        label. Used when robust=True. If not provided and robust=True, it
+        will be computed internally.
 
     Returns
     -------
@@ -2907,8 +2901,8 @@ def regionprops_perimeter_crofton(
     of the field of view, so an accurate perimeter cannot be measured for such
     objects.
 
-    TODO(grelee): should be able to make this an order of magnitude faster with
-    a customized filter/kernel instead of convolve + bincount, etc.
+    TODO(grelee): should be able to make this faster with a customized
+    filter/kernel instead of convolve + bincount, etc.
 
     See Also
     --------
@@ -2926,68 +2920,51 @@ def regionprops_perimeter_crofton(
     if max_label is None:
         max_label = int(labels.max())
 
-    # maximum possible value for XF_labeled input to bincount
-    # need to choose integer range large enough that this won't overflow
-    max_val = (max_label + 1) * 16
-    if max_val < 256:
-        image_dtype = cp.uint8
-    elif max_val < 65536:
-        image_dtype = cp.uint16
-    elif max_val < 2**32:
-        image_dtype = cp.uint32
-    else:
-        image_dtype = cp.uint64
-
-    if image_dtype == cp.uint8:
-        # can directly view bool as uint8 without a copy
-        binary_image = (labels > 0).view(cp.uint8)
-    else:
-        binary_image = (labels > 0).astype(image_dtype)
-
+    binary_image = labels > 0
+    if robust and labels_close is None:
+        labels_close = _find_close_labels(labels, binary_image, max_label)
     if not omit_image_edges:
+        # Dilate labels by 1 pixel so we can sum with values in image_filtered
+        # to give unique histogram bins for each labeled regions (As long as no
+        # labeled regions are within < 2 pixels from another labeled region)
+        labels_pad = cp.pad(labels, pad_width=1, mode="constant")
+        labels_dilated = ndi.grey_dilation(labels_pad, 3, mode="constant")
         binary_image = pad(binary_image, pad_width=1, mode="constant")
+        # need dilated mask for later use for indexing into
+        # `image_filtered_labeled` for bincount
+        binary_image_mask = ndi.binary_dilation(binary_image, 3)
+        binary_image_mask = cp.logical_xor(
+            binary_image_mask, ndi.binary_erosion(binary_image, 3)
+        )
+    else:
+        labels_dilated = ndi.grey_dilation(labels, 3, mode="constant")
+        binary_image_mask = binary_image
+
     image_filtered = ndi.convolve(
-        binary_image,
+        binary_image.view(cp.uint8),
         cp.array([[0, 0, 0], [0, 1, 4], [0, 2, 8]]),
         mode="constant",
         cval=0,
     )
 
-    # dilate labels by 1 pixel so we can sum with values in XF to give
-    # unique histogram bins for each labeled regions (as long as no labeled
-    # regions are within < 2 pixels from another labeled region)
-    if not omit_image_edges:
-        labels_pad = cp.pad(labels, pad_width=1, mode="constant")
-        labels_dilated = ndi.grey_dilation(labels_pad, 3, mode="constant")
-    else:
-        labels_dilated = ndi.grey_dilation(labels, 3, mode="constant")
-
     if robust:
-        # check possibly too-close regions for which we may need to manually
-        # recompute the regions perimeter in isolation
-        if omit_image_edges:
-            labels_to_recompute = _find_close_labels(
-                labels, binary_image, max_label
-            )
-        else:
-            labels_to_recompute = _find_close_labels(
-                labels, binary_image, max_label, labels_pad=labels_pad
-            )
-
-        if labels_to_recompute.size > 0:
+        if labels_close.size > 0:
             print(
-                f"recomputing {labels_to_recompute.size} of {max_label} labels"
+                f"recomputing {labels_close.size} of {max_label} labels"
                 " due to close proximity."
             )
             bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
-    # values in XF are guaranteed to be in range [0, 15] so need to multiply
-    # each label by 16 to make sure all labels have a unique set of values
-    # during bincount
+    # values in image_filtered are guaranteed to be in range [0, 15] so need to
+    # multiply each label by 16 to make sure all labels have a unique set of
+    # values during bincount
     image_filtered_labeled = image_filtered + 16 * labels_dilated
 
     minlength = 16 * (max_label + 1)
-    h = cp.bincount(image_filtered_labeled.ravel(), minlength=minlength)
+    h = cp.bincount(
+        image_filtered_labeled[binary_image_mask], minlength=minlength
+    )
+
     # values for label=1 start at index 16
     h = h[16:minlength].reshape((max_label, 16))
 
@@ -3012,36 +2989,26 @@ def regionprops_perimeter_crofton(
         # recompute perimeter in isolation for each region that may be too
         # close to another one
         shape = labels_dilated.shape
-        for lab in labels_to_recompute:
+        for lab in labels_close:
             sl = slices[lab - 1]
-            if omit_image_edges:
-                # keep boundary of 1 so object is not at 'edge' of cropped
-                # region (unless it is at a true image edge)
-                ld = labels_dilated[
-                    max(sl[0].start - 1, 0):min(sl[0].stop + 1, shape[0]),
-                    max(sl[1].start - 1, 0):min(sl[1].stop + 1, shape[1])
-                ]
-            else:
-                # keep boundary of 1 so object is not at 'edge' of cropped
-                # region (unless it is at a true image edge)
-                # + 2 is because labels_pad is padded, but labels was not
-                ld = labels_pad[
-                    max(sl[0].start, 0):min(sl[0].stop + 2, shape[0]),
-                    max(sl[1].start, 0):min(sl[1].stop + 2, shape[1])
-                ]
+            ld = labels[
+                max(sl[0].start, 0):min(sl[0].stop, shape[0]),
+                max(sl[1].start, 0):min(sl[1].stop, shape[1])
+            ]
             p = regionprops_perimeter_crofton(
                 ld == lab,
                 max_label=1,
                 directions=directions,
-                omit_image_edges=omit_image_edges,
+                omit_image_edges=False,
                 robust=False
             )
-            # print(f"label {lab}: old perimeter={perimeters[lab - 1]}, new_perimeter={p}")  # noqa: E501
             perimeters[lab - 1] = p[0]
     return perimeters
 
 
-def regionprops_euler(labels, connectivity=None, max_label=None, robust=False):
+def regionprops_euler(
+    labels, connectivity=None, max_label=None, robust=True, labels_close=None
+):
     """Calculate the Euler characteristic in binary image.
 
     For 2D objects, the Euler number is the number of objects minus the number
@@ -3050,7 +3017,7 @@ def regionprops_euler(labels, connectivity=None, max_label=None, robust=False):
 
     Parameters
     ----------
-    labels: (M, N[, P]) ndarray
+    labels: (M, N[, P]) cupy.ndarray
         Input image. If image is not binary, all values greater than zero
         are considered as the object.
     connectivity : int, optional
@@ -3073,30 +3040,43 @@ def regionprops_euler(labels, connectivity=None, max_label=None, robust=False):
         on will make the run time substantially longer, so it should only be
         used when labeled regions may have a non-negligible portion of their
         boundary within a <2 pixel gap from another label.
+    labels_close : numpy.ndarray or sequence of int
+        List of labeled regions that are less than 2 pixel gap from another
+        label. Used when robust=True. If not provided and robust=True, it
+        will be computed internally.
 
     Returns
     -------
-    perimeter : float
-        Total perimeter of all objects in binary image.
+    euler_number : cp.ndarray of int
+        Euler characteristic of the set of all objects in the image.
 
     Notes
     -----
-    The `perimeter` method does not consider the boundary along the image edge
-    as image as part of the perimeter, while the `perimeter_crofton` method
-    does. In any case, an object touching the image edge likely extends outside
-    of the field of view, so an accurate perimeter cannot be measured for such
-    objects.
+    The Euler characteristic is an integer number that describes the
+    topology of the set of all objects in the input image. If object is
+    4-connected, then background is 8-connected, and conversely.
 
-    TODO(grelee): should be able to make this an order of magnitude faster with
-    a customized filter/kernel instead of convolve + bincount, etc.
+    The computation of the Euler characteristic is based on an integral
+    geometry formula in discretized space. In practice, a neighborhood
+    configuration is constructed, and a LUT is applied for each
+    configuration. The coefficients used are the ones of Ohser et al.
+
+    It can be useful to compute the Euler characteristic for several
+    connectivities. A large relative difference between results
+    for different connectivities suggests that the image resolution
+    (with respect to the size of objects and holes) is too low.
 
     References
     ----------
-    .. [1] K. Benkrid, D. Crookes. Design and FPGA Implementation of
-           a Perimeter Estimator. The Queen's University of Belfast.
-           http://www.cs.qub.ac.uk/~d.crookes/webpubs/papers/perimeter.doc
-
-    See Also
+    .. [1] S. Rivollier. Analyse d’image geometrique et morphometrique par
+           diagrammes de forme et voisinages adaptatifs generaux. PhD thesis,
+           2010. Ecole Nationale Superieure des Mines de Saint-Etienne.
+           https://tel.archives-ouvertes.fr/tel-00560838
+    .. [2] Ohser J., Nagel W., Schladitz K. (2002) The Euler Number of
+           Discretized Sets - On the Choice of Adjacency in Homogeneous
+           Lattices. In: Mecke K., Stoyan D. (eds) Morphology of Condensed
+           Matter. Lecture Notes in Physics, vol 600. Springer, Berlin,
+           Heidelberg.
     --------
     perimeter_crofton
 
@@ -3158,19 +3138,14 @@ def regionprops_euler(labels, connectivity=None, max_label=None, robust=False):
             coefs = EULER_COEFS3D_26
         filter_bins = 256
 
-    max_val = (max_label + 1) * filter_bins
-    if max_val < 2**15:
-        image_dtype = cp.int16
-    elif max_val < 2**31:
-        image_dtype = cp.int32
-    else:
-        image_dtype = cp.int64
+    binary_image = labels > 0
 
-    binary_image = (labels > 0).astype(image_dtype)
+    if robust and labels_close is None:
+        labels_close = _find_close_labels(labels, binary_image, max_label)
 
     binary_image = pad(binary_image, pad_width=1, mode="constant")
     image_filtered = ndi.convolve(
-        binary_image,
+        binary_image.view(cp.uint8),
         config,
         mode="constant",
         cval=0,
@@ -3182,27 +3157,25 @@ def regionprops_euler(labels, connectivity=None, max_label=None, robust=False):
     labels_pad = pad(labels, pad_width=1, mode="constant")
     labels_dilated = ndi.grey_dilation(labels_pad, 3, mode="constant")
 
-    if robust:
-        # check possibly too-close regions for which we may need to manually
-        # recompute the regions perimeter in isolation
-        labels_to_recompute = _find_close_labels(
-            labels, binary_image, max_label, labels_pad=labels_pad
+    if robust and labels_close.size > 0:
+        print(
+            f"recomputing {labels_close.size} of {max_label} labels"
+            " due to close proximity."
         )
+        bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
-        if labels_to_recompute.size > 0:
-            print(
-                f"recomputing {labels_to_recompute.size} of {max_label} labels"
-                " due to close proximity."
-            )
-            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
-
-    # values in XF are guaranteed to be in range [0, 15] so need to multiply
-    # each label by 16 to make sure all labels have a unique set of values
-    # during bincount
+    # values in image_filtered are guaranteed to be in range [0, filter_bins)
+    # so need to multiply each label by filter_bins to make sure all labels
+    # have a unique set of values during bincount
     image_filtered_labeled = image_filtered + filter_bins * labels_dilated
 
     minlength = filter_bins * (max_label + 1)
-    h = cp.bincount(image_filtered_labeled.ravel(), minlength=minlength)
+
+    bincount_mask = cp.logical_xor(
+        ndi.binary_dilation(binary_image, 3),
+        ndi.binary_erosion(binary_image, 3),
+    )
+    h = cp.bincount(image_filtered_labeled[bincount_mask], minlength=minlength)
     # values for label=1 start at index filter_bins
     h = h[filter_bins:minlength].reshape((max_label, filter_bins))
 
@@ -3217,7 +3190,7 @@ def regionprops_euler(labels, connectivity=None, max_label=None, robust=False):
         # recompute perimeter in isolation for each region that may be too
         # close to another one
         shape = labels_dilated.shape
-        for lab in labels_to_recompute:
+        for lab in labels_close:
             sl = slices[lab - 1]
             # keep boundary of 1 so object is not at 'edge' of cropped
             # region (unless it is at a true image edge)
@@ -3229,6 +3202,5 @@ def regionprops_euler(labels, connectivity=None, max_label=None, robust=False):
             euler_num = regionprops_euler(
                 ld == lab, connectivity=connectivity, max_label=1, robust=False
             )
-            # print(f"label {lab}: old perimeter={perimeters[lab - 1]}, new_perimeter={p}")  # noqa: E501
             euler_number[lab - 1] = euler_num[0]
     return euler_number
