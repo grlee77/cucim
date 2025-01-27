@@ -214,6 +214,7 @@ def get_bbox_coords_kernel(
     compute_num_pixels=False,
     compute_coordinate_sums=False,
     pixels_per_thread=8,
+    max_labels_per_thread=None,
 ):
     coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
     if compute_num_pixels:
@@ -222,12 +223,9 @@ def get_bbox_coords_kernel(
         coord_sum_dtype = cp.dtype(cp.uint64)
         coord_sum_ctype = "uint64_t"
 
-    if pixels_per_thread < 10:
-        array_size = pixels_per_thread
-    else:
-        # highly unlikely for array to repeatedly swap labels at every pixel,
-        # so use a smaller size
-        array_size = pixels_per_thread // 2
+    array_size = pixels_per_thread
+    if max_labels_per_thread is not None:
+        array_size = min(pixels_per_thread, max_labels_per_thread)
 
     if coord_dtype.itemsize <= 4:
         uint_t = "unsigned int"
@@ -545,6 +543,7 @@ def get_intensity_measure_kernel(
     compute_min=False,
     compute_max=False,
     pixels_per_thread=8,
+    max_labels_per_thread=None,
 ):
     if compute_num_pixels:
         count_dtype = cp.dtype(cp.uint32 if int32_count else cp.uint64)
@@ -556,12 +555,9 @@ def get_intensity_measure_kernel(
         c_min_max_type,
     ) = _get_intensity_img_kernel_dtypes(image_dtype)
 
-    if pixels_per_thread < 10:
-        array_size = pixels_per_thread
-    else:
-        # highly unlikely for array to repeatedly swap labels at every pixel,
-        # so use a smaller size
-        array_size = pixels_per_thread // 2
+    array_size = pixels_per_thread
+    if max_labels_per_thread is not None:
+        array_size = min(pixels_per_thread, max_labels_per_thread)
 
     any_sums = compute_num_pixels or compute_sum or compute_sum_sq
 
@@ -899,14 +895,13 @@ def get_raw_moments_kernel(
     weighted=False,
     num_channels=1,
     pixels_per_thread=8,
+    max_labels_per_thread=None,
 ):
     moments_dtype = cp.dtype(moments_dtype)
-    if pixels_per_thread < 10:
-        array_size = pixels_per_thread
-    else:
-        # highly unlikely for array to repeatedly swap labels at every pixel,
-        # so use a smaller size
-        array_size = pixels_per_thread // 2
+
+    array_size = pixels_per_thread
+    if max_labels_per_thread is not None:
+        array_size = min(pixels_per_thread, max_labels_per_thread)
 
     coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
     if coord_dtype.itemsize <= 4:
@@ -1012,7 +1007,13 @@ def _get_count_dtype(label_image_size):
     return count_dtype, int32_count
 
 
-def regionprops_num_pixels(label_image, max_label=None, pixels_per_thread=16):
+def regionprops_num_pixels(
+    label_image,
+    max_label=None,
+    pixels_per_thread=16,
+    max_labels_per_thread=None,
+    props_dict=None,
+):
     if max_label is None:
         max_label = int(label_image.max())
     num_counts = max_label
@@ -1026,6 +1027,7 @@ def regionprops_num_pixels(label_image, max_label=None, pixels_per_thread=16):
         compute_num_pixels=True,
         compute_coordinate_sums=False,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
     )
     counts = cp.zeros(num_counts, dtype=count_dtype)
 
@@ -1039,6 +1041,8 @@ def regionprops_num_pixels(label_image, max_label=None, pixels_per_thread=16):
         counts,
         size=math.ceil(label_image.size / pixels_per_thread),
     )
+    if props_dict is not None:
+        props_dict["num_pixels"] = counts
     return counts
 
 
@@ -1048,14 +1052,20 @@ def regionprops_area(
     max_label=None,
     dtype=cp.float32,
     pixels_per_thread=16,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     # integer atomicAdd is faster than floating point so better to convert
     # after counting
-    area = regionprops_num_pixels(
-        label_image,
-        max_label=max_label,
-        pixels_per_thread=pixels_per_thread,
-    )
+    if props_dict is not None and "num_pixels" in props_dict:
+        area = props_dict["num_pixels"]
+    else:
+        area = regionprops_num_pixels(
+            label_image,
+            max_label=max_label,
+            pixels_per_thread=pixels_per_thread,
+            max_labels_per_thread=max_labels_per_thread,
+        )
     area = area.astype(dtype)
     if spacing is not None:
         if isinstance(spacing, cp.ndarray):
@@ -1063,6 +1073,8 @@ def regionprops_area(
         else:
             pixel_area = math.prod(spacing)
         area *= pixel_area
+    if props_dict is not None:
+        props_dict["area"] = area
     return area
 
 
@@ -1089,6 +1101,8 @@ def regionprops_intensity_mean(
     max_label=None,
     mean_dtype=cp.float32,
     pixels_per_thread=16,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     if max_label is None:
         max_label = int(label_image.max())
@@ -1101,7 +1115,15 @@ def regionprops_intensity_mean(
     image_dtype = intensity_image.dtype
     sum_dtype, _, _, _ = _get_intensity_img_kernel_dtypes(image_dtype)
 
-    counts = cp.zeros(num_counts, dtype=count_dtype)
+    if props_dict is not None and "num_pixels" in props_dict:
+        counts = props_dict["num_pixels"]
+        if counts.dtype != count_dtype:
+            counts = counts.astype(count_dtype, copy=False)
+        compute_num_pixels = False
+    else:
+        counts = cp.zeros(num_counts, dtype=count_dtype)
+        compute_num_pixels = True
+
     sum_shape = (
         (num_counts,) if num_channels == 1 else (num_counts, num_channels)
     )
@@ -1111,10 +1133,11 @@ def regionprops_intensity_mean(
         int32_count=int32_count,
         image_dtype=image_dtype,
         num_channels=num_channels,
-        compute_num_pixels=True,
+        compute_num_pixels=compute_num_pixels,
         compute_sum=True,
         compute_sum_sq=False,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
     )
 
     # make a copy if the inputs are not already C-contiguous
@@ -1123,12 +1146,16 @@ def regionprops_intensity_mean(
     if not intensity_image.flags.c_contiguous:
         intensity_image = cp.ascontiguousarray(intensity_image)
 
+    if compute_num_pixels:
+        outputs = (counts, sums)
+    else:
+        outputs = (sums,)
+
     kernel(
         label_image,
         label_image.size,
         intensity_image,
-        counts,
-        sums,
+        *outputs,
         size=math.ceil(label_image.size / pixels_per_thread),
     )
 
@@ -1137,6 +1164,10 @@ def regionprops_intensity_mean(
     else:
         means = sums / counts
     means = means.astype(mean_dtype, copy=False)
+    if props_dict is not None:
+        props_dict["intensity_mean"] = means
+        if "num_pixels" not in props_dict:
+            props_dict["num_pixels"] = counts
     return counts, means
 
 
@@ -1191,6 +1222,8 @@ def regionprops_intensity_std(
     max_label=None,
     std_dtype=cp.float64,
     pixels_per_thread=4,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     if max_label is None:
         max_label = int(label_image.max())
@@ -1202,7 +1235,16 @@ def regionprops_intensity_std(
     sum_dtype, _, _, _ = _get_intensity_img_kernel_dtypes(image_dtype)
 
     count_dtype, int32_count = _get_count_dtype(label_image.size)
-    counts = cp.zeros(num_counts, dtype=count_dtype)
+
+    if props_dict is not None and "num_pixels" in props_dict:
+        counts = props_dict["num_pixels"]
+        if counts.dtype != count_dtype:
+            counts = counts.astype(count_dtype, copy=False)
+        compute_num_pixels = False
+    else:
+        counts = cp.zeros(num_counts, dtype=count_dtype)
+        compute_num_pixels = True
+
     sum_shape = (
         (num_counts,) if num_channels == 1 else (num_counts, num_channels)
     )
@@ -1221,18 +1263,21 @@ def regionprops_intensity_std(
             int32_count=int32_count,
             image_dtype=image_dtype,
             num_channels=num_channels,
-            compute_num_pixels=True,
+            compute_num_pixels=compute_num_pixels,
             compute_sum=True,
             compute_sum_sq=True,
             pixels_per_thread=pixels_per_thread,
+            max_labels_per_thread=max_labels_per_thread,
         )
+        if compute_num_pixels:
+            outputs = (counts, sums, sumsqs)
+        else:
+            outputs = (sums, sumsqs)
         kernel(
             label_image,
             label_image.size,
             intensity_image,
-            counts,
-            sums,
-            sumsqs,
+            *outputs,
             size=math.ceil(label_image.size / pixels_per_thread),
         )
 
@@ -1255,6 +1300,11 @@ def regionprops_intensity_std(
         raise NotImplementedError("TODO")
     means = means.astype(std_dtype, copy=False)
     stds = stds.astype(std_dtype, copy=False)
+    if props_dict is not None:
+        props_dict["intensity_std"] = stds
+        props_dict["intensity_mean"] = means
+        if "num_pixels" not in props_dict:
+            props_dict["num_pixels"] = counts
     return counts, means, stds
 
 
@@ -1265,6 +1315,8 @@ def _regionprops_min_or_max_intensity(
     compute_min=True,
     compute_max=False,
     pixels_per_thread=8,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     if max_label is None:
         max_label = int(label_image.max())
@@ -1293,6 +1345,7 @@ def _regionprops_min_or_max_intensity(
         compute_min=compute_min,
         compute_max=compute_max,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
     )
 
     # make a copy if the inputs are not already C-contiguous
@@ -1307,17 +1360,30 @@ def _regionprops_min_or_max_intensity(
         kernel(
             label_image, lab_size, intensity_image, minimums, maximums, size=sz
         )  # noqa: E501
+        if props_dict is not None:
+            props_dict["intensity_min"] = minimums
+        if props_dict is not None:
+            props_dict["intensity_max"] = maximums
         return minimums, maximums
     elif compute_min:
         kernel(label_image, lab_size, intensity_image, minimums, size=sz)
+        if props_dict is not None:
+            props_dict["intensity_min"] = minimums
         return minimums
     elif compute_max:
         kernel(label_image, lab_size, intensity_image, maximums, size=sz)
+        if props_dict is not None:
+            props_dict["intensity_max"] = maximums
         return maximums
 
 
 def regionprops_intensity_min(
-    label_image, intensity_image, max_label=None, pixels_per_thread=8
+    label_image,
+    intensity_image,
+    max_label=None,
+    pixels_per_thread=8,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     return _regionprops_min_or_max_intensity(
         label_image,
@@ -1326,11 +1392,18 @@ def regionprops_intensity_min(
         compute_min=True,
         compute_max=False,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
+        props_dict=props_dict,
     )
 
 
 def regionprops_intensity_max(
-    label_image, intensity_image, max_label=None, pixels_per_thread=8
+    label_image,
+    intensity_image,
+    max_label=None,
+    pixels_per_thread=8,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     return _regionprops_min_or_max_intensity(
         label_image,
@@ -1339,6 +1412,8 @@ def regionprops_intensity_max(
         compute_min=False,
         compute_max=True,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
+        props_dict=props_dict,
     )
 
 
@@ -1347,6 +1422,8 @@ def regionprops_bbox_coords(
     max_label=None,
     return_slices=False,
     pixels_per_thread=16,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     """
     Parameters
@@ -1386,6 +1463,7 @@ def regionprops_bbox_coords(
         ndim=label_image.ndim,
         int32_coords=int32_coords,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
     )
 
     ndim = label_image.ndim
@@ -1405,6 +1483,9 @@ def regionprops_bbox_coords(
         bbox_coords,
         size=math.ceil(label_image.size / pixels_per_thread),
     )
+    if props_dict is not None:
+        props_dict["bbox"] = bbox_coords
+
     if return_slices:
         bbox_coords_cpu = cp.asnumpy(bbox_coords)
         if ndim == 2:
@@ -1425,6 +1506,8 @@ def regionprops_bbox_coords(
                 )
                 for box in bbox_coords_cpu
             ]
+        if props_dict is not None:
+            props_dict["slice"] = bbox_slices
     else:
         bbox_slices = None
 
@@ -1432,7 +1515,12 @@ def regionprops_bbox_coords(
 
 
 def regionprops_centroid(
-    label_image, max_label=None, coord_dtype=cp.uint32, pixels_per_thread=16
+    label_image,
+    max_label=None,
+    coord_dtype=cp.uint32,
+    pixels_per_thread=16,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     """
     Parameters
@@ -1456,21 +1544,29 @@ def regionprops_centroid(
     """
     if max_label is None:
         max_label = int(label_image.max())
+    ndim = label_image.ndim
 
     int32_coords = max(label_image.shape) < 2**32
     coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
+    if props_dict is not None and "num_pixels" in props_dict:
+        centroid_counts = props_dict["num_pixels"]
+        if centroid_counts.dtype != cp.uint32:
+            centroid_counts = centroid_counts.astype(cp.uint32)
+        compute_num_pixels = False
+    else:
+        centroid_counts = cp.zeros((max_label,), dtype=cp.uint32)
+        compute_num_pixels = True
 
     bbox_coords_kernel = get_bbox_coords_kernel(
         ndim=label_image.ndim,
         int32_coords=int32_coords,
-        compute_num_pixels=True,
+        compute_num_pixels=compute_num_pixels,
         compute_coordinate_sums=True,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
     )
 
-    ndim = label_image.ndim
     bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
-    centroid_counts = cp.zeros((max_label,), dtype=cp.uint32)
     centroid_sums = cp.zeros((max_label, ndim), dtype=cp.uint64)
 
     # Initialize value for atomicMin on even coordinates
@@ -1481,21 +1577,32 @@ def regionprops_centroid(
     if not label_image.flags.c_contiguous:
         label_image = cp.ascontiguousarray(label_image)
 
+    if compute_num_pixels:
+        outputs = (bbox_coords, centroid_counts, centroid_sums)
+    else:
+        outputs = (bbox_coords, centroid_sums)
     bbox_coords_kernel(
         label_image,
         label_image.size,
-        bbox_coords,
-        centroid_counts,
-        centroid_sums,
+        *outputs,
         size=math.ceil(label_image.size / pixels_per_thread),
     )
 
     centroid = centroid_sums / centroid_counts[:, cp.newaxis]
-    return centroid_counts, centroid
+    if props_dict is not None:
+        props_dict["centroied"] = centroid
+        if "bbox" not in props_dict:
+            props_dict["bbox"] = bbox_coords
+        if "num_pixels" not in props_dict:
+            props_dict["num_pixels"] = centroid_counts
+    return centroid
 
 
 @cp.memoize(for_each_device=True)
 def get_centroid_local_kernel(coord_dtype, ndim):
+    """Keep this kernel for n-dimensional support as the raw_moments kernels
+    currently only support 2D and 3D data.
+    """
     coord_dtype = cp.dtype(coord_dtype)
     sum_dtype = cp.dtype(cp.uint64)
     count_dtype = cp.dtype(cp.uint32)
@@ -1529,8 +1636,13 @@ def regionprops_centroid_local(
     max_label=None,
     coord_dtype=cp.uint32,
     pixels_per_thread=16,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
-    """
+    """Compute the central moments of the labeled regions.
+
+    dimensions supported: nD
+
     Parameters
     ----------
     label_image : cp.ndarray
@@ -1556,32 +1668,59 @@ def regionprops_centroid_local(
     int32_coords = max(label_image.shape) < 2**32
     coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
 
-    bbox_coords_kernel = get_bbox_coords_kernel(
-        ndim=label_image.ndim,
-        int32_coords=int32_coords,
-        compute_bbox=True,
-        compute_num_pixels=False,
-        compute_coordinate_sums=False,
-        pixels_per_thread=pixels_per_thread,
-    )
-
     ndim = label_image.ndim
-    bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
 
-    # Initialize value for atomicMin on even coordinates
-    # The value for atomicMax columns is already 0 as desired.
-    bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+    if props_dict is not None and "moments" in props_dict and ndim in [2, 3]:
+        # already have the moments needed in previously computed properties
+        moments = props_dict["moments"]
+        # can't compute if only zeroth moment is present
+        if moments.shape[-1] > 1:
+            centroid_local = cp.empty((max_label, ndim), dtype=moments.dtype)
+            if ndim == 2:
+                m0 = moments[:, 0, 0]
+                centroid_local[:, 0] = moments[:, 1, 0] / m0
+                centroid_local[:, 1] = moments[:, 0, 1] / m0
+            else:
+                m0 = moments[:, 0, 0, 0]
+                centroid_local[:, 0] = moments[:, 1, 0, 0] / m0
+                centroid_local[:, 1] = moments[:, 0, 1, 0] / m0
+                centroid_local[:, 2] = moments[:, 0, 0, 1] / m0
+        props_dict["centroid_local"] = centroid_local
+        return centroid_local
 
-    # make a copy if the inputs are not already C-contiguous
-    if not label_image.flags.c_contiguous:
-        label_image = cp.ascontiguousarray(label_image)
+    if props_dict is not None and "bbox" in props_dict:
+        # reuse previously computed bounding box coordinates
+        bbox_coords = props_dict["bbox"]
+        if bbox_coords.dtype != coord_dtype:
+            bbox_coords = bbox_coords.astype(coord_dtype)
 
-    bbox_coords_kernel(
-        label_image,
-        label_image.size,
-        bbox_coords,
-        size=math.ceil(label_image.size / pixels_per_thread),
-    )
+    else:
+        bbox_coords_kernel = get_bbox_coords_kernel(
+            ndim=label_image.ndim,
+            int32_coords=int32_coords,
+            compute_bbox=True,
+            compute_num_pixels=False,
+            compute_coordinate_sums=False,
+            pixels_per_thread=pixels_per_thread,
+            max_labels_per_thread=max_labels_per_thread,
+        )
+
+        bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
+
+        # Initialize value for atomicMin on even coordinates
+        # The value for atomicMax columns is already 0 as desired.
+        bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+
+        # make a copy if the inputs are not already C-contiguous
+        if not label_image.flags.c_contiguous:
+            label_image = cp.ascontiguousarray(label_image)
+
+        bbox_coords_kernel(
+            label_image,
+            label_image.size,
+            bbox_coords,
+            size=math.ceil(label_image.size / pixels_per_thread),
+        )
 
     counts = cp.zeros((max_label,), dtype=cp.uint32)
     centroids_sums = cp.zeros((max_label, ndim), dtype=cp.uint64)
@@ -1593,8 +1732,11 @@ def regionprops_centroid_local(
     )
 
     centroid_local = centroids_sums / counts[:, cp.newaxis]
-
-    return counts, centroid_local
+    if props_dict is not None:
+        props_dict["centroid_local"] = centroid_local
+        if "num_pixels" not in props_dict:
+            props_dict["num_pixels"] = counts
+    return centroid_local
 
 
 @cp.memoize(for_each_device=True)
@@ -1677,6 +1819,8 @@ def regionprops_moments(
     spacing=None,
     coord_dtype=cp.uint32,
     pixels_per_thread=10,
+    max_labels_per_thread=None,
+    props_dict=None,
 ):
     """
     Parameters
@@ -1737,23 +1881,44 @@ def regionprops_moments(
     if max_label is None:
         max_label = int(label_image.max())
 
-    int32_coords = max(label_image.shape) < 2**32
-    coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
-
-    bbox_kernel = get_bbox_coords_kernel(
-        ndim=label_image.ndim,
-        int32_coords=int32_coords,
-        compute_bbox=True,
-        compute_num_pixels=False,
-        compute_coordinate_sums=False,
-        pixels_per_thread=pixels_per_thread,
-    )
-
     # make a copy if the inputs are not already C-contiguous
     if not label_image.flags.c_contiguous:
         label_image = cp.ascontiguousarray(label_image)
-
     ndim = label_image.ndim
+
+    int32_coords = max(label_image.shape) < 2**32
+    if props_dict is not None and "bbox" in props_dict:
+        bbox_coords = props_dict["bbox"]
+        if bbox_coords.dtype != coord_dtype:
+            bbox_coords = bbox_coords.astype(coord_dtype)
+    else:
+        coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
+
+        bbox_kernel = get_bbox_coords_kernel(
+            ndim=ndim,
+            int32_coords=int32_coords,
+            compute_bbox=True,
+            compute_num_pixels=False,
+            compute_coordinate_sums=False,
+            pixels_per_thread=pixels_per_thread,
+            max_labels_per_thread=max_labels_per_thread,
+        )
+
+        bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
+
+        # Initialize value for atomicMin on even coordinates
+        # The value for atomicMax columns is already 0 as desired.
+        bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+
+        bbox_kernel(
+            label_image,
+            label_image.size,
+            bbox_coords,
+            size=math.ceil(label_image.size / pixels_per_thread),
+        )
+        if props_dict is not None:
+            props_dict["bbox"] = bbox_coords
+
     moments_shape = (max_label,) + (order + 1,) * ndim
     if intensity_image is not None:
         if not intensity_image.flags.c_contiguous:
@@ -1767,19 +1932,6 @@ def regionprops_moments(
         num_channels = 1
         weighted = False
 
-    bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
-
-    # Initialize value for atomicMin on even coordinates
-    # The value for atomicMax columns is already 0 as desired.
-    bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
-
-    bbox_kernel(
-        label_image,
-        label_image.size,
-        bbox_coords,
-        size=math.ceil(label_image.size / pixels_per_thread),
-    )
-
     # total number of elements in the moments matrix
     moments = cp.zeros(moments_shape, dtype=cp.float64)
     moments_kernel = get_raw_moments_kernel(
@@ -1791,6 +1943,7 @@ def regionprops_moments(
         weighted=weighted,
         num_channels=num_channels,
         pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
     )
     input_args = (
         label_image,
@@ -1803,6 +1956,11 @@ def regionprops_moments(
         input_args = input_args + (intensity_image,)
     size = math.ceil(label_image.size / pixels_per_thread)
     moments_kernel(*input_args, moments, size=size)
+    if props_dict is not None:
+        if weighted:
+            props_dict["moments_weighted"] = moments
+        else:
+            props_dict["moments"] = moments
     return moments
 
 
@@ -1989,7 +2147,9 @@ def get_moments_central_kernel(
     )
 
 
-def regionprops_moments_central(moments_raw, ndim):
+def regionprops_moments_central(
+    moments_raw, ndim, weighted=False, props_dict=None
+):
     if moments_raw.ndim == 2 + ndim:
         num_channels = moments_raw.shape[1]
     elif moments_raw.ndim == 1 + ndim:
@@ -2014,6 +2174,11 @@ def regionprops_moments_central(moments_raw, ndim):
     moments_central = cp.zeros_like(moments_raw)
     # kernel loops over moments so size is max_label * num_channels
     moments_kernel(moments_raw, moments_central, size=max_label * num_channels)
+    if props_dict is not None:
+        if weighted:
+            props_dict["moments_weighted_central"] = moments_central
+        else:
+            props_dict["moments_central"] = moments_central
     return moments_central
 
 
@@ -2169,7 +2334,12 @@ def get_moments_normalize_kernel(
 
 
 def regionprops_moments_normalized(
-    moments_central, ndim, spacing=None, pixel_correction=False
+    moments_central,
+    ndim,
+    spacing=None,
+    pixel_correction=False,
+    weighted=False,
+    props_dict=None,
 ):
     """
 
@@ -2243,6 +2413,11 @@ def regionprops_moments_normalized(
 
     # kernel loops over moments so size is max_label * num_channels
     moments_norm_kernel(*inputs, moments_norm, size=max_label * num_channels)
+    if props_dict is not None:
+        if weighted:
+            props_dict["moments_weighted_normalized"] = moments_norm
+        else:
+            props_dict["moments_normalized"] = moments_norm
     return moments_norm
 
 
@@ -2308,7 +2483,7 @@ def get_moments_hu_kernel(moments_dtype):
     )
 
 
-def regionprops_moments_hu(moments_normalized):
+def regionprops_moments_hu(moments_normalized, weighted=False, props_dict=None):
     if moments_normalized.ndim == 4:
         num_channels = moments_normalized.shape[1]
     elif moments_normalized.ndim == 3:
@@ -2348,6 +2523,11 @@ def regionprops_moments_hu(moments_normalized):
     moments_hu_kernel(
         moments_normalized, moments_hu, size=max_label * num_channels
     )
+    if props_dict is not None:
+        if weighted:
+            props_dict["moments_weighted_hu"] = moments_hu
+        else:
+            props_dict["moments_hu"] = moments_hu
     return moments_hu
 
 
@@ -2434,7 +2614,7 @@ def get_inertia_tensor_kernel(moments_dtype, ndim, compute_orientation):
 
 
 def regionprops_inertia_tensor(
-    moments_central, ndim, compute_orientation=False
+    moments_central, ndim, compute_orientation=False, props_dict=None
 ):
     if ndim < 2 or ndim > 3:
         raise ValueError("inertia tensor only implemented for 2D and 3D images")
@@ -2472,6 +2652,8 @@ def regionprops_inertia_tensor(
         return itensor, orientation
 
     kernel(moments_central, itensor, size=nbatch)
+    if props_dict is not None:
+        props_dict["inertia_tensor"] = itensor
     return itensor
 
 
@@ -2682,7 +2864,7 @@ def get_spd_matrix_eigvals_kernel(
 
 
 def regionprops_inertia_tensor_eigvals(
-    inertia_tensor, compute_axis_lengths=False
+    inertia_tensor, compute_axis_lengths=False, props_dict=None
 ):
     # inertia tensor should have shape (ndim, ndim) on last two axes
     ndim = inertia_tensor.shape[-1]
@@ -2709,12 +2891,19 @@ def regionprops_inertia_tensor_eigvals(
         return eigvals, axis_lengths
     # kernel loops over moments so size is max_label * num_channels
     kernel(inertia_tensor, eigvals, size=nbatch)
+    if props_dict is not None:
+        props_dict["inertia_tensor_eigvals"] = eigvals
     return eigvals
 
 
 @cp.memoize(for_each_device=True)
 def get_centroid_weighted_kernel(
-    moments_dtype, ndim, local=True, unit_spacing=True, num_channels=1
+    moments_dtype,
+    ndim,
+    compute_local=True,
+    compute_global=False,
+    unit_spacing=True,
+    num_channels=1,
 ):
     """Centroid (in global or local coordinates) from 1st order moment matrix"""
     moments_dtype = cp.dtype(moments_dtype)
@@ -2727,7 +2916,7 @@ def get_centroid_weighted_kernel(
             "calculations."
         )
     source = ""
-    if not local:
+    if compute_global:
         source += f"""
         unsigned int offset_coords = i * {2 * ndim};\n"""
 
@@ -2756,36 +2945,46 @@ def get_centroid_weighted_kernel(
     #     out[offset_out] = moments_raw[offset + 4] / m0;      // m[1, 0, 0]
     axis_offset = 1
     for d in range(ndim - 1, -1, -1):
-        if local:
+        if compute_local:
             source += f"""
-            out[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0;"""  # noqa: E501
-        else:
+            out_local[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0;"""  # noqa: E501
+        if compute_global:
             spc = "" if unit_spacing else f" * spacing[{d}]"
             source += f"""
-            out[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0 + bbox[offset_coords + {d * 2}]{spc};"""  # noqa: E501
+            out_global[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0 + bbox[offset_coords + {d * 2}]{spc};"""  # noqa: E501
         axis_offset *= 2
     if num_channels > 1:
         source += """
         }  // channels loop\n"""
-    inputs = "raw F moments_raw"
-    local_str = ""
-    spacing_str = ""
-    if not local:
-        local_str = "_local"
+    name = f"cucim_centroid_weighted_{ndim}d"
+    inputs = ["raw F moments_raw"]
+    outputs = []
+    if compute_global:
+        name += "_global"
+        outputs.append("raw F out_global")
         # bounding box coordinates
-        inputs += ", raw Y bbox"
+        inputs.append("raw Y bbox")
         if not unit_spacing:
-            spacing_str = "_spacing"
-            inputs += ", raw float64 spacing"
-    outputs = "raw F out"
-    name = f"cucim_centroid_weighted{local_str}{spacing_str}_{ndim}d"
+            inputs.append("raw float64 spacing")
+            name += "_spacing"
+    if compute_local:
+        name += "_local"
+        outputs.append("raw F out_local")
+    inputs = ", ".join(inputs)
+    outputs = ", ".join(outputs)
     return cp.ElementwiseKernel(
         inputs, outputs, source, preamble=_includes, name=name
     )
 
 
 def regionprops_centroid_weighted(
-    moments_raw, ndim, bbox=None, local=True, spacing=None
+    moments_raw,
+    ndim,
+    bbox=None,
+    compute_local=True,
+    compute_global=False,
+    spacing=None,
+    props_dict=None,
 ):
     max_label = moments_raw.shape[0]
     if moments_raw.ndim == ndim + 2:
@@ -2794,9 +2993,16 @@ def regionprops_centroid_weighted(
         num_channels = 1
     else:
         raise ValueError("moments_raw has unexpected shape")
-    if not local and bbox is None:
+
+    if compute_global and bbox is None:
         raise ValueError(
             "bbox coordinates must be provided to get the non-local centroid"
+        )
+
+    if not (compute_local or compute_global):
+        raise ValueError(
+            "nothing to compute: either compute_global and/or compute_local "
+            "must be true"
         )
     if moments_raw.dtype.kind != "f":
         raise ValueError("moments_raw must have a floating point dtype")
@@ -2816,7 +3022,7 @@ def regionprops_centroid_weighted(
 
     unit_spacing = spacing is None
 
-    if local:
+    if compute_local and not compute_global:
         inputs = (moments_raw,)
     else:
         if not bbox.flags.c_contiguous:
@@ -2827,14 +3033,32 @@ def regionprops_centroid_weighted(
     kernel = get_centroid_weighted_kernel(
         moments_raw.dtype,
         ndim,
-        local=local,
+        compute_local=compute_local,
+        compute_global=compute_global,
         unit_spacing=unit_spacing,
         num_channels=num_channels,
     )
     centroid_shape = moments_raw.shape[:-ndim] + (ndim,)
-    centroid = cp.zeros(centroid_shape, dtype=moments_raw.dtype)
-    kernel(*inputs, centroid, size=max_label)
-    return centroid
+    outputs = []
+    if compute_global:
+        centroid_global = cp.zeros(centroid_shape, dtype=moments_raw.dtype)
+        outputs.append(centroid_global)
+    if compute_local:
+        centroid_local = cp.zeros(centroid_shape, dtype=moments_raw.dtype)
+        outputs.append(centroid_local)
+    # Note: order of inputs and outputs here must match
+    #       get_centroid_weighted_kernel
+    kernel(*inputs, *outputs, size=max_label)
+    if props_dict is not None:
+        if compute_local:
+            props_dict["centroid_weighted_local"] = centroid_local
+        if compute_global:
+            props_dict["centroid_weighted"] = centroid_global
+    if compute_global and compute_local:
+        return centroid_global, compute_local
+    elif compute_global:
+        return centroid_global
+    return centroid_local
 
 
 def _reverse_label_values(label_image, max_label):
@@ -3377,3 +3601,39 @@ def regionprops_euler(
             )
             euler_number[lab - 1] = euler_num[0]
     return euler_number
+
+
+# Currently unused utilities
+# Some properties can be computed faster using raveled labels and/or
+# intensity_image.
+
+
+def _get_min_integer_dtype(max_size, signed=False):
+    # negate to get a signed integer type, but need to also subtract 1, due
+    # to asymmetric range on positive side, e.g. we want
+    #    max_sz = 127 -> int8  (signed)   uint8 (unsigned)
+    #    max_sz = 128 -> int16 (signed)   uint8 (unsigned)
+    func = cp.min_scalar_type
+    return func(-max_size - 1) if signed else func(max_size)
+
+
+def get_compressed_labels(
+    labels, max_label, intensity_image=None, sort_labels=True
+):
+    label_dtype = _get_min_integer_dtype(max_label, signed=False)
+    if labels.dtype != label_dtype:
+        labels = labels.astype(dtype=label_dtype)
+    coords_dtype = _get_min_integer_dtype(max(labels.shape), signed=False)
+    label_coords = cp.where(labels)
+    if label_coords[0].dtype != coords_dtype:
+        label_coords = tuple(c.astype(coords_dtype) for c in label_coords)
+    labels1d = labels[label_coords]
+    if sort_labels:
+        sort_indices = cp.argsort(labels1d)
+        label_coords = tuple(c[sort_indices] for c in label_coords)
+        labels1d = labels1d[sort_indices]
+    if intensity_image:
+        img1d = intensity_image[label_coords]
+        return label_coords, labels1d, img1d
+    # max_label = int(labels1d[-1])
+    return label_coords, labels1d
