@@ -622,7 +622,6 @@ def test_inertia_tensor(
     ndim = len(shape)
     labels = get_labels_nd(shape, blob_size_fraction=blob_size_fraction)
     max_label = int(cp.max(labels))
-    print(f"\n{max_label=}")
     if spacing is not None:
         # omit 3rd element for 2d images
         spacing = spacing[:ndim]

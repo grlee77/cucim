@@ -42,6 +42,44 @@ __all__ = [
 ]
 
 
+def _unravel_loop_index_declarations(var_name, ndim, uint_t="unsigned int"):
+    code = f"""
+        // variables for unraveling a linear index to a coordinate array
+        {uint_t} in_coord[{ndim}];
+        {uint_t} temp_floor;"""
+    for d in range(ndim):
+        code += f"""
+        {uint_t} dim{d}_size = {var_name}.shape()[{d}];"""
+    return code
+
+
+def _unravel_loop_index(
+    var_name,
+    ndim,
+    uint_t="unsigned int",
+    raveled_index="i",
+    omit_declarations=False,
+):
+    """
+    declare a multi-index array in_coord and unravel the 1D index, i into it.
+    This code assumes that the array is a C-ordered array.
+    """
+    code = (
+        ""
+        if omit_declarations
+        else _unravel_loop_index_declarations(var_name, ndim, uint_t)
+    )
+    code += f"{uint_t} temp_idx = {raveled_index};"
+    for d in range(ndim - 1, 0, -1):
+        code += f"""
+        temp_floor = temp_idx / dim{d}_size;
+        in_coord[{d}] = temp_idx - temp_floor * dim{d}_size;
+        temp_idx = temp_floor;"""
+    code += """
+        in_coord[0] = temp_idx;"""
+    return code
+
+
 def _get_bbox_code(uint_t, ndim, array_size):
     """
     Notes
@@ -633,6 +671,340 @@ def get_intensity_measure_kernel(
     )
 
 
+def _get_raw_moments_code(
+    coord_c_type,
+    moments_c_type,
+    ndim,
+    order,
+    array_size,
+    num_channels=1,
+    has_spacing=False,
+    has_weights=False,
+):
+    """
+    Notes
+    -----
+    Local variables created:
+
+        - local_moments : shape (array_size, num_channels, num_moments)
+            local set of moments up to the specified order (1-3 supported)
+
+    Output variables written to:
+
+        - moments : shape (max_label, num_channels, num_moments)
+    """
+
+    # number is for a densely populated moments matrix of size (order + 1) per
+    # side (values at locations where order is greater than specified will be 0)
+    num_moments = (order + 1) ** ndim
+
+    if order > 3:
+        raise ValueError("Only moments of orders 0-3 are supported")
+
+    use_floating_point = moments_c_type in ["float", "double"]
+
+    source_pre = f"""
+    {moments_c_type} local_moments[{array_size*num_channels*num_moments}] = {{0}};
+    {coord_c_type} m_offset = 0;
+    {coord_c_type} local_off = 0;\n"""  # noqa: E501
+    if has_weights:
+        source_pre += f"""
+    {moments_c_type} w = 0.0;\n"""
+
+    # op uses external coordinate array variables:
+    #    bbox : bounding box coordinates, shape (max_label, 2*ndim)
+    #    in_coord[0]...in_coord[ndim - 1] : coordinates
+    #        coordinates in the labeled image at the current index
+    #    ii : index into labels array
+    #    current_label : value of the label image at location ii
+    #    spacing (optional) : pixel spacings
+    #    img (optional) : intensity image
+    source_operation = ""
+    # using bounding box to transform the global coordinates to local ones
+    # (c0 = local coordinate on axis 0, etc.)
+    for d in range(ndim):
+        source_operation += f"""
+                {moments_c_type} c{d} = in_coord[{d}]
+                            - bbox[(current_label - 1) * {2 * ndim} + {2*d}];"""
+        if has_spacing:
+            source_operation += f"""
+                c{d} *= spacing[{d}];"""
+
+    # need additional multiplication by the intensity value for weighted case
+    w = "w * " if has_weights else ""
+    for c in range(num_channels):
+        source_operation += f"""
+                local_off = {num_moments*num_channels}*offset + {c * num_moments};\n"""  # noqa: E501
+
+        # zeroth moment
+        if has_weights:
+            source_operation += f"""
+                w = static_cast<{moments_c_type}>(img[{num_channels} * ii + {c}]);
+                local_moments[local_off] += w;\n"""  # noqa: E501
+        elif use_floating_point:
+            source_operation += """
+                local_moments[local_off] += 1.0;\n"""
+        else:
+            source_operation += """
+                local_moments[local_off] += 1;\n"""
+
+        # moments for order 1-3
+        if ndim == 2:
+            if order == 1:
+                source_operation += f"""
+                local_moments[local_off + 1] += {w}c1;
+                local_moments[local_off + 2] += {w}c0;\n"""
+            elif order == 2:
+                source_operation += f"""
+                local_moments[local_off + 1] += {w}c1;
+                local_moments[local_off + 2] += {w}c1 * c1;
+                local_moments[local_off + 3] += {w}c0;
+                local_moments[local_off + 4] += {w}c0 * c1;
+                local_moments[local_off + 6] += {w}c0 * c0;\n"""
+            elif order == 3:
+                source_operation += f"""
+                local_moments[local_off + 1] += {w}c1;
+                local_moments[local_off + 2] += {w}c1 * c1;
+                local_moments[local_off + 3] += {w}c1 * c1 * c1;
+                local_moments[local_off + 4] += {w}c0;
+                local_moments[local_off + 5] += {w}c0 * c1;
+                local_moments[local_off + 6] += {w}c0 * c1 * c1;
+                local_moments[local_off + 8] += {w}c0 * c0;
+                local_moments[local_off + 9] += {w}c0 * c0 * c1;
+                local_moments[local_off + 12] += {w}c0 * c0 * c0;\n"""
+        elif ndim == 3:
+            if order == 1:
+                source_operation += f"""
+                local_moments[local_off + 1] += {w}c2;
+                local_moments[local_off + 2] += {w}c1;
+                local_moments[local_off + 4] += {w}c0;\n"""
+            elif order == 2:
+                source_operation += f"""
+                local_moments[local_off + 1] += {w}c2;
+                local_moments[local_off + 2] += {w}c2 * c2;
+                local_moments[local_off + 3] += {w}c1;
+                local_moments[local_off + 4] += {w}c1 * c2;
+                local_moments[local_off + 6] += {w}c1 * c1;
+                local_moments[local_off + 9] += {w}c0;
+                local_moments[local_off + 10] += {w}c0 * c2;
+                local_moments[local_off + 12] += {w}c0 * c1;
+                local_moments[local_off + 18] += {w}c0 * c0;\n"""
+            elif order == 3:
+                source_operation += f"""
+                local_moments[local_off + 1] += {w}c2;
+                local_moments[local_off + 2] += {w}c2 * c2;
+                local_moments[local_off + 3] += {w}c2 * c2 * c2;
+                local_moments[local_off + 4] += {w}c1;
+                local_moments[local_off + 5] += {w}c1 * c2;
+                local_moments[local_off + 6] += {w}c1 * c2 * c2;
+                local_moments[local_off + 8] += {w}c1 * c1;
+                local_moments[local_off + 9] += {w}c1 * c1 * c2;
+                local_moments[local_off + 12] += {w}c1 * c1 * c1;
+                local_moments[local_off + 16] += {w}c0;
+                local_moments[local_off + 17] += {w}c0 * c2;
+                local_moments[local_off + 18] += {w}c0 * c2 * c2;
+                local_moments[local_off + 20] += {w}c0 * c1;
+                local_moments[local_off + 21] += {w}c0 * c1 * c2;
+                local_moments[local_off + 24] += {w}c0 * c1 * c1;
+                local_moments[local_off + 32] += {w}c0 * c0;
+                local_moments[local_off + 33] += {w}c0 * c0 * c2;
+                local_moments[local_off + 36] += {w}c0 * c0 * c1;
+                local_moments[local_off + 48] += {w}c0 * c0 * c0;\n"""
+        else:
+            raise ValueError("only ndim = 2 or 3 is supported")
+
+    # post_operation uses external variables:
+    #     ii : index into num_pixels array
+    #     lab : label value that corresponds to location ii
+    #     coord_sums : output with shape (max_label, ndim)
+    source_post = ""
+    for c in range(0, num_channels):
+        source_post += f"""
+                // moments outputs
+                m_offset = {num_moments*num_channels}*(lab - 1) + {c * num_moments};
+                local_off = {num_moments*num_channels}*ii + {c * num_moments};
+                atomicAdd(&moments[m_offset], local_moments[local_off]);\n"""  # noqa: E501
+
+        if ndim == 2:
+            if order == 1:
+                source_post += """
+                atomicAdd(&moments[m_offset + 1], local_moments[local_off + 1]);
+                atomicAdd(&moments[m_offset + 2], local_moments[local_off + 2]);\n"""  # noqa: E501
+            elif order == 2:
+                source_post += """
+                atomicAdd(&moments[m_offset + 1], local_moments[local_off + 1]);
+                atomicAdd(&moments[m_offset + 2], local_moments[local_off + 2]);
+                atomicAdd(&moments[m_offset + 3], local_moments[local_off + 3]);
+                atomicAdd(&moments[m_offset + 4], local_moments[local_off + 4]);
+                atomicAdd(&moments[m_offset + 6], local_moments[local_off + 6]);\n"""  # noqa: E501
+            elif order == 3:
+                source_post += """
+                atomicAdd(&moments[m_offset + 1], local_moments[local_off + 1]);
+                atomicAdd(&moments[m_offset + 2], local_moments[local_off + 2]);
+                atomicAdd(&moments[m_offset + 3], local_moments[local_off + 3]);
+                atomicAdd(&moments[m_offset + 4], local_moments[local_off + 4]);
+                atomicAdd(&moments[m_offset + 5], local_moments[local_off + 5]);
+                atomicAdd(&moments[m_offset + 6], local_moments[local_off + 6]);
+                atomicAdd(&moments[m_offset + 8], local_moments[local_off + 8]);
+                atomicAdd(&moments[m_offset + 9], local_moments[local_off + 9]);
+                atomicAdd(&moments[m_offset + 12], local_moments[local_off + 12]);\n"""  # noqa: E501
+        elif ndim == 3:
+            if order == 1:
+                source_post += """
+                atomicAdd(&moments[m_offset + 1], local_moments[local_off + 1]);
+                atomicAdd(&moments[m_offset + 2], local_moments[local_off + 2]);
+                atomicAdd(&moments[m_offset + 4], local_moments[local_off + 4]);\n"""  # noqa: E501
+            elif order == 2:
+                source_post += """
+                atomicAdd(&moments[m_offset + 1], local_moments[local_off + 1]);
+                atomicAdd(&moments[m_offset + 2], local_moments[local_off + 2]);
+                atomicAdd(&moments[m_offset + 3], local_moments[local_off + 3]);
+                atomicAdd(&moments[m_offset + 4], local_moments[local_off + 4]);
+                atomicAdd(&moments[m_offset + 6], local_moments[local_off + 6]);
+                atomicAdd(&moments[m_offset + 9], local_moments[local_off + 9]);
+                atomicAdd(&moments[m_offset + 10], local_moments[local_off + 10]);
+                atomicAdd(&moments[m_offset + 12], local_moments[local_off + 12]);
+                atomicAdd(&moments[m_offset + 18], local_moments[local_off + 18]);\n"""  # noqa: E501
+            elif order == 3:
+                source_post += """
+                atomicAdd(&moments[m_offset + 1], local_moments[local_off + 1]);
+                atomicAdd(&moments[m_offset + 2], local_moments[local_off + 2]);
+                atomicAdd(&moments[m_offset + 3], local_moments[local_off + 3]);
+                atomicAdd(&moments[m_offset + 4], local_moments[local_off + 4]);
+                atomicAdd(&moments[m_offset + 5], local_moments[local_off + 5]);
+                atomicAdd(&moments[m_offset + 6], local_moments[local_off + 6]);
+                atomicAdd(&moments[m_offset + 8], local_moments[local_off + 8]);
+                atomicAdd(&moments[m_offset + 9], local_moments[local_off + 9]);
+                atomicAdd(&moments[m_offset + 12], local_moments[local_off + 12]);
+                atomicAdd(&moments[m_offset + 16], local_moments[local_off + 16]);
+                atomicAdd(&moments[m_offset + 17], local_moments[local_off + 17]);
+                atomicAdd(&moments[m_offset + 18], local_moments[local_off + 18]);
+                atomicAdd(&moments[m_offset + 20], local_moments[local_off + 20]);
+                atomicAdd(&moments[m_offset + 21], local_moments[local_off + 21]);
+                atomicAdd(&moments[m_offset + 24], local_moments[local_off + 24]);
+                atomicAdd(&moments[m_offset + 32], local_moments[local_off + 32]);
+                atomicAdd(&moments[m_offset + 33], local_moments[local_off + 33]);
+                atomicAdd(&moments[m_offset + 36], local_moments[local_off + 36]);
+                atomicAdd(&moments[m_offset + 48], local_moments[local_off + 48]);\n"""  # noqa: E501
+    return source_pre, source_operation, source_post
+
+
+@cp.memoize(for_each_device=True)
+def get_raw_moments_kernel(
+    ndim,
+    order,
+    moments_dtype=cp.float64,
+    int32_coords=True,
+    spacing=None,
+    weighted=False,
+    num_channels=1,
+    pixels_per_thread=8,
+):
+    moments_dtype = cp.dtype(moments_dtype)
+    if pixels_per_thread < 10:
+        array_size = pixels_per_thread
+    else:
+        # highly unlikely for array to repeatedly swap labels at every pixel,
+        # so use a smaller size
+        array_size = pixels_per_thread // 2
+
+    coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
+    if coord_dtype.itemsize <= 4:
+        coord_c_type = "unsigned int"
+    else:
+        coord_c_type = "unsigned long long"
+
+    use_floating_point = moments_dtype.kind == "f"
+    has_spacing = spacing is not None
+    if (weighted or has_spacing) and not use_floating_point:
+        raise ValueError(
+            "`moments_dtype` must be a floating point type for weighted "
+            "moments calculations or moment calculations using spacing."
+        )
+    moments_c_type = "double" if use_floating_point else "unsigned long long"
+    if spacing is not None:
+        if len(spacing) != ndim:
+            raise ValueError("len(spacing) must equal len(shape)")
+        if moments_dtype.kind != "f":
+            raise ValueError("moments must have a floating point data type")
+
+    moments_pre, moments_op, moments_post = _get_raw_moments_code(
+        coord_c_type=coord_c_type,
+        moments_c_type=moments_c_type,
+        ndim=ndim,
+        order=order,
+        array_size=array_size,
+        has_weights=weighted,
+        has_spacing=spacing is not None,
+        num_channels=num_channels,
+    )
+
+    # store only counts for label > 0  (label = 0 is the background)
+    source = f"""
+      uint64_t start_index = {pixels_per_thread}*i;
+    """
+    source += moments_pre
+
+    inner_op = ""
+
+    source += _unravel_loop_index_declarations(
+        "labels", ndim, uint_t=coord_c_type
+    )
+
+    inner_op += _unravel_loop_index(
+        "labels",
+        ndim=ndim,
+        uint_t=coord_c_type,
+        raveled_index="ii",
+        omit_declarations=True,
+    )
+    inner_op += moments_op
+
+    source += f"""
+      X encountered_labels[{array_size}] = {{0}};
+      X current_label;
+      X prev_label = labels[start_index];
+      int offset = 0;
+      encountered_labels[0] = prev_label;
+      uint64_t ii_max = min(start_index + {pixels_per_thread}, labels_size);
+      for (uint64_t ii = start_index; ii < ii_max; ii++) {{
+        current_label = labels[ii];
+        if (current_label == 0) {{ continue; }}
+        if (current_label != prev_label) {{
+            offset += 1;
+            prev_label = current_label;
+            encountered_labels[offset] = current_label;
+        }}
+        {inner_op}
+      }}"""
+    source += """
+      for (size_t ii = 0; ii <= offset; ii++) {
+        X lab = encountered_labels[ii];
+        if (lab != 0) {"""
+
+    source += moments_post
+    source += """
+        }
+      }\n"""
+
+    # print(source)
+    inputs = (
+        f"raw X labels, raw uint64 labels_size, raw {coord_dtype.name} bbox"
+    )
+    if spacing:
+        inputs += ", raw float64 spacing"
+    if weighted:
+        inputs += ", raw Y img"
+    outputs = f"raw {moments_dtype.name} moments"
+    weighted_str = "_weighted" if weighted else ""
+    spacing_str = "_sp" if spacing else ""
+    name = f"cucim_moments{weighted_str}{spacing_str}_order{order}_{ndim}d"
+    name += f"_{coord_dtype.char}_{moments_dtype.char}_batch{pixels_per_thread}"
+    return cp.ElementwiseKernel(
+        inputs, outputs, source, preamble=_includes, name=name
+    )
+
+
 def _get_count_dtype(label_image_size):
     """atomicAdd only supports int32, uint32, int64, uint64, float32, float64"""
     int32_count = label_image_size < 2**32
@@ -970,44 +1342,6 @@ def regionprops_intensity_max(
     )
 
 
-def _unravel_loop_index_declarations(var_name, ndim, uint_t="unsigned int"):
-    code = f"""
-        // variables for unraveling a linear index to a coordinate array
-        {uint_t} in_coord[{ndim}];
-        {uint_t} temp_floor;"""
-    for d in range(ndim):
-        code += f"""
-        {uint_t} dim{d}_size = {var_name}.shape()[{d}];"""
-    return code
-
-
-def _unravel_loop_index(
-    var_name,
-    ndim,
-    uint_t="unsigned int",
-    raveled_index="i",
-    omit_declarations=False,
-):
-    """
-    declare a multi-index array in_coord and unravel the 1D index, i into it.
-    This code assumes that the array is a C-ordered array.
-    """
-    code = (
-        ""
-        if omit_declarations
-        else _unravel_loop_index_declarations(var_name, ndim, uint_t)
-    )
-    code += f"{uint_t} temp_idx = {raveled_index};"
-    for d in range(ndim - 1, 0, -1):
-        code += f"""
-        temp_floor = temp_idx / dim{d}_size;
-        in_coord[{d}] = temp_idx - temp_floor * dim{d}_size;
-        temp_idx = temp_floor;"""
-    code += """
-        in_coord[0] = temp_idx;"""
-    return code
-
-
 def regionprops_bbox_coords(
     label_image,
     max_label=None,
@@ -1335,170 +1669,6 @@ def area_bbox_from_slices(slices, area_dtype=cp.float32, spacing=None):
     return cp.asarray(area_bbox)
 
 
-@cp.memoize(for_each_device=True)
-def get_moments_kernel(
-    coord_dtype,
-    moments_dtype,
-    ndim,
-    order,
-    spacing=None,
-    weighted=False,
-    num_channels=1,
-):
-    # note: ndim here is the number of spatial image dimensions
-
-    coord_dtype = cp.dtype(coord_dtype)
-    moments_dtype = cp.dtype(moments_dtype)
-
-    use_floating_point = moments_dtype.kind == "f"
-    if weighted and not use_floating_point:
-        raise ValueError(
-            "`moments_dtype` must be a floating point type for weighted "
-            "moments calculations."
-        )
-    uint_t = (
-        "unsigned int" if coord_dtype.itemsize <= 4 else "unsigned long long"
-    )
-    c_type = "double" if use_floating_point else f"{uint_t}"
-
-    if spacing is not None:
-        if len(spacing) != ndim:
-            raise ValueError("len(spacing) must equal len(shape)")
-        if moments_dtype.kind != "f":
-            raise ValueError("moments must have a floating point data type")
-
-    # number is for a densely populated moments matrix of size (order + 1) per
-    # side (values at locations where order is greater than specified will be 0)
-    num_moments = (order + 1) ** ndim
-
-    source = """
-        auto L = label[i];
-        if (L != 0) {"""
-    source += _unravel_loop_index("label", ndim, uint_t=uint_t)
-    # using bounding box to transform the global coordinates to local ones
-    # (c0 = local coordinate on axis 0, etc.)
-    for d in range(ndim):
-        source += f"""
-            {c_type} c{d} = in_coord[{d}]
-                            - bbox[(L - 1) * {2 * ndim} + {2*d}];"""
-        if spacing:
-            source += f"""
-            c{d} *= spacing[{d}];"""
-    if order > 3:
-        raise ValueError("Only moments of orders 0-3 are supported")
-
-    if num_channels > 1:
-        # insert a loop over channels in multichannel case
-        source += f"""
-            {uint_t} num_channels = moments.shape()[1];
-            for ({uint_t} c = 0; c < num_channels; c++) {{\n"""
-    else:
-        source += f"""
-            {uint_t} num_channels = 1;
-            {uint_t} c = 0;\n"""
-    source += f"""
-            {uint_t} offset = (L - 1) * {num_moments} * num_channels
-                              + c * {num_moments};\n"""
-
-    if weighted:
-        source += f"""
-            {uint_t} img_offset = i * num_channels + c;
-            auto w = static_cast<{c_type}>(img[img_offset]);
-            atomicAdd(&moments[offset], w);\n"""
-    else:
-        if use_floating_point:
-            source += """
-            atomicAdd(&moments[offset], 1.0);\n"""
-        else:
-            source += """
-            atomicAdd(&moments[offset], 1);\n"""
-
-    # need additional multiplication by the intensity value for weighted case
-    w = "w * " if weighted else ""
-    if ndim == 2:
-        if order == 1:
-            source += f"""
-            atomicAdd(&moments[offset + 1], {w}c1);
-            atomicAdd(&moments[offset + 2], {w}c0);\n"""
-        elif order == 2:
-            source += f"""
-            atomicAdd(&moments[offset + 1], {w}c1);
-            atomicAdd(&moments[offset + 2], {w}c1 * c1);
-            atomicAdd(&moments[offset + 3], {w}c0);
-            atomicAdd(&moments[offset + 4], {w}c0 * c1);
-            atomicAdd(&moments[offset + 6], {w}c0 * c0);\n"""
-        elif order == 3:
-            source += f"""
-            atomicAdd(&moments[offset + 1], {w}c1);
-            atomicAdd(&moments[offset + 2], {w}c1 * c1);
-            atomicAdd(&moments[offset + 3], {w}c1 * c1 * c1);
-            atomicAdd(&moments[offset + 4], {w}c0);
-            atomicAdd(&moments[offset + 5], {w}c0 * c1);
-            atomicAdd(&moments[offset + 6], {w}c0 * c1 * c1);
-            atomicAdd(&moments[offset + 8], {w}c0 * c0);
-            atomicAdd(&moments[offset + 9], {w}c0 * c0 * c1);
-            atomicAdd(&moments[offset + 12], {w}c0 * c0 * c0);\n"""
-    elif ndim == 3:
-        if order == 1:
-            source += f"""
-            atomicAdd(&moments[offset + 1], {w}c2);
-            atomicAdd(&moments[offset + 2], {w}c1);
-            atomicAdd(&moments[offset + 4], {w}c0);\n"""
-        elif order == 2:
-            source += f"""
-            atomicAdd(&moments[offset + 1], {w}c2);
-            atomicAdd(&moments[offset + 2], {w}c2 * c2);
-            atomicAdd(&moments[offset + 3], {w}c1);
-            atomicAdd(&moments[offset + 4], {w}c1 * c2);
-            atomicAdd(&moments[offset + 6], {w}c1 * c1);
-            atomicAdd(&moments[offset + 9], {w}c0);
-            atomicAdd(&moments[offset + 10], {w}c0 * c2);
-            atomicAdd(&moments[offset + 12], {w}c0 * c1);
-            atomicAdd(&moments[offset + 18], {w}c0 * c0);\n"""
-        elif order == 3:
-            source += f"""
-            atomicAdd(&moments[offset + 1], {w}c2);
-            atomicAdd(&moments[offset + 2], {w}c2 * c2);
-            atomicAdd(&moments[offset + 3], {w}c2 * c2 * c2);
-            atomicAdd(&moments[offset + 4], {w}c1);
-            atomicAdd(&moments[offset + 5], {w}c1 * c2);
-            atomicAdd(&moments[offset + 6], {w}c1 * c2 * c2);
-            atomicAdd(&moments[offset + 8], {w}c1 * c1);
-            atomicAdd(&moments[offset + 9], {w}c1 * c1 * c2);
-            atomicAdd(&moments[offset + 12], {w}c1 * c1 * c1);
-            atomicAdd(&moments[offset + 16], {w}c0);
-            atomicAdd(&moments[offset + 17], {w}c0 * c2);
-            atomicAdd(&moments[offset + 18], {w}c0 * c2 * c2);
-            atomicAdd(&moments[offset + 20], {w}c0 * c1);
-            atomicAdd(&moments[offset + 21], {w}c0 * c1 * c2);
-            atomicAdd(&moments[offset + 24], {w}c0 * c1 * c1);
-            atomicAdd(&moments[offset + 32], {w}c0 * c0);
-            atomicAdd(&moments[offset + 33], {w}c0 * c0 * c2);
-            atomicAdd(&moments[offset + 36], {w}c0 * c0 * c1);
-            atomicAdd(&moments[offset + 48], {w}c0 * c0 * c0);\n"""
-    else:
-        raise ValueError("only ndim = 2 or 3 is supported")
-    if num_channels > 1:
-        source += """
-            }  // channels loop"
-        """
-    source += """
-        }\n"""
-    inputs = f"raw X label, raw {coord_dtype.name} bbox"
-    if spacing:
-        inputs += ", raw float64 spacing"
-    if weighted:
-        inputs += ", raw Y img"
-    outputs = f"raw {moments_dtype.name} moments"
-    weighted_str = "_weighted" if weighted else ""
-    spacing_str = "_sp" if spacing else ""
-    name = f"cucim_moments{weighted_str}{spacing_str}_order{order}_{ndim}d_"
-    name += f"{coord_dtype.name}_{moments_dtype.name}"
-    return cp.ElementwiseKernel(
-        inputs, outputs, source, preamble=_includes, name=name
-    )
-
-
 def regionprops_moments(
     label_image,
     intensity_image=None,
@@ -1506,7 +1676,7 @@ def regionprops_moments(
     order=2,
     spacing=None,
     coord_dtype=cp.uint32,
-    pixels_per_thread=16,
+    pixels_per_thread=10,
 ):
     """
     Parameters
@@ -1612,24 +1782,27 @@ def regionprops_moments(
 
     # total number of elements in the moments matrix
     moments = cp.zeros(moments_shape, dtype=cp.float64)
-    moments_kernel = get_moments_kernel(
-        coord_dtype,
-        moments.dtype,
-        label_image.ndim,
+    moments_kernel = get_raw_moments_kernel(
+        ndim=label_image.ndim,
         order=order,
+        moments_dtype=moments.dtype,
+        int32_coords=int32_coords,
         spacing=spacing,
         weighted=weighted,
         num_channels=num_channels,
+        pixels_per_thread=pixels_per_thread,
     )
     input_args = (
         label_image,
+        label_image.size,
         bbox_coords,
     )
     if spacing:
         input_args = input_args + (cp.asarray(spacing, dtype=cp.float64),)
     if weighted:
         input_args = input_args + (intensity_image,)
-    moments_kernel(*input_args, moments, size=label_image.size)
+    size = math.ceil(label_image.size / pixels_per_thread)
+    moments_kernel(*input_args, moments, size=size)
     return moments
 
 
