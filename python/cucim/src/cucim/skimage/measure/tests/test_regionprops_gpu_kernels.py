@@ -308,16 +308,11 @@ def test_centroid(precompute_max, local, ndim):
     max_label = int(cp.max(labels)) if precompute_max else None
     if local:
         name = "centroid_local"
-        counts, centroid = regionprops_centroid_local(
-            labels, max_label=max_label
-        )
+        centroid = regionprops_centroid_local(labels, max_label=max_label)
     else:
         name = "centroid"
-        counts, centroid = regionprops_centroid(labels, max_label=max_label)
-    expected = measure.regionprops_table(
-        labels, properties=["num_pixels", name]
-    )
-    assert_array_equal(counts, expected["num_pixels"])
+        centroid = regionprops_centroid(labels, max_label=max_label)
+    expected = measure.regionprops_table(labels, properties=[name])
     assert_allclose(centroid[:, 0], expected[name + "-0"])
     if ndim > 1:
         assert_allclose(centroid[:, 1], expected[name + "-1"])
@@ -776,8 +771,14 @@ def test_centroid_weighted(
         bbox, _ = regionprops_bbox_coords(
             labels, max_label=max_label, return_slices=False
         )
+
     centroids = regionprops_centroid_weighted(
-        moments_raw, ndim=ndim, bbox=bbox, local=local, spacing=spacing
+        moments_raw,
+        ndim=ndim,
+        bbox=bbox,
+        compute_local=local,
+        compute_global=not local,
+        spacing=spacing,
     )
     assert centroids.shape[-1] == ndim
 
