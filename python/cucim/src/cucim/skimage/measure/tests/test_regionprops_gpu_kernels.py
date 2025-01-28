@@ -26,9 +26,8 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_extent,
     regionprops_inertia_tensor,
     regionprops_inertia_tensor_eigvals,
-    regionprops_intensity_max,
     regionprops_intensity_mean,
-    regionprops_intensity_min,
+    regionprops_intensity_min_max,
     regionprops_intensity_std,
     regionprops_moments,
     regionprops_moments_central,
@@ -230,12 +229,16 @@ def test_intensity_min_and_max(
 
     max_label = int(cp.max(labels)) if precompute_max else None
 
-    func = (
-        regionprops_intensity_min
-        if op_name == "intensity_min"
-        else regionprops_intensity_max
+    compute_min = op_name == "intensity_min"
+    compute_max = not compute_min
+
+    values = regionprops_intensity_min_max(
+        labels,
+        intensity_image,
+        max_label=max_label,
+        compute_min=compute_min,
+        compute_max=compute_max,
     )
-    values = func(labels, intensity_image, max_label=max_label)
     expected = measure.regionprops_table(
         labels, intensity_image=intensity_image, properties=[op_name]
     )
