@@ -25,6 +25,7 @@ __all__ = [
     "regionprops_bbox_coords",
     "regionprops_centroid",
     "regionprops_centroid_local",
+    "regionprops_centroid_weighted",
     "regionprops_euler",
     "regionprops_inertia_tensor",
     "regionprops_inertia_tensor_eigvals",
@@ -170,14 +171,12 @@ def _get_coord_sums_code(coord_sum_ctype, ndim, array_size):
     -----
     Local variables created:
 
-        - bbox_min : shape (array_size, ndim)
-            local minimum coordinates across the local set of labels encountered
-        - bbox_max : shape (array_size, ndim)
-            local maximum coordinates across the local set of labels encountered
+        - coord_sum : shape (array_size, ndim)
+            local sum of coordinates across the local set of labels encountered
 
     Output variables written to:
 
-        - bbox : shape (max_label, 2 * ndim)
+        - coord_sums : shape (max_label, 2 * ndim)
     """
 
     source_pre = f"""
@@ -259,7 +258,7 @@ def get_bbox_coords_kernel(
         source += coord_sums_pre
 
     inner_op = ""
-    if compute_bbox:
+    if compute_bbox or compute_coordinate_sums:
         source += _unravel_loop_index_declarations(
             "labels", ndim, uint_t=uint_t
         )
@@ -271,6 +270,7 @@ def get_bbox_coords_kernel(
             raveled_index="ii",
             omit_declarations=True,
         )
+    if compute_bbox:
         inner_op += bbox_op
     if compute_num_pixels:
         inner_op += count_op
@@ -1058,15 +1058,18 @@ def regionprops_area(
     # integer atomicAdd is faster than floating point so better to convert
     # after counting
     if props_dict is not None and "num_pixels" in props_dict:
-        area = props_dict["num_pixels"]
+        num_pixels = props_dict["num_pixels"]
     else:
-        area = regionprops_num_pixels(
+        num_pixels = regionprops_num_pixels(
             label_image,
             max_label=max_label,
             pixels_per_thread=pixels_per_thread,
             max_labels_per_thread=max_labels_per_thread,
         )
-    area = area.astype(dtype)
+        if props_dict is not None:
+            props_dict["num_pixels"] = num_pixels
+
+    area = num_pixels.astype(dtype)
     if spacing is not None:
         if isinstance(spacing, cp.ndarray):
             pixel_area = cp.product(spacing)
@@ -1547,7 +1550,6 @@ def regionprops_centroid(
     ndim = label_image.ndim
 
     int32_coords = max(label_image.shape) < 2**32
-    coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
     if props_dict is not None and "num_pixels" in props_dict:
         centroid_counts = props_dict["num_pixels"]
         if centroid_counts.dtype != cp.uint32:
@@ -1560,27 +1562,28 @@ def regionprops_centroid(
     bbox_coords_kernel = get_bbox_coords_kernel(
         ndim=label_image.ndim,
         int32_coords=int32_coords,
+        compute_bbox=False,
         compute_num_pixels=compute_num_pixels,
         compute_coordinate_sums=True,
         pixels_per_thread=pixels_per_thread,
         max_labels_per_thread=max_labels_per_thread,
     )
 
-    bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
+    # bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
     centroid_sums = cp.zeros((max_label, ndim), dtype=cp.uint64)
 
-    # Initialize value for atomicMin on even coordinates
-    # The value for atomicMax columns is already 0 as desired.
-    bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+    # # Initialize value for atomicMin on even coordinates
+    # # The value for atomicMax columns is already 0 as desired.
+    # bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
 
     # make a copy if the inputs are not already C-contiguous
     if not label_image.flags.c_contiguous:
         label_image = cp.ascontiguousarray(label_image)
 
     if compute_num_pixels:
-        outputs = (bbox_coords, centroid_counts, centroid_sums)
+        outputs = (centroid_counts, centroid_sums)
     else:
-        outputs = (bbox_coords, centroid_sums)
+        outputs = centroid_sums
     bbox_coords_kernel(
         label_image,
         label_image.size,
@@ -1590,9 +1593,7 @@ def regionprops_centroid(
 
     centroid = centroid_sums / centroid_counts[:, cp.newaxis]
     if props_dict is not None:
-        props_dict["centroied"] = centroid
-        if "bbox" not in props_dict:
-            props_dict["bbox"] = bbox_coords
+        props_dict["centroid"] = centroid
         if "num_pixels" not in props_dict:
             props_dict["num_pixels"] = centroid_counts
     return centroid
@@ -1769,7 +1770,9 @@ def get_area_bbox_kernel(
     )
 
 
-def regionprops_area_bbox(bbox, area_dtype=cp.float32, spacing=None):
+def regionprops_area_bbox(
+    bbox, area_dtype=cp.float32, spacing=None, props_dict=None
+):
     num_label = bbox.shape[0]
     ndim = bbox.shape[1] // 2
 
@@ -1788,6 +1791,8 @@ def regionprops_area_bbox(bbox, area_dtype=cp.float32, spacing=None):
     kernel = get_area_bbox_kernel(bbox.dtype, area_dtype, ndim)
     area_bbox = cp.empty((num_label,), dtype=area_dtype)
     kernel(bbox, pixel_area, area_bbox)
+    if props_dict is not None:
+        props_dict["area_bbox"] = area_bbox
     return area_bbox
 
 
@@ -1817,7 +1822,6 @@ def regionprops_moments(
     max_label=None,
     order=2,
     spacing=None,
-    coord_dtype=cp.uint32,
     pixels_per_thread=10,
     max_labels_per_thread=None,
     props_dict=None,
@@ -1835,9 +1839,6 @@ def regionprops_moments(
     max_label : int or None, optional
         The maximum label value present in label_image. Will be computed if not
         provided.
-    coord_dtype : dtype, optional
-        The data type to use for coordinate calculations. Should be
-        ``cp.uint32`` or ``cp.uint64``.
 
     Returns
     -------
@@ -1887,13 +1888,12 @@ def regionprops_moments(
     ndim = label_image.ndim
 
     int32_coords = max(label_image.shape) < 2**32
+    coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
     if props_dict is not None and "bbox" in props_dict:
         bbox_coords = props_dict["bbox"]
         if bbox_coords.dtype != coord_dtype:
             bbox_coords = bbox_coords.astype(coord_dtype)
     else:
-        coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
-
         bbox_kernel = get_bbox_coords_kernel(
             ndim=ndim,
             int32_coords=int32_coords,
@@ -2659,7 +2659,10 @@ def regionprops_inertia_tensor(
 
 @cp.memoize(for_each_device=True)
 def get_spd_matrix_eigvals_kernel(
-    rank, compute_eigenvectors=False, compute_axis_lengths=False
+    rank,
+    compute_eigenvectors=False,
+    compute_axis_lengths=False,
+    compute_eccentricity=False,
 ):
     """Compute symmetric positive definite (SPD) matrix eigenvalues
 
@@ -2712,14 +2715,18 @@ def get_spd_matrix_eigvals_kernel(
             evecs[offset + 2] = 1.0;
             // second eigenvector
             evecs[offset + 1] = (lam1 - m11) / ev_denom;
-            evecs[offset + 3] = 1.0;
-            \n"""
+            evecs[offset + 3] = 1.0;\n"""
         if compute_axis_lengths:
             source += """
             axis_lengths[offset_out] = 4.0 * sqrt(lam1);
-            axis_lengths[offset_out + 1] = 4.0 * sqrt(lam2);
-            \n"""
+            axis_lengths[offset_out + 1] = 4.0 * sqrt(lam2);\n"""
+        if compute_eccentricity:
+            source += """
+            eccentricity[i] =  sqrt(1.0 - lam2 / lam1);\n"""
     elif rank == 3:
+        if compute_eccentricity:
+            raise ValueError("eccentricity only supported for 2D images")
+
         source += """
             double x1, x2, phi;
             // extract triangle of (spd) inertia tensor values
@@ -2833,8 +2840,7 @@ def get_spd_matrix_eigvals_kernel(
             m = (d * (c - lam3) - ef) / m_denom;
             evecs[offset + 2] = (lam3 - c - e * m) / f_denom;
             evecs[offset + 5] = m;
-            evecs[offset + 8] = 1.0;
-            \n"""
+            evecs[offset + 8] = 1.0;\n"""
         if compute_axis_lengths:
             source += """
             // formula reference:
@@ -2842,35 +2848,44 @@ def get_spd_matrix_eigvals_kernel(
             // note: added max to clip possible small (e.g. 1e-7) negative value due to numerical error
             axis_lengths[offset_out] = sqrt(10.0 * (lam1 + lam2 - lam3));
             axis_lengths[offset_out + 1] = sqrt(10.0 * (lam1 - lam2 + lam3));
-            axis_lengths[offset_out + 2] = sqrt(10.0 * max(-lam1 + lam2 + lam3, 0.0));
-            \n"""  # noqa: E501
+            axis_lengths[offset_out + 2] = sqrt(10.0 * max(-lam1 + lam2 + lam3, 0.0));\n"""  # noqa: E501
     else:
         # note: ndim here is the number of spatial image dimensions
         raise ValueError("only rank = 2 or 3 is supported")
     inputs = "raw F spd_matrix"
-    outputs = "raw F out"
+    outputs = ["raw F out"]
     if compute_eigenvectors:
-        outputs += ", raw F eigvecs"
+        outputs.append("raw F eigvecs")
         ev_str = "eigvecs_"
     else:
         ev_str = ""
     name = f"cucim_spd_matrix_eigvals_{ev_str}{rank}d"
     if compute_axis_lengths:
-        outputs += ", raw F axis_lengths"
+        outputs.append("raw F axis_lengths")
         name += "_with_axis"
+    if compute_eccentricity:
+        outputs.append("raw F eccentricity")
+        name += "_eccen"
+    outputs = ", ".join(outputs)
     return cp.ElementwiseKernel(
         inputs, outputs, source, preamble=_includes, name=name
     )
 
 
 def regionprops_inertia_tensor_eigvals(
-    inertia_tensor, compute_axis_lengths=False, props_dict=None
+    inertia_tensor,
+    compute_axis_lengths=False,
+    compute_eccentricity=False,
+    props_dict=None,
 ):
     # inertia tensor should have shape (ndim, ndim) on last two axes
     ndim = inertia_tensor.shape[-1]
     if ndim < 2 or ndim > 3:
         raise ValueError("inertia tensor only implemented for 2D and 3D images")
     nbatch = math.prod(inertia_tensor.shape[:-2])
+
+    if compute_eccentricity and ndim != 2:
+        raise ValueError("eccentricity is only supported for 2D images")
 
     if inertia_tensor.dtype.kind != "f":
         raise ValueError("moments_central must have a floating point dtype")
@@ -2882,18 +2897,31 @@ def regionprops_inertia_tensor_eigvals(
         rank=ndim,
         compute_axis_lengths=compute_axis_lengths,
         compute_eigenvectors=False,
+        compute_eccentricity=compute_eccentricity,
     )
     eigvals_shape = inertia_tensor.shape[:-2] + (ndim,)
     eigvals = cp.empty(eigvals_shape, dtype=inertia_tensor.dtype)
+    outputs = [eigvals]
     if compute_axis_lengths:
         axis_lengths = cp.empty(eigvals_shape, dtype=inertia_tensor.dtype)
-        kernel(inertia_tensor, eigvals, axis_lengths, size=nbatch)
-        return eigvals, axis_lengths
-    # kernel loops over moments so size is max_label * num_channels
-    kernel(inertia_tensor, eigvals, size=nbatch)
+        outputs.append(axis_lengths)
+    if compute_eccentricity:
+        eccentricity = cp.empty(
+            inertia_tensor.shape[:-2], dtype=inertia_tensor.dtype
+        )
+        outputs.append(eccentricity)
+    kernel(inertia_tensor, *outputs, size=nbatch)
     if props_dict is not None:
         props_dict["inertia_tensor_eigvals"] = eigvals
-    return eigvals
+        if compute_eccentricity:
+            props_dict["eccentricity"] = eccentricity
+        if compute_axis_lengths:
+            props_dict["axis_lengths"] = axis_lengths
+            props_dict["axis_length_major"] = axis_lengths[..., 0]
+            props_dict["axis_length_minor"] = axis_lengths[..., -1]
+    if len(outputs) == 1:
+        return outputs[0]
+    return tuple(outputs)
 
 
 @cp.memoize(for_each_device=True)
@@ -2983,6 +3011,7 @@ def regionprops_centroid_weighted(
     bbox=None,
     compute_local=True,
     compute_global=False,
+    weighted=True,
     spacing=None,
     props_dict=None,
 ):
@@ -3051,9 +3080,15 @@ def regionprops_centroid_weighted(
     kernel(*inputs, *outputs, size=max_label)
     if props_dict is not None:
         if compute_local:
-            props_dict["centroid_weighted_local"] = centroid_local
+            if weighted:
+                props_dict["centroid_weighted_local"] = centroid_local
+            else:
+                props_dict["centroid_local"] = centroid_local
         if compute_global:
-            props_dict["centroid_weighted"] = centroid_global
+            if weighted:
+                props_dict["centroid_weighted"] = centroid_global
+            else:
+                props_dict["centroid"] = centroid_global
     if compute_global and compute_local:
         return centroid_global, compute_local
     elif compute_global:
@@ -3084,7 +3119,12 @@ def _find_close_labels(labels, binary_image, max_label):
 
 
 def regionprops_perimeter(
-    labels, neighborhood=4, max_label=None, robust=True, labels_close=None
+    labels,
+    neighborhood=4,
+    max_label=None,
+    robust=True,
+    labels_close=None,
+    props_dict=None,
 ):
     """Calculate total perimeter of all objects in binary image.
 
@@ -3231,6 +3271,8 @@ def regionprops_perimeter(
                 ld == lab, max_label=1, neighborhood=neighborhood, robust=False
             )
             perimeters[lab - 1] = p[0]
+    if props_dict is not None:
+        props_dict["perimeter"] = perimeters
     return perimeters
 
 
@@ -3241,6 +3283,7 @@ def regionprops_perimeter_crofton(
     robust=True,
     omit_image_edges=False,
     labels_close=None,
+    props_dict=None,
 ):
     """Calculate total Crofton perimeter of all objects in binary image.
 
@@ -3400,11 +3443,18 @@ def regionprops_perimeter_crofton(
                 robust=False
             )
             perimeters[lab - 1] = p[0]
+    if props_dict is not None:
+        props_dict["perimeter_crofton"] = perimeters
     return perimeters
 
 
 def regionprops_euler(
-    labels, connectivity=None, max_label=None, robust=True, labels_close=None
+    labels,
+    connectivity=None,
+    max_label=None,
+    robust=True,
+    labels_close=None,
+    props_dict=None,
 ):
     """Calculate the Euler characteristic in binary image.
 
@@ -3600,6 +3650,8 @@ def regionprops_euler(
                 ld == lab, connectivity=connectivity, max_label=1, robust=False
             )
             euler_number[lab - 1] = euler_num[0]
+    if props_dict is not None:
+        props_dict["euler_number"] = euler_number
     return euler_number
 
 
@@ -3637,3 +3689,483 @@ def get_compressed_labels(
         return label_coords, labels1d, img1d
     # max_label = int(labels1d[-1])
     return label_coords, labels1d
+
+
+need_moments_order1 = {
+    "centroid",
+    "centroid_local",  # unless ndim > 3
+    "centroid_weighted",
+    "centroid_weighted_local",
+}
+need_moments_order2 = {
+    "axis_major_length",
+    "axis_minor_length",
+    "eccentricity",
+    "inertia_tensor",
+    "inertia_tensor_eigvals",
+    "moments",
+    "moments_central",
+    "moments_normalized",
+    "moments_weighted",
+    "moments_weighted_central",
+    "moments_weighted_normalized",
+    "orientation",
+}
+need_moments_order3 = {"moments_hu", "moments_weighted_hu"}
+
+requires = {}
+
+requires["inertia_tensor_eigvals"] = {
+    "eccentricity",
+    "inertia_tensor_eigvals",
+}
+requires["inertia_tensor"] = {
+    "inertia_tensor",
+    "inertia_tensor_eigvals",
+    "axis_major_length",
+    "axis_minor_length",
+    "inertia_tensor",
+    "orientation",
+} | requires["inertia_tensor_eigvals"]
+
+requires["moments_normalized"] = {
+    "moments_normalized",
+    "moments_hu",
+}
+
+requires["moments_central"] = (
+    {
+        "moments_central",
+    }
+    | requires["moments_normalized"]
+    | requires["inertia_tensor"]
+)
+
+requires["moments"] = {
+    "centroid",
+    "centroid_local",  # unless ndim > 3
+    "moments",
+} | requires["moments_central"]
+
+requires["moments_weighted_normalized"] = {
+    "moments_weighted_normalized",
+    "moments_weighted_hu",
+}
+
+requires["moments_weighted_central"] = {
+    "moments_weighted_central",
+} | requires["moments_weighted_normalized"]
+
+requires["moments_weighted"] = {
+    "centroid_weighted",
+    "centroid_weighted_local",
+    "moments_weighted",
+} | requires["moments_weighted_central"]
+
+# Technically don't need bbox for centroid and centroid_weighted if no other
+# moments are going to be computed, but probably best to just always compute
+# them via the moments
+requires["bbox"] = (
+    {
+        "bbox",
+        "area_bbox",
+        "slice",
+    }
+    | requires["moments"]
+    | requires["moments_weighted"]
+)
+
+requires["num_pixels"] = {
+    "area",
+    "intensity_mean",
+    "intensity_std",
+    "num_pixels",
+}
+
+ndim_2_only = {
+    "eccentricity",
+    "moments_hu",
+    "moments_weighted_hu",
+    "orientation",
+    "perimeter",
+    "perimeter_crofton",
+}
+
+need_intensity_image = {
+    "intensity_mean",
+    "intensity_std",
+    "intensity_max",
+    "intensity_min",
+}
+need_intensity_image = need_intensity_image | requires["moments_weighted"]
+
+
+def _check_moment_order(moment_order, requested_moment_props):
+    if moment_order is None:
+        if any(requested_moment_props | need_moments_order3):
+            order = 3
+        elif any(requested_moment_props | need_moments_order2):
+            order = 2
+        elif any(requested_moment_props | need_moments_order1):
+            order = 1
+        else:
+            raise ValueError(
+                "could not determine moment order from "
+                "{requested_moment_props}"
+            )
+    else:
+        # use user-provided moment_order
+        order = moment_order
+        if order < 3 and any(requested_moment_props | need_moments_order3):
+            raise ValueError(
+                f"can't compute {requested_moment_props} with " "moment_order<3"
+            )
+        if order < 2 and any(requested_moment_props | need_moments_order2):
+            raise ValueError(
+                f"can't compute {requested_moment_props} with " "moment_order<2"
+            )
+        if order < 1 and any(requested_moment_props | need_moments_order1):
+            raise ValueError(
+                f"can't compute {requested_moment_props} with " "moment_order<1"
+            )
+    return order
+
+
+def regionprops_dict(
+    label_image,
+    intensity_image=None,
+    spacing=None,
+    moment_order=None,
+    pixels_per_thread=32,
+    max_labels_per_thread=4,
+    properties=[],
+):
+    from cucim.skimage.measure._regionprops import PROPS
+
+    supported_properties = set(PROPS.values())
+    properties = set(properties)
+
+    valid_names = properties & supported_properties
+    invalid_names = set(properties) - valid_names
+    valid_names = list(valid_names)
+    for name in invalid_names:
+        if name in PROPS:
+            vname = PROPS[name]
+            if vname in valid_names:
+                raise ValueError(
+                    f"Property name: {name} is a duplicate of {vname}"
+                )
+            else:
+                valid_names.append(vname)
+        else:
+            raise ValueError(f"Unrecognized property name: {name}")
+
+    requested_props = set(sorted(valid_names))
+
+    ndim = label_image.ndim
+    if ndim != 2:
+        invalid_names = requested_props & ndim_2_only
+        if any(invalid_names):
+            raise ValueError(
+                f"{label_image.ndim=}, but the following properties are for "
+                "2D label images only: {invalid_names}"
+            )
+    if intensity_image is None:
+        has_intensity = False
+        invalid_names = requested_props & need_intensity_image
+        if any(invalid_names):
+            raise ValueError(
+                "No intensity_image provided, but the following requested "
+                "properties require one: {invalid_names}"
+            )
+    else:
+        has_intensity = True
+
+    out = {}
+    max_label = int(label_image.max())
+    label_dtype = _get_min_integer_dtype(max_label, signed=False)
+    # For performance, shrink label's data type to the minimum possible
+    # unsigned integer type.
+    if label_image.dtype != label_dtype:
+        label_image = label_image.astype(label_dtype)
+
+    # create vector of label values
+    if "label" in requested_props:
+        out["label"] = cp.arange(1, max_label + 1, dtype=label_dtype)
+        requested_props.discard("label")
+
+    perf_kwargs = {}
+    if pixels_per_thread is not None:
+        perf_kwargs["pixels_per_thread"] = pixels_per_thread
+    if max_labels_per_thread is not None:
+        perf_kwargs["max_labels_per_thread"] = max_labels_per_thread
+
+    requested_num_pixels_props = requested_props & requires["num_pixels"]
+    compute_num_pixels = any(requested_num_pixels_props)
+    if compute_num_pixels:
+        regionprops_num_pixels(
+            label_image,
+            max_label=max_label,
+            **perf_kwargs,
+            props_dict=out,
+        )
+        requested_props.discard("num_pixels")
+
+    if "area" in requested_props:
+        regionprops_area(
+            label_image,
+            spacing=spacing,
+            max_label=max_label,
+            dtype=cp.float32,
+            **perf_kwargs,
+            props_dict=out,
+        )
+        requested_props.discard("area")
+
+    if has_intensity:
+        if "intensity_std" in requested_props:
+            # std also computes mean
+            regionprops_intensity_std(
+                label_image,
+                intensity_image,
+                max_label=max_label,
+                std_dtype=cp.float64,
+                sample_std=False,
+                **perf_kwargs,
+                props_dict=out,
+            )
+
+        elif "intensity_mean" in requested_props:
+            regionprops_intensity_mean(
+                label_image,
+                intensity_image,
+                max_label=max_label,
+                mean_dtype=cp.float32,
+                **perf_kwargs,
+                props_dict=out,
+            )
+
+        compute_min = "intensity_min" in requested_props
+        compute_max = "intensity_max" in requested_props
+        if compute_min or compute_max:
+            _regionprops_min_or_max_intensity(
+                label_image,
+                intensity_image,
+                max_label=max_label,
+                compute_min=compute_min,
+                compute_max=compute_max,
+                **perf_kwargs,
+                props_dict=out,
+            )
+
+    requested_bbox_props = requested_props & requires["bbox"]
+    compute_bbox = any(requested_bbox_props)
+    if compute_bbox:
+        # compute bbox (and slice)
+        regionprops_bbox_coords(
+            label_image,
+            max_label=max_label,
+            return_slices="slice" in requested_bbox_props,
+            **perf_kwargs,
+            props_dict=out,
+        )
+
+        if "area_bbox" in requested_bbox_props:
+            regionprops_area_bbox(
+                out["bbox"],
+                area_dtype=cp.float32,
+                spacing=None,
+                props_dict=out,
+            )
+
+    requested_unweighted_moment_props = requested_props & requires["moments"]
+    compute_unweighted_moments = any(requested_unweighted_moment_props)
+    requested_weighted_moment_props = (
+        requested_props & requires["moments_weighted"]
+    )
+    compute_weighted_moments = any(requested_weighted_moment_props)
+
+    requested_moment_props = (
+        requested_unweighted_moment_props | requested_weighted_moment_props
+    )  # noqa: E501
+    compute_moments = any(requested_moment_props)
+
+    requested_inertia_tensor_props = (
+        requested_props & requires["inertia_tensor"]
+    )
+    compute_inertia_tensor = any(requested_inertia_tensor_props)
+
+    if compute_moments:
+        # determine minimum necessary order (or validate the user-provided one)
+        order = _check_moment_order(moment_order, requested_moment_props)
+
+        imgs = []
+        if compute_unweighted_moments:
+            imgs.append(None)
+        if compute_weighted_moments:
+            imgs.append(intensity_image)
+
+        # compute raw moments (weighted and/or unweighted)
+        for img in imgs:
+            regionprops_moments(
+                label_image,
+                intensity_image=img,
+                max_label=max_label,
+                order=order,
+                spacing=spacing,
+                **perf_kwargs,
+                props_dict=out,
+            )
+
+        compute_centroid_local = (
+            "centroid_local" in requested_unweighted_moment_props
+        )  # noqa:E501
+        compute_centroid = "centroid" in requested_unweighted_moment_props
+        if compute_centroid or compute_centroid_local:
+            regionprops_centroid_weighted(
+                moments_raw=out["moments"],
+                ndim=label_image.ndim,
+                bbox=out["bbox"],
+                compute_local=compute_centroid_local,
+                compute_global=compute_centroid,
+                weighted=False,
+                props_dict=out,
+            )
+
+        compute_centroid_weighted_local = (
+            "centroid_weighted_local" in requested_weighted_moment_props
+        )  # noqa: E501
+        compute_centroid_weighted = (
+            "centroid_weighted" in requested_weighted_moment_props
+        )  # noqa: E501
+        if compute_centroid_weighted or compute_centroid_weighted_local:
+            regionprops_centroid_weighted(
+                moments_raw=out["moments_weighted"],
+                ndim=label_image.ndim,
+                bbox=out["bbox"],
+                compute_local=compute_centroid_weighted_local,
+                compute_global=compute_centroid_weighted,
+                weighted=True,
+                props_dict=out,
+            )
+
+        if any(requested_unweighted_moment_props & requires["moments_central"]):
+            regionprops_moments_central(
+                out["moments"], ndim=ndim, weighted=False, props_dict=out
+            )
+
+            if any(
+                requested_unweighted_moment_props
+                & requires["moments_normalized"]
+            ):
+                regionprops_moments_normalized(
+                    out["moments_central"],
+                    ndim=ndim,
+                    spacing=None,
+                    pixel_correction=False,
+                    weighted=False,
+                    props_dict=out,
+                )
+                if "moments_hu" in requested_unweighted_moment_props:
+                    regionprops_moments_hu(
+                        out["moments_normalized"],
+                        weighted=False,
+                        props_dict=out,
+                    )
+
+        if any(
+            requested_weighted_moment_props
+            & requires["moments_weighted_central"]
+        ):
+            regionprops_moments_central(
+                out["moments"], ndim, weighted=True, props_dict=out
+            )
+
+            if any(
+                requested_weighted_moment_props
+                & requires["moments_weighted_normalized"]
+            ):
+                regionprops_moments_normalized(
+                    out["moments_weighted_central"],
+                    ndim=ndim,
+                    spacing=None,
+                    pixel_correction=False,
+                    weighted=True,
+                    props_dict=out,
+                )
+
+                if "moments_weighted_hu" in requested_weighted_moment_props:
+                    regionprops_moments_hu(
+                        out["moments_weighted_normalized"],
+                        weighted=True,
+                        props_dict=out,
+                    )
+
+        # inertia tensor computations come after moment computations
+        if compute_inertia_tensor:
+            regionprops_inertia_tensor(
+                out["moments_central"],
+                ndim=ndim,
+                compute_orientation=(
+                    "orientation" in requested_inertia_tensor_props
+                ),  # noqa: E501
+                props_dict=out,
+            )
+
+            if "inertia_tensor_eigvals" in requested_inertia_tensor_props:
+                compute_axis_lengths = (
+                    "axis_minor_length" in requested_inertia_tensor_props
+                    or "axis_major_length" in requested_inertia_tensor_props
+                )
+                regionprops_inertia_tensor_eigvals(
+                    out["inertia_tensor"],
+                    compute_axis_lengths=compute_axis_lengths,
+                    compute_eccentricity=(
+                        "eccentricity" in requested_inertia_tensor_props
+                    ),  # noqa: E501
+                    props_dict=out,
+                )
+
+        compute_perimeter = "perimeter" in requested_props
+        compute_perimeter_crofton = "perimeter_crofton" in requested_props
+        compute_euler = "euler_number" in requested_props
+
+        if compute_euler or compute_perimeter or compute_perimeter_crofton:
+            # precompute list of labels with <2 pixels space between them
+            if label_image.dtype == cp.uint8:
+                labels_mask = label_image.view("bool")
+            else:
+                labels_mask = label_image > 0
+            labels_close = _find_close_labels(
+                label_image, binary_image=labels_mask, max_label=max_label
+            )
+
+            if compute_perimeter:
+                regionprops_perimeter(
+                    label_image,
+                    neighborhood=4,
+                    max_label=max_label,
+                    robust=True,
+                    labels_close=labels_close,
+                    props_dict=out,
+                )
+            if compute_perimeter_crofton:
+                regionprops_perimeter_crofton(
+                    label_image,
+                    directions=4,
+                    max_label=max_label,
+                    robust=True,
+                    omit_image_edges=False,
+                    labels_close=labels_close,
+                    props_dict=out,
+                )
+            if compute_euler:
+                regionprops_euler(
+                    label_image,
+                    connectivity=None,
+                    max_label=max_label,
+                    robust=True,
+                    labels_close=labels_close,
+                    props_dict=out,
+                )
+    return out
