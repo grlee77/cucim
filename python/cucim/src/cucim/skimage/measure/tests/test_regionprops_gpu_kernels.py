@@ -299,19 +299,50 @@ def test_bbox_coords_and_area(precompute_max, ndim, dtype, return_slices):
         assert_allclose(area_bbox, expected_bbox["area_bbox"], rtol=1e-5)
 
 
-@pytest.mark.parametrize("precompute_max", [False, True])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("ndim", [2, 3])
-def test_centroid(precompute_max, local, ndim):
+@pytest.mark.parametrize("via_moments", [False, True])
+def test_centroid(via_moments, local, ndim):
     shape = (1024, 512) if ndim == 2 else (80, 64, 48)
     labels = get_labels_nd(shape)
-    max_label = int(cp.max(labels)) if precompute_max else None
+    max_label = int(cp.max(labels))
+    if via_moments:
+        props = {}
+        moments = regionprops_moments(
+            labels, max_label=max_label, order=1, props_dict=props
+        )
+        assert "bbox" in props
+        assert "moments" in props
     if local:
         name = "centroid_local"
-        centroid = regionprops_centroid_local(labels, max_label=max_label)
+        if via_moments:
+            centroid = regionprops_centroid_weighted(
+                moments_raw=moments,
+                ndim=labels.ndim,
+                bbox=props["bbox"],
+                compute_local=True,
+                compute_global=False,
+                weighted=False,
+                props_dict=props,
+            )
+            assert "centroid_local" in props
+        else:
+            centroid = regionprops_centroid_local(labels, max_label=max_label)
     else:
         name = "centroid"
-        centroid = regionprops_centroid(labels, max_label=max_label)
+        if via_moments:
+            centroid = regionprops_centroid_weighted(
+                moments_raw=moments,
+                ndim=labels.ndim,
+                bbox=props["bbox"],
+                compute_local=False,
+                compute_global=True,
+                weighted=False,
+                props_dict=props,
+            )
+            assert "centroid" in props
+        else:
+            centroid = regionprops_centroid(labels, max_label=max_label)
     expected = measure.regionprops_table(labels, properties=[name])
     assert_allclose(centroid[:, 0], expected[name + "-0"])
     if ndim > 1:
@@ -621,6 +652,9 @@ def test_inertia_tensor(
         # omit 3rd element for 2d images
         spacing = spacing[:ndim]
     props = ["inertia_tensor", "inertia_tensor_eigvals"]
+    compute_eccentricity = True if ndim == 2 else False
+    if compute_eccentricity:
+        props += ["eccentricity"]
     if compute_orientation:
         props += ["orientation"]
     if compute_axis_lengths:
@@ -651,16 +685,24 @@ def test_inertia_tensor(
 
     assert itensor.shape[-2:] == (ndim, ndim)
 
-    if compute_axis_lengths:
-        eigvals, axis_lengths = regionprops_inertia_tensor_eigvals(
-            itensor, compute_axis_lengths=compute_axis_lengths
-        )
+    outputs = regionprops_inertia_tensor_eigvals(
+        itensor,
+        compute_axis_lengths=compute_axis_lengths,
+        compute_eccentricity=compute_eccentricity,
+    )
+    if compute_eccentricity and compute_axis_lengths:
+        eigvals, axis_lengths, eccentricity = outputs
         assert axis_lengths.shape == (max_label, ndim)
+        assert eccentricity.shape == (max_label,)
+    elif compute_axis_lengths:
+        eigvals, axis_lengths = outputs
+        assert axis_lengths.shape == (max_label, ndim)
+    elif compute_eccentricity:
+        eigvals, eccentricity = outputs
+        assert eccentricity.shape == (max_label,)
     else:
-        eigvals = regionprops_inertia_tensor_eigvals(
-            itensor, compute_axis_lengths=compute_axis_lengths
-        )
-    assert eigvals.shape[-1] == ndim
+        eigvals = outputs
+        assert eigvals.shape == (max_label, ndim)
 
     expected = measure.regionprops_table(
         labels,
@@ -698,6 +740,9 @@ def test_inertia_tensor(
             # assert_allclose(
             #     cp.sin(orientation), cp.sin(expected["orientation"]), **tol_kw
             # )
+        if compute_eccentricity:
+            allclose(eccentricity, expected["eccentricity"])
+
     elif ndim == 3:
         # valida inertia tensor
         allclose(itensor[:, 0, 0], expected["inertia_tensor-0-0"])
