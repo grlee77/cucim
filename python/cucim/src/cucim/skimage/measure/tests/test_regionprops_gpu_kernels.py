@@ -14,6 +14,8 @@ from cucim.skimage import data, measure
 from cucim.skimage.measure._regionprops_gpu import (
     _find_close_labels,
     area_bbox_from_slices,
+    equivalent_diameter_area_2d,
+    equivalent_diameter_area_3d,
     regionprops_area,
     regionprops_area_bbox,
     regionprops_bbox_coords,
@@ -21,6 +23,7 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_centroid_local,
     regionprops_centroid_weighted,
     regionprops_euler,
+    regionprops_extent,
     regionprops_inertia_tensor,
     regionprops_inertia_tensor_eigvals,
     regionprops_intensity_max,
@@ -116,8 +119,9 @@ def test_num_pixels(precompute_max, ndim):
 @pytest.mark.parametrize("area_dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("spacing", [None, (0.5, 0.35, 0.75)])
 def test_area(precompute_max, ndim, area_dtype, spacing):
-    shape = (256, 512) if ndim == 2 else (15, 63, 37)
+    shape = (256, 512) if ndim == 2 else (45, 63, 37)
     labels = get_labels_nd(shape)
+    # discard any extra dimensions from spacing
     if spacing is not None:
         spacing = spacing[:ndim]
 
@@ -126,9 +130,53 @@ def test_area(precompute_max, ndim, area_dtype, spacing):
         labels, spacing=spacing, max_label=max_label, dtype=area_dtype
     )
     expected = measure.regionprops_table(
-        labels, spacing=spacing, properties=["area"]
+        labels, spacing=spacing, properties=["area", "equivalent_diameter_area"]
     )
     assert_allclose(area, expected["area"])
+
+    if ndim == 2:
+        ed = equivalent_diameter_area_2d(area)
+    else:
+        ed = equivalent_diameter_area_3d(area)
+    assert_allclose(
+        ed, expected["equivalent_diameter_area"], rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("area_dtype", [cp.float32, cp.float64])
+@pytest.mark.parametrize("spacing", [None, (0.5, 0.35, 0.75)])
+def test_extent(ndim, area_dtype, spacing):
+    shape = (512, 512) if ndim == 2 else (64, 64, 64)
+    labels = get_labels_nd(shape)
+    # discard any extra dimensions from spacing
+    if spacing is not None:
+        spacing = spacing[:ndim]
+
+    # compute area
+    max_label = int(cp.max(labels))
+    area = regionprops_area(
+        labels, spacing=spacing, max_label=max_label, dtype=area_dtype
+    )
+
+    # compute bounding-box area
+    bbox, slices = regionprops_bbox_coords(
+        labels,
+        max_label=max_label,
+        return_slices=True,
+    )
+    area_bbox = regionprops_area_bbox(
+        bbox, area_dtype=cp.float32, spacing=spacing
+    )
+
+    # compute extents from these
+    extent = regionprops_extent(area=area, area_bbox=area_bbox)
+
+    # compare to expected result
+    expected = measure.regionprops_table(
+        labels, spacing=spacing, properties=["extent"]
+    )
+    assert_allclose(extent, expected["extent"], rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("precompute_max", [False, True])

@@ -20,13 +20,18 @@ else:
 
 __all__ = [
     "area_bbox_from_slices",
+    "equivalent_diameter_area_2d",
+    "equivalent_diameter_area_3d",
+    "equivalent_diameter_area",
     "regionprops_area",
     "regionprops_area_bbox",
     "regionprops_bbox_coords",
     "regionprops_centroid",
     "regionprops_centroid_local",
     "regionprops_centroid_weighted",
+    "regionprops_dict",
     "regionprops_euler",
+    "regionprops_extent",
     "regionprops_inertia_tensor",
     "regionprops_inertia_tensor_eigvals",
     "regionprops_intensity_max",
@@ -1076,9 +1081,25 @@ def regionprops_area(
         else:
             pixel_area = math.prod(spacing)
         area *= pixel_area
+
     if props_dict is not None:
         props_dict["area"] = area
     return area
+
+
+@cp.fuse()
+def equivalent_diameter_area_2d(area):
+    return cp.sqrt(4.0 * area / cp.pi)
+
+
+@cp.fuse()
+def equivalent_diameter_area_3d(area):
+    return cp.cbrt(6.0 * area / cp.pi)
+
+
+@cp.fuse()
+def equivalent_diameter_area(area, ndim):
+    return cp.pow(2.0 * ndim * area / cp.pi, 1.0 / ndim)
 
 
 def _check_shapes(label_image, intensity_image):
@@ -3655,6 +3676,13 @@ def regionprops_euler(
     return euler_number
 
 
+def regionprops_extent(area, area_bbox, props_dict=None):
+    extent = area / area_bbox
+    if props_dict is not None:
+        props_dict["extent"] = extent
+    return extent
+
+
 # Currently unused utilities
 # Some properties can be computed faster using raveled labels and/or
 # intensity_image.
@@ -3765,12 +3793,24 @@ requires["moments_weighted"] = {
 # Technically don't need bbox for centroid and centroid_weighted if no other
 # moments are going to be computed, but probably best to just always compute
 # them via the moments
+
+requires["area"] = {
+    "area",
+    "extent",
+    "equivalent_diameter_area",
+}
+
+requires["area_bbox"] = {
+    "area_bbox",
+    "extent",
+}
+
 requires["bbox"] = (
     {
         "bbox",
-        "area_bbox",
         "slice",
     }
+    | requires["area_bbox"]
     | requires["moments"]
     | requires["moments_weighted"]
 )
@@ -3909,9 +3949,8 @@ def regionprops_dict(
             **perf_kwargs,
             props_dict=out,
         )
-        requested_props.discard("num_pixels")
 
-    if "area" in requested_props:
+    if any(requested_props & requires["area"]):
         regionprops_area(
             label_image,
             spacing=spacing,
@@ -3920,7 +3959,15 @@ def regionprops_dict(
             **perf_kwargs,
             props_dict=out,
         )
-        requested_props.discard("area")
+
+        if "equivalent_diameter_area" in requested_props:
+            if ndim == 2:
+                ed = equivalent_diameter_area_2d(out["area"])
+            elif ndim == 3:
+                ed = equivalent_diameter_area_3d(out["area"])
+            else:
+                ed = equivalent_diameter_area(out["area"], float(ndim))
+            out["equivalent_diameter_area"] = ed
 
     if has_intensity:
         if "intensity_std" in requested_props:
@@ -3970,13 +4017,16 @@ def regionprops_dict(
             props_dict=out,
         )
 
-        if "area_bbox" in requested_bbox_props:
+        if any(requested_props & requires["area_bbox"]):
             regionprops_area_bbox(
                 out["bbox"],
                 area_dtype=cp.float32,
                 spacing=None,
                 props_dict=out,
             )
+
+        if "extent" in requested_props:
+            out["extent"] = out["area"] / out["area_bbox"]
 
     requested_unweighted_moment_props = requested_props & requires["moments"]
     compute_unweighted_moments = any(requested_unweighted_moment_props)
@@ -4168,4 +4218,28 @@ def regionprops_dict(
                     labels_close=labels_close,
                     props_dict=out,
                 )
+
+    compute_images = "image" in requested_props
+    compute_intensity_images = "intensity_image" in requested_props
+    if compute_intensity_images or compute_images:
+        masks = tuple(
+            label_image[sl] == lab
+            for lab, sl in enumerate(out["slice"], start=1)
+        )
+
+        if compute_intensity_images:
+            out["intensity_image"] = tuple(
+                img[sl] * mask
+                for lab, (sl, mask) in enumerate(
+                    zip(out["slice"], masks), start=1
+                )
+            )
+
+        if compute_images:
+            out["image"] = tuple(
+                label_image[sl] * mask
+                for lab, (sl, mask) in enumerate(
+                    zip(out["slice"], masks), start=1
+                )
+            )
     return out
