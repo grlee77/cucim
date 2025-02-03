@@ -2,30 +2,17 @@ import math
 
 import cupy as cp
 
-from ._regionprops_gpu_basic_kernels import _get_count_dtype, _includes
+from ._regionprops_gpu_utils import (
+    _check_intensity_image_shape,
+    _get_count_dtype,
+    _includes,
+)
 
 __all__ = [
     "regionprops_intensity_mean",
     "regionprops_intensity_min_max",
     "regionprops_intensity_std",
 ]
-
-
-def _check_intensity_image_shape(label_image, intensity_image):
-    ndim = label_image.ndim
-    if intensity_image.shape[:ndim] != label_image.shape:
-        raise ValueError(
-            "Initial dimensions of `intensity_image` must match the shape of "
-            "`label_image`. (`intensity_image` may have additional trailing "
-            "channels/batch dimensions)"
-        )
-
-    num_channels = (
-        math.prod(intensity_image.shape[ndim:])
-        if intensity_image.ndim > ndim
-        else 1
-    )
-    return num_channels
 
 
 def _get_img_sums_code(

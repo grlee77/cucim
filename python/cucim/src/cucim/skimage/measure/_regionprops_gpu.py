@@ -17,7 +17,6 @@ from ._regionprops_gpu_intensity_kernels import (
     regionprops_intensity_std,
 )
 from ._regionprops_gpu_misc_kernels import (
-    _find_close_labels,
     regionprops_euler,
     regionprops_perimeter,
     regionprops_perimeter_crofton,
@@ -33,6 +32,7 @@ from ._regionprops_gpu_moments_kernels import (
     regionprops_moments_hu,
     regionprops_moments_normalized,
 )
+from ._regionprops_gpu_utils import _find_close_labels, _get_min_integer_dtype
 
 __all__ = [
     "area_bbox_from_slices",
@@ -61,20 +61,6 @@ __all__ = [
     "regionprops_perimeter",
     "regionprops_perimeter_crofton",
 ]
-
-
-# Currently unused utilities
-# Some properties can be computed faster using raveled labels and/or
-# intensity_image.
-
-
-def _get_min_integer_dtype(max_size, signed=False):
-    # negate to get a signed integer type, but need to also subtract 1, due
-    # to asymmetric range on positive side, e.g. we want
-    #    max_sz = 127 -> int8  (signed)   uint8 (unsigned)
-    #    max_sz = 128 -> int16 (signed)   uint8 (unsigned)
-    func = cp.min_scalar_type
-    return func(-max_size - 1) if signed else func(max_size)
 
 
 def get_compressed_labels(

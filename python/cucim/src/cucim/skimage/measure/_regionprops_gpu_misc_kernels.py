@@ -4,37 +4,15 @@ import cupy as cp
 import numpy as np
 
 from cucim.skimage._vendored import ndimage as ndi, pad
-from cucim.skimage.util import map_array
 
 from ._regionprops_gpu_basic_kernels import regionprops_bbox_coords
+from ._regionprops_gpu_utils import _find_close_labels, _get_min_integer_dtype
 
 __all__ = [
     "regionprops_euler",
     "regionprops_perimeter",
     "regionprops_perimeter_crofton",
 ]
-
-
-def _reverse_label_values(label_image, max_label):
-    """reverses the value of all labels (keeping background value=0 the same)"""
-    dtype = label_image.dtype
-    labs = cp.asarray(tuple(range(max_label + 1)), dtype=dtype)
-    rev_labs = cp.asarray((0,) + tuple(range(max_label, 0, -1)), dtype=dtype)
-    return map_array(label_image, labs, rev_labs)
-
-
-def _find_close_labels(labels, binary_image, max_label):
-    # check possibly too-close regions for which we may need to
-    # manually recompute the regions perimeter in isolation
-    labels_dilated2 = ndi.grey_dilation(labels, 5, mode="constant")
-    labels2 = labels_dilated2 * binary_image
-    rev_labels = _reverse_label_values(labels, max_label=max_label)
-    rev_labels = ndi.grey_dilation(rev_labels, 5, mode="constant")
-    rev_labels = rev_labels * binary_image
-    labels3 = _reverse_label_values(rev_labels, max_label=max_label)
-    diffs = cp.logical_or(labels != labels2, labels != labels3)
-    labels_close = cp.asnumpy(cp.unique(labels[diffs]))
-    return labels_close
 
 
 def regionprops_perimeter(
@@ -152,11 +130,21 @@ def regionprops_perimeter(
             )
             bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
-    max_val = 50  # 1 + sum of kernel used by ndi.convolve above
+    max_val = 50  # 1 + sum of kernel weights used for convolve above
+    min_integer_type = _get_min_integer_dtype(
+        (max_label + 1) * max_val, signed=False
+    )
+    if perimeter_image.dtype != min_integer_type:
+        perimeter_image = perimeter_image.astype(min_integer_type)
+    if labels_dilated.dtype != min_integer_type:
+        # print(f"{min_integer_type=}, {max_label=}, {max_val=}")
+        labels_dilated = labels_dilated.astype(min_integer_type)
+    labels_dilated *= max_val
+
     # values in perimeter_image are guaranteed to be in range [0, max_val) so
     # need to multiply each label by max_val to make sure all labels have a
     # unique set of values during bincount
-    perimeter_image = perimeter_image + max_val * labels_dilated
+    perimeter_image = perimeter_image + labels_dilated
 
     minlength = max_val * (max_label + 1)
 
@@ -314,18 +302,28 @@ def regionprops_perimeter_crofton(
             )
             bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
+    max_val = 16  # 1 + (sum of the kernel weights) used for convolve above
+    min_integer_type = _get_min_integer_dtype(
+        (max_label + 1) * max_val, signed=False
+    )
+    if image_filtered.dtype != min_integer_type:
+        image_filtered = image_filtered.astype(min_integer_type)
+    if labels_dilated.dtype != min_integer_type:
+        labels_dilated = labels_dilated.astype(min_integer_type)
+    labels_dilated *= max_val
+
     # values in image_filtered are guaranteed to be in range [0, 15] so need to
     # multiply each label by 16 to make sure all labels have a unique set of
     # values during bincount
-    image_filtered_labeled = image_filtered + 16 * labels_dilated
+    image_filtered_labeled = image_filtered + labels_dilated
 
-    minlength = 16 * (max_label + 1)
+    minlength = max_val * (max_label + 1)
     h = cp.bincount(
         image_filtered_labeled[binary_image_mask], minlength=minlength
     )
 
-    # values for label=1 start at index 16
-    h = h[16:minlength].reshape((max_label, 16))
+    # values for label=1 start at index max_val
+    h = h[max_val:minlength].reshape((max_label, max_val))
 
     # definition of the LUT
     # fmt: off
@@ -530,10 +528,19 @@ def regionprops_euler(
         )
         bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
 
+    min_integer_type = _get_min_integer_dtype(
+        (max_label + 1) * filter_bins, signed=False
+    )
+    if image_filtered.dtype != min_integer_type:
+        image_filtered = image_filtered.astype(min_integer_type)
+    if labels_dilated.dtype != min_integer_type:
+        labels_dilated = labels_dilated.astype(min_integer_type)
+    labels_dilated *= filter_bins
+
     # values in image_filtered are guaranteed to be in range [0, filter_bins)
     # so need to multiply each label by filter_bins to make sure all labels
     # have a unique set of values during bincount
-    image_filtered_labeled = image_filtered + filter_bins * labels_dilated
+    image_filtered_labeled = image_filtered + labels_dilated
 
     minlength = filter_bins * (max_label + 1)
 

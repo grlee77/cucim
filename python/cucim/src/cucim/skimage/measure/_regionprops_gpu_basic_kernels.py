@@ -2,7 +2,13 @@ import math
 
 import cupy as cp
 import numpy as np
-from packaging.version import parse
+
+from ._regionprops_gpu_utils import (
+    _get_count_dtype,
+    _includes,
+    _unravel_loop_index,
+    _unravel_loop_index_declarations,
+)
 
 __all__ = [
     "area_bbox_from_slices",
@@ -15,56 +21,6 @@ __all__ = [
     "regionprops_extent",
     "regionprops_num_pixels",
 ]
-
-
-CUPY_GTE_13_3_0 = parse(cp.__version__) >= parse("13.3.0")
-
-if CUPY_GTE_13_3_0:
-    _includes = r"""
-#include <cupy/cuda_workaround.h>  // provide std:: coverage
-"""
-else:
-    _includes = r"""
-#include <type_traits>  // let Jitify handle this
-"""
-
-
-def _unravel_loop_index_declarations(var_name, ndim, uint_t="unsigned int"):
-    code = f"""
-        // variables for unraveling a linear index to a coordinate array
-        {uint_t} in_coord[{ndim}];
-        {uint_t} temp_floor;"""
-    for d in range(ndim):
-        code += f"""
-        {uint_t} dim{d}_size = {var_name}.shape()[{d}];"""
-    return code
-
-
-def _unravel_loop_index(
-    var_name,
-    ndim,
-    uint_t="unsigned int",
-    raveled_index="i",
-    omit_declarations=False,
-):
-    """
-    declare a multi-index array in_coord and unravel the 1D index, i into it.
-    This code assumes that the array is a C-ordered array.
-    """
-    code = (
-        ""
-        if omit_declarations
-        else _unravel_loop_index_declarations(var_name, ndim, uint_t)
-    )
-    code += f"{uint_t} temp_idx = {raveled_index};"
-    for d in range(ndim - 1, 0, -1):
-        code += f"""
-        temp_floor = temp_idx / dim{d}_size;
-        in_coord[{d}] = temp_idx - temp_floor * dim{d}_size;
-        temp_idx = temp_floor;"""
-    code += """
-        in_coord[0] = temp_idx;"""
-    return code
 
 
 def _get_bbox_code(uint_t, ndim, array_size):
@@ -100,7 +56,7 @@ def _get_bbox_code(uint_t, ndim, array_size):
     source_operation = f"""
           bbox_min[{ndim}*offset] = min(in_coord[0], bbox_min[{ndim}*offset]);
           bbox_max[{ndim}*offset] = max(in_coord[0] + 1, bbox_max[{ndim}*offset]);"""  # noqa: E501
-    for d in range(1, ndim):
+    for d in range(ndim):
         source_operation += f"""
           bbox_min[{ndim}*offset + {d}] = min(in_coord[{d}], bbox_min[{ndim}*offset + {d}]);
           bbox_max[{ndim}*offset + {d}] = max(in_coord[{d}] + 1, bbox_max[{ndim}*offset + {d}]);"""  # noqa: E501
@@ -313,13 +269,6 @@ def get_bbox_coords_kernel(
     return cp.ElementwiseKernel(
         inputs, outputs, source, preamble=_includes, name=name
     )
-
-
-def _get_count_dtype(label_image_size):
-    """atomicAdd only supports int32, uint32, int64, uint64, float32, float64"""
-    int32_count = label_image_size < 2**32
-    count_dtype = cp.dtype(cp.uint32 if int32_count else cp.uint64)
-    return count_dtype, int32_count
 
 
 def regionprops_num_pixels(

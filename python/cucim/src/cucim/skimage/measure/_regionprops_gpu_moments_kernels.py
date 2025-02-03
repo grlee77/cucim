@@ -2,13 +2,13 @@ import math
 
 import cupy as cp
 
-from ._regionprops_gpu_basic_kernels import (
+from ._regionprops_gpu_basic_kernels import get_bbox_coords_kernel
+from ._regionprops_gpu_utils import (
+    _check_intensity_image_shape,
     _includes,
     _unravel_loop_index,
     _unravel_loop_index_declarations,
-    get_bbox_coords_kernel,
 )
-from ._regionprops_gpu_intensity_kernels import _check_intensity_image_shape
 
 __all__ = [
     "regionprops_centroid",
@@ -1425,7 +1425,6 @@ def regionprops_inertia_tensor(
 @cp.memoize(for_each_device=True)
 def get_spd_matrix_eigvals_kernel(
     rank,
-    compute_eigenvectors=False,
     compute_axis_lengths=False,
     compute_eccentricity=False,
 ):
@@ -1446,7 +1445,7 @@ def get_spd_matrix_eigvals_kernel(
     # size of the inertia_tensor matrix
     source = f"""
             unsigned int offset = i * {num_elements};
-            unsigned int offset_out = i * {rank};\n"""
+            unsigned int offset_evals = i * {rank};\n"""
     if rank == 2:
         source += """
             F tmp1, tmp2;
@@ -1470,21 +1469,12 @@ def get_spd_matrix_eigvals_kernel(
             //  numerical errors)
             F lam1 = max(tmp1 + tmp2, 0.0);
             F lam2 = max(tmp1 - tmp2, 0.0);
-            out[offset_out] = lam1;
-            out[offset_out + 1] = lam2;\n"""
-        if compute_eigenvectors:
-            source += """
-            double ev_denom = max(m01, 1.0e-15);
-            // first eigenvector
-            evecs[offset] = (lam2 - m11) / ev_denom;
-            evecs[offset + 2] = 1.0;
-            // second eigenvector
-            evecs[offset + 1] = (lam1 - m11) / ev_denom;
-            evecs[offset + 3] = 1.0;\n"""
+            evals[offset_evals] = lam1;
+            evals[offset_evals + 1] = lam2;\n"""
         if compute_axis_lengths:
             source += """
-            axis_lengths[offset_out] = 4.0 * sqrt(lam1);
-            axis_lengths[offset_out + 1] = 4.0 * sqrt(lam2);\n"""
+            axis_lengths[offset_evals] = 4.0 * sqrt(lam1);
+            axis_lengths[offset_evals + 1] = 4.0 * sqrt(lam2);\n"""
         if compute_eccentricity:
             source += """
             eccentricity[i] =  sqrt(1.0 - lam2 / lam1);\n"""
@@ -1565,66 +1555,23 @@ def get_spd_matrix_eigvals_kernel(
             lam1 = max(lam1, 0.0);
             lam2 = max(lam2, 0.0);
             lam3 = max(lam3, 0.0);
-            out[offset_out] = lam1;
-            out[offset_out + 1] = lam2;
-            out[offset_out + 2] = lam3;\n"""
-        if compute_eigenvectors:
-            source += """
-            double f_denom = f;
-            if (f_denom == 0) {
-                f = 1.0e-15;
-            }
-            double de = d * e;
-            double ef = e * f;
-
-            // first eigenvector
-            double m_denom = f * (b - lam1) - de;
-            if (m_denom == 0) {
-                m_denom = 1.0e-15;
-            }
-            double m = (d * (c - lam1) - ef) / m_denom;
-            evecs[offset] = (lam1 - c - e * m) / f_denom;
-            evecs[offset + 3] = m;
-            evecs[offset + 6] = 1.0;
-
-            // second eigenvector
-            m_denom = f * (b - lam2) - de;
-            if (m_denom == 0) {
-                m_denom = 1.0e-15;
-            }
-            m = (d * (c - lam2) - ef) / m_denom;
-            evecs[offset + 1] = (lam2 - c - e * m) / f_denom;
-            evecs[offset + 4] = m;
-            evecs[offset + 7] = 1.0;
-
-            // third eigenvector
-            m_denom = f * (b - lam3) - de;
-            if (m_denom == 0) {
-                m_denom = 1.0e-15;
-            }
-            m = (d * (c - lam3) - ef) / m_denom;
-            evecs[offset + 2] = (lam3 - c - e * m) / f_denom;
-            evecs[offset + 5] = m;
-            evecs[offset + 8] = 1.0;\n"""
+            evals[offset_evals] = lam1;
+            evals[offset_evals + 1] = lam2;
+            evals[offset_evals + 2] = lam3;\n"""
         if compute_axis_lengths:
             source += """
             // formula reference:
             //   https://github.com/scikit-image/scikit-image/blob/v0.25.0/skimage/measure/_regionprops.py#L275-L295
             // note: added max to clip possible small (e.g. 1e-7) negative value due to numerical error
-            axis_lengths[offset_out] = sqrt(10.0 * (lam1 + lam2 - lam3));
-            axis_lengths[offset_out + 1] = sqrt(10.0 * (lam1 - lam2 + lam3));
-            axis_lengths[offset_out + 2] = sqrt(10.0 * max(-lam1 + lam2 + lam3, 0.0));\n"""  # noqa: E501
+            axis_lengths[offset_evals] = sqrt(10.0 * (lam1 + lam2 - lam3));
+            axis_lengths[offset_evals + 1] = sqrt(10.0 * (lam1 - lam2 + lam3));
+            axis_lengths[offset_evals + 2] = sqrt(10.0 * max(-lam1 + lam2 + lam3, 0.0));\n"""  # noqa: E501
     else:
         # note: ndim here is the number of spatial image dimensions
         raise ValueError("only rank = 2 or 3 is supported")
     inputs = "raw F spd_matrix"
-    outputs = ["raw F out"]
-    if compute_eigenvectors:
-        outputs.append("raw F eigvecs")
-        ev_str = "eigvecs_"
-    else:
-        ev_str = ""
-    name = f"cucim_spd_matrix_eigvals_{ev_str}{rank}d"
+    outputs = ["raw F evals"]
+    name = f"cucim_spd_matrix_eigvals_{rank}d"
     if compute_axis_lengths:
         outputs.append("raw F axis_lengths")
         name += "_with_axis"
@@ -1639,6 +1586,7 @@ def get_spd_matrix_eigvals_kernel(
 
 def regionprops_inertia_tensor_eigvals(
     inertia_tensor,
+    compute_eigenvectors=False,
     compute_axis_lengths=False,
     compute_eccentricity=False,
     props_dict=None,
@@ -1658,10 +1606,10 @@ def regionprops_inertia_tensor_eigvals(
     if not inertia_tensor.flags.c_contiguous:
         inertia_tensor = cp.ascontiguousarray(inertia_tensor)
 
+    # don't use this kernel for eigenvectors as it is not robust to 0 entries
     kernel = get_spd_matrix_eigvals_kernel(
         rank=ndim,
         compute_axis_lengths=compute_axis_lengths,
-        compute_eigenvectors=False,
         compute_eccentricity=compute_eccentricity,
     )
     eigvals_shape = inertia_tensor.shape[:-2] + (ndim,)
@@ -1676,6 +1624,18 @@ def regionprops_inertia_tensor_eigvals(
         )
         outputs.append(eccentricity)
     kernel(inertia_tensor, *outputs, size=nbatch)
+    if compute_eigenvectors:
+        # eigenvectors computed by the kernel are not robust to 0 entries, so
+        # use slightly slow cp.linalg.eigh instead
+        eigvals, eigvecs = cp.linalg.eigh(inertia_tensor)
+        # swap from ascending to descending order
+        eigvals = eigvals[:, ::-1]
+        eigvecs = eigvecs[:, ::-1]
+        outputs = [eigvals, eigvecs]
+        if compute_axis_lengths:
+            outputs.append(axis_lengths)
+        if compute_eccentricity:
+            outputs.append(eccentricity)
     if props_dict is not None:
         props_dict["inertia_tensor_eigvals"] = eigvals
         if compute_eccentricity:
@@ -1684,6 +1644,14 @@ def regionprops_inertia_tensor_eigvals(
             props_dict["axis_lengths"] = axis_lengths
             props_dict["axis_length_major"] = axis_lengths[..., 0]
             props_dict["axis_length_minor"] = axis_lengths[..., -1]
+        if compute_eigenvectors:
+            props_dict["inertia_tensor_eigvecs"] = eigvecs
+    # Note:
+    #   For eigenvalues in descending order as returned here:
+    #     ITK's flatness and elongation are:
+    #           flatness = cp.sqrt(eigvecs[-2] / eigvecs[-1])
+    #           elongation = cp.sqrt(eigvecs[0] / eigvecs[1])
+    #   (for 2D those are the same, but not in other dimensions)
     if len(outputs) == 1:
         return outputs[0]
     return tuple(outputs)
