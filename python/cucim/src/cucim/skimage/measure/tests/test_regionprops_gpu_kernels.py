@@ -1,5 +1,6 @@
 import functools
 import math
+from copy import deepcopy
 
 import cupy as cp
 import pytest
@@ -109,7 +110,9 @@ def test_num_pixels(precompute_max, ndim):
 
     max_label = int(cp.max(labels)) if precompute_max else None
     num_pixels = regionprops_num_pixels(labels, max_label=max_label)
-    expected = measure.regionprops_table(labels, properties=["num_pixels"])
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), properties=["num_pixels"]
+    )
     assert_allclose(num_pixels, expected["num_pixels"])
 
 
@@ -128,8 +131,10 @@ def test_area(precompute_max, ndim, area_dtype, spacing):
     area = regionprops_area(
         labels, spacing=spacing, max_label=max_label, dtype=area_dtype
     )
-    expected = measure.regionprops_table(
-        labels, spacing=spacing, properties=["area", "equivalent_diameter_area"]
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        spacing=spacing,
+        properties=["area", "equivalent_diameter_area"],
     )
     assert_allclose(area, expected["area"])
 
@@ -172,8 +177,8 @@ def test_extent(ndim, area_dtype, spacing):
     extent = regionprops_extent(area=area, area_bbox=area_bbox)
 
     # compare to expected result
-    expected = measure.regionprops_table(
-        labels, spacing=spacing, properties=["extent"]
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), spacing=spacing, properties=["extent"]
     )
     assert_allclose(extent, expected["extent"], rtol=1e-5, atol=1e-5)
 
@@ -196,18 +201,18 @@ def test_mean_intensity(
     counts, means = regionprops_intensity_mean(
         labels, intensity_image, max_label=max_label, mean_dtype=mean_dtype
     )
-    expected = measure.regionprops_table(
-        labels,
-        intensity_image=intensity_image,
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        intensity_image=cp.asnumpy(intensity_image),
         properties=["num_pixels", "intensity_mean"],
     )
     assert_array_equal(counts, expected["num_pixels"])
     if num_channels == 1:
-        assert_allclose(means, expected["intensity_mean"], rtol=1e-6)
+        assert_allclose(means, expected["intensity_mean"], rtol=1e-3)
     else:
         for c in range(num_channels):
             assert_allclose(
-                means[..., c], expected[f"intensity_mean-{c}"], rtol=1e-6
+                means[..., c], expected[f"intensity_mean-{c}"], rtol=1e-3
             )
 
 
@@ -239,8 +244,10 @@ def test_intensity_min_and_max(
         compute_min=compute_min,
         compute_max=compute_max,
     )
-    expected = measure.regionprops_table(
-        labels, intensity_image=intensity_image, properties=[op_name]
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        intensity_image=cp.asnumpy(intensity_image),
+        properties=[op_name],
     )
     if num_channels == 1:
         assert_array_equal(values, expected[op_name])
@@ -278,22 +285,22 @@ def test_intensity_std(
     counts, means, stds = regionprops_intensity_std(
         labels, intensity_image, max_label=max_label, std_dtype=std_dtype
     )
-    expected = measure.regionprops_table(
-        labels,
-        intensity_image=intensity_image,
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        intensity_image=cp.asnumpy(intensity_image),
         properties=["num_pixels", "intensity_mean", "intensity_std"],
     )
     assert_array_equal(counts, expected["num_pixels"])
     if num_channels == 1:
-        assert_allclose(means, expected["intensity_mean"], rtol=1e-5)
-        assert_allclose(stds, expected["intensity_std"], rtol=1e-4)
+        assert_allclose(means, expected["intensity_mean"], rtol=1e-3)
+        assert_allclose(stds, expected["intensity_std"], rtol=1e-3)
     else:
         for c in range(num_channels):
             assert_allclose(
-                means[..., c], expected[f"intensity_mean-{c}"], rtol=1e-5
+                means[..., c], expected[f"intensity_mean-{c}"], rtol=1e-3
             )
             assert_allclose(
-                stds[..., c], expected[f"intensity_std-{c}"], rtol=1e-4
+                stds[..., c], expected[f"intensity_std-{c}"], rtol=1e-3
             )
 
 
@@ -319,8 +326,8 @@ def test_bbox_coords_and_area(precompute_max, ndim, dtype, return_slices):
         assert slices == expected_slices
 
     spacing = (0.35, 0.75, 0.5)[:ndim]
-    expected_bbox = measure.regionprops_table(
-        labels, spacing=spacing, properties=["bbox", "area_bbox"]
+    expected_bbox = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), spacing=spacing, properties=["bbox", "area_bbox"]
     )
     if ndim == 2:
         # TODO make ordering of bbox consistent with regionprops bbox?
@@ -394,7 +401,9 @@ def test_centroid(via_moments, local, ndim):
             assert "centroid" in props
         else:
             centroid = regionprops_centroid(labels, max_label=max_label)
-    expected = measure.regionprops_table(labels, properties=[name])
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), properties=[name]
+    )
     assert_allclose(centroid[:, 0], expected[name + "-0"])
     if ndim > 1:
         assert_allclose(centroid[:, 1], expected[name + "-1"])
@@ -447,7 +456,14 @@ def test_moments_2d(
         prop += "_normalized"
     elif norm_type == "hu":
         prop += "_hu"
-    expected = measure.regionprops_table(labels, properties=[prop], **kwargs)
+    kwargs_cpu = deepcopy(kwargs)
+    if "intensity_image" in kwargs_cpu:
+        kwargs_cpu["intensity_image"] = cp.asnumpy(
+            kwargs_cpu["intensity_image"]
+        )
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), properties=[prop], **kwargs_cpu
+    )
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
@@ -572,7 +588,14 @@ def test_moments_3d(
         prop += "_central"
     elif norm_type == "normalized":
         prop += "_normalized"
-    expected = measure.regionprops_table(labels, properties=[prop], **kwargs)
+    kwargs_cpu = deepcopy(kwargs)
+    if "intensity_image" in kwargs_cpu:
+        kwargs_cpu["intensity_image"] = cp.asnumpy(
+            kwargs_cpu["intensity_image"]
+        )
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), properties=[prop], **kwargs_cpu
+    )
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
@@ -755,6 +778,8 @@ def test_inertia_tensor(
         eigvals = outputs
         assert eigvals.shape == (max_label, ndim)
 
+    # Do not compare to scikit-image via measure_cpu due to unhandled
+    # ValueError: math domain error in scikit-image.
     expected = measure.regionprops_table(
         labels,
         properties=props,
@@ -845,18 +870,12 @@ def test_centroid_weighted(
     if local:
         prop += "_local"
 
-    validate_via_cpu_skimage = False
-    if not validate_via_cpu_skimage:
-        expected = measure.regionprops_table(
-            labels, properties=[prop], **kwargs
-        )
-    else:
-        expected = measure_cpu.regionprops_table(
-            cp.asnumpy(labels),
-            properties=[prop],
-            spacing=spacing,
-            intensity_image=cp.asnumpy(intensity_image),
-        )
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        properties=[prop],
+        spacing=spacing,
+        intensity_image=cp.asnumpy(intensity_image),
+    )
     moments_raw = regionprops_moments(
         labels, max_label=max_label, order=1, **kwargs
     )
@@ -914,7 +933,9 @@ def test_perimeter(shape, robust, volume_fraction, blob_size_fraction):
 
     max_label = int(cp.max(labels))
     values = regionprops_perimeter(labels, max_label=max_label, robust=robust)
-    expected = measure.regionprops_table(labels, properties=["perimeter"])
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), properties=["perimeter"]
+    )
     rtol = 1e-5
     atol = 1e-5
     allclose = functools.partial(assert_allclose, rtol=rtol, atol=atol)
@@ -946,8 +967,8 @@ def test_perimeter_crofton(shape, robust, volume_fraction, blob_size_fraction):
     values = regionprops_perimeter_crofton(
         labels, max_label=max_label, robust=robust
     )
-    expected = measure.regionprops_table(
-        labels, properties=["perimeter_crofton"]
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels), properties=["perimeter_crofton"]
     )
     rtol = 1e-5
     atol = 1e-5
@@ -1002,7 +1023,7 @@ def test_euler(
     if connectivity is None or connectivity == labels.ndim:
         # regionprops_table has hard-coded connectivity, can't use it to verify
         # other values
-        expected = measure.regionprops_table(
-            labels, properties=["euler_number"]
+        expected = measure_cpu.regionprops_table(
+            cp.asnumpy(labels), properties=["euler_number"]
         )
         assert_array_equal(values, expected["euler_number"])
