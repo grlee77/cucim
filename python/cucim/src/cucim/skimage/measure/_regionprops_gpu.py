@@ -157,6 +157,7 @@ def regionprops_image(
     max_label=None,
     compute_image=True,
     props_dict=None,
+    on_cpu=False,
 ):
     """Return tuples of images of isolated label and/or intensities.
 
@@ -188,6 +189,11 @@ def regionprops_image(
         label_image[sl] == lab for lab, sl in enumerate(slices, start=1)
     )
 
+    if on_cpu:
+        masks = tuple(cp.asnumpy(m) for m in masks)
+        if intensity_image is not None:
+            intensity_image = cp.asnumpy(intensity_image)
+
     if compute_image:
         props_dict["image"] = masks
         if intensity_image is None:
@@ -201,15 +207,19 @@ def regionprops_image(
                     "label_image.ndim or label_image.ndim + 1"
                 )
             imslices = tuple(sl + (slice(None),) for sl in slices)
-            props_dict["intensity_image"] = tuple(
+            intensity_images = tuple(
                 intensity_image[sl] * mask[..., cp.newaxis]
                 for img, (sl, mask) in enumerate(zip(imslices, masks), start=1)
             )
+
         else:
-            props_dict["intensity_image"] = tuple(
+            intensity_images = tuple(
                 intensity_image[sl] * mask
                 for img, (sl, mask) in enumerate(zip(slices, masks), start=1)
             )
+        if on_cpu:
+            intensity_images = (cp.asnumpy(img) for img in intensity_images)
+        props_dict["intensity_image"] = intensity_images
         if not compute_image:
             return props_dict["intensity_image"]
     return props_dict["image"], props_dict["intensity_image"]
