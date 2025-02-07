@@ -1,4 +1,5 @@
 import cupy as cp
+import numpy as np
 
 from ._regionprops_gpu_basic_kernels import (
     area_bbox_from_slices,
@@ -45,9 +46,11 @@ __all__ = [
     "regionprops_centroid",
     "regionprops_centroid_local",
     "regionprops_centroid_weighted",
+    "regionprops_coords",
     "regionprops_dict",
     "regionprops_euler",
     "regionprops_extent",
+    "regionprops_image",
     "regionprops_inertia_tensor",
     "regionprops_inertia_tensor_eigvals",
     "regionprops_intensity_mean",
@@ -61,6 +64,62 @@ __all__ = [
     "regionprops_perimeter",
     "regionprops_perimeter_crofton",
 ]
+
+
+# Master list of properties currently supported by regionprops_dict for faster
+# computation on the GPU.
+#
+# One caveat is that centroid/moment/inertia_tensor properties currently only
+# support 2D and 3D data with moments up to 3rd order.
+#
+# Comment lines indicate currently missing items that would be nice to support
+# in the future.
+
+PROPS_GPU = {
+    "area",
+    "area_bbox",
+    # area_convex
+    # area_filled
+    "bbox",
+    "coords",
+    "coords_scaled",
+    "axis_major_length",
+    "axis_minor_length",
+    "centroid",
+    "centroid_local",
+    "centroid_weighted",
+    "centroid_weighted_local",
+    "eccentricity",
+    "equivalent_diameter_area",
+    "euler",
+    "extent",
+    # feret_diameter_mx
+    "image",
+    # image_convex
+    # image_filled
+    "inertia_tensor",
+    "inertia_tensor_eigvals",
+    "intensity_image",
+    "intensity_mean",
+    "intensity_std",
+    "intensity_max",
+    "intensity_min",
+    "label",
+    "moments",
+    "moments_central",
+    "moments_hu",
+    "moments_normalized",
+    "moments_weighted",
+    "moments_weighted_central",
+    "moments_weighted_hu",
+    "moments_weighted_normalized",
+    "num_pixels",
+    "orientation",
+    "perimeter",
+    "perimeter_crofton",
+    "slice",
+    # solidity
+}
 
 
 def get_compressed_labels(
@@ -77,7 +136,7 @@ def get_compressed_labels(
     if labels.dtype != label_dtype:
         labels = labels.astype(dtype=label_dtype)
     coords_dtype = _get_min_integer_dtype(max(labels.shape), signed=False)
-    label_coords = cp.where(labels)
+    label_coords = cp.nonzero(labels)
     if label_coords[0].dtype != coords_dtype:
         label_coords = tuple(c.astype(coords_dtype) for c in label_coords)
     labels1d = labels[label_coords]
@@ -90,6 +149,146 @@ def get_compressed_labels(
         return label_coords, labels1d, img1d
     # max_label = int(labels1d[-1])
     return label_coords, labels1d
+
+
+def regionprops_image(
+    label_image,
+    intensity_image=None,
+    max_label=None,
+    compute_image=True,
+    props_dict=None,
+):
+    """Return tuples of images of isolated label and/or intensities.
+
+    Each image incorporates only the bounding box region for a given label.
+
+    Length of the tuple(s) is equal to `max_label`.
+
+    Notes
+    -----
+    This is provided only for completeness, but unlike for the RegionProps
+    class, these are not used to compute any of the other properties.
+    """
+    if max_label is None:
+        max_label = int(label_image.max())
+    if props_dict is None:
+        props_dict = dict()
+
+    if "slice" not in props_dict:
+        regionprops_bbox_coords(
+            label_image,
+            max_label=max_label,
+            return_slices=True,
+            props_dict=props_dict,
+        )
+    slices = props_dict["slice"]
+
+    # mask so there will only be a single label value in each returned slice
+    masks = tuple(
+        label_image[sl] == lab for lab, sl in enumerate(slices, start=1)
+    )
+
+    if compute_image:
+        props_dict["image"] = masks
+        if intensity_image is None:
+            return props_dict["image"]
+
+    if intensity_image is not None:
+        if intensity_image.ndim > label_image.ndim:
+            if intensity_image.ndim != label_image.ndim + 1:
+                raise ValueError(
+                    "Unexpected intensity_image.ndim. Should be "
+                    "label_image.ndim or label_image.ndim + 1"
+                )
+            imslices = tuple(sl + (slice(None),) for sl in slices)
+            props_dict["intensity_image"] = tuple(
+                intensity_image[sl] * mask[..., cp.newaxis]
+                for img, (sl, mask) in enumerate(zip(imslices, masks), start=1)
+            )
+        else:
+            props_dict["intensity_image"] = tuple(
+                intensity_image[sl] * mask
+                for img, (sl, mask) in enumerate(zip(slices, masks), start=1)
+            )
+        if not compute_image:
+            return props_dict["intensity_image"]
+    return props_dict["image"], props_dict["intensity_image"]
+
+
+def regionprops_coords(
+    label_image,
+    max_label=None,
+    spacing=None,
+    compute_coords=True,
+    compute_coords_scaled=False,
+    props_dict=None,
+):
+    """Return tuple(s) of arrays of coordinates for each labeled region.
+
+    Length of the tuple(s) is equal to `max_label`.
+
+    Notes
+    -----
+    This is provided only for completeness, but unlike for the RegionProps
+    class, these are not used to compute any of the other properties.
+    """
+    if max_label is None:
+        max_label = int(label_image.max())
+    if props_dict is None:
+        props_dict = dict()
+
+    coords_concat, _ = get_compressed_labels(
+        label_image, max_label=max_label, sort_labels=True
+    )
+
+    if "num_pixels" not in props_dict:
+        num_pixels = regionprops_num_pixels(
+            label_image, max_label=max_label, props_dict=props_dict
+        )
+    else:
+        num_pixels = props_dict["num_pixels"]
+
+    # stack ndim arrays into a single (pixels, ndim) array
+    coords_concat = cp.stack(coords_concat, axis=-1)
+
+    # scale based on spacing
+    if compute_coords_scaled:
+        max_exact_float32_int = 16777216  # 2 ** 24
+        max_sz = max(label_image.shape)
+        float_type = (
+            cp.float32 if max_sz < max_exact_float32_int else cp.float64
+        )
+        coords_concat_scaled = coords_concat.astype(float_type)
+        if spacing is not None:
+            scale_factor = cp.asarray(spacing, dtype=float_type)[cp.newaxis, :]
+            coords_concat_scaled *= scale_factor
+        coords_scaled = []
+
+    if compute_coords:
+        coords = []
+
+    # split separate labels out of the concatenated array above
+    num_pixels_cpu = cp.asnumpy(num_pixels)
+    slice_start = 0
+    slice_stops = np.cumsum(num_pixels_cpu)
+    for slice_stop in slice_stops:
+        sl = slice(slice_start, slice_stop)
+        if compute_coords:
+            coords.append(coords_concat[sl, :])
+        if compute_coords_scaled:
+            coords_scaled.append(coords_concat_scaled[sl, :])
+        slice_start = slice_stop
+    coords = tuple(coords)
+    if compute_coords:
+        props_dict["coords"] = coords
+        if not compute_coords_scaled:
+            return coords
+    if compute_coords_scaled:
+        coords_scaled = tuple(coords_scaled)
+        props_dict["coords_scaled"] = coords_scaled
+        if not compute_coords:
+            return coords_scaled
+    return coords, coords_scaled
 
 
 need_moments_order1 = {
@@ -190,6 +389,8 @@ requires["bbox"] = (
 
 requires["num_pixels"] = {
     "area",
+    "coords",
+    "coords_scaled",
     "intensity_mean",
     "intensity_std",
     "num_pixels",
@@ -595,24 +796,25 @@ def regionprops_dict(
     compute_images = "image" in requested_props
     compute_intensity_images = "intensity_image" in requested_props
     if compute_intensity_images or compute_images:
-        masks = tuple(
-            label_image[sl] == lab
-            for lab, sl in enumerate(out["slice"], start=1)
+        regionprops_image(
+            label_image,
+            intensity_image=intensity_image
+            if compute_intensity_images
+            else None,  # noqa: E501
+            max_label=max_label,
+            props_dict=out,
+            compute_image=compute_images,
         )
 
-        if compute_intensity_images:
-            out["intensity_image"] = tuple(
-                img[sl] * mask
-                for lab, (sl, mask) in enumerate(
-                    zip(out["slice"], masks), start=1
-                )
-            )
-
-        if compute_images:
-            out["image"] = tuple(
-                label_image[sl] * mask
-                for lab, (sl, mask) in enumerate(
-                    zip(out["slice"], masks), start=1
-                )
-            )
+    compute_coords = "coords" in requested_props
+    compute_coords_scaled = "coords_scaled" in requested_props
+    if compute_coords or compute_coords_scaled:
+        regionprops_coords(
+            label_image,
+            max_label=max_label,
+            spacing=spacing,
+            compute_coords=compute_coords,
+            compute_coords_scaled=compute_coords_scaled,
+            props_dict=out,
+        )
     return out

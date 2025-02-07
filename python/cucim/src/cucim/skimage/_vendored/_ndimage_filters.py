@@ -390,7 +390,7 @@ def _correlate_or_convolve1d(
 
 @cupy.memoize(for_each_device=True)
 def _get_correlate_kernel(
-    mode, w_shape, int_type, offsets, cval, *, has_mask=False
+    modes, w_shape, int_type, offsets, cval, *, has_mask=False
 ):
     pre = ""
     if has_mask:
@@ -1422,7 +1422,7 @@ def maximum_filter(
         "max",
         axes,
         mask=mask,
-        )
+    )
 
 
 def _min_or_max_filter(
@@ -1895,7 +1895,7 @@ def percentile_filter(
         cval,
         origin,
         axes,
-        mask=mask
+        mask=mask,
     )
 
 

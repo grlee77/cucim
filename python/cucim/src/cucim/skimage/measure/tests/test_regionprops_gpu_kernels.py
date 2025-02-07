@@ -23,8 +23,10 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_centroid,
     regionprops_centroid_local,
     regionprops_centroid_weighted,
+    regionprops_coords,
     regionprops_euler,
     regionprops_extent,
+    regionprops_image,
     regionprops_inertia_tensor,
     regionprops_inertia_tensor_eigvals,
     regionprops_intensity_mean,
@@ -1027,3 +1029,60 @@ def test_euler(
             cp.asnumpy(labels), properties=["euler_number"]
         )
         assert_array_equal(values, expected["euler_number"])
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("num_channels", [1, 3])
+def test_image(ndim, num_channels):
+    shape = (256, 512) if ndim == 2 else (35, 63, 37)
+    labels = get_labels_nd(shape)
+    intensity_image = get_intensity_image(
+        shape, dtype=cp.uint16, num_channels=num_channels
+    )
+    max_label = int(cp.max(labels))
+    images, intensity_images = regionprops_image(
+        labels, max_label=max_label, intensity_image=intensity_image
+    )
+    assert len(images) == max_label
+    assert len(intensity_images) == max_label
+
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        intensity_image=cp.asnumpy(intensity_image),
+        properties=["image", "intensity_image"],
+    )
+    for n in range(max_label):
+        assert_array_equal(images[n], expected["image"][n])
+        assert_array_equal(intensity_images[n], expected["intensity_image"][n])
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("spacing", [None, (1, 1, 1), (1.5, 0.5, 0.76)])
+def test_coords(ndim, spacing):
+    shape = (256, 512) if ndim == 2 else (35, 63, 37)
+    if spacing is not None:
+        spacing = spacing[:ndim]
+    labels = get_labels_nd(shape)
+    max_label = int(cp.max(labels))
+    coords, coords_scaled = regionprops_coords(
+        labels,
+        max_label=max_label,
+        spacing=spacing,
+        compute_coords=True,
+        compute_coords_scaled=True,
+    )
+    assert len(coords) == max_label
+    assert len(coords_scaled) == max_label
+
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        spacing=spacing,
+        properties=["coords", "coords_scaled"],
+    )
+    for n in range(max_label):
+        # cast to Python int to match dtype from CPU case
+        assert_array_equal(coords[n].astype(int), expected["coords"][n])
+
+        assert_allclose(
+            coords_scaled[n], expected["coords_scaled"][n], rtol=1e-5
+        )
