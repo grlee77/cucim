@@ -1,5 +1,6 @@
 import functools
 import math
+import warnings
 from copy import deepcopy
 
 import cupy as cp
@@ -19,6 +20,7 @@ from cucim.skimage.measure._regionprops_gpu import (
     equivalent_diameter_area_3d,
     regionprops_area,
     regionprops_area_bbox,
+    regionprops_area_convex,
     regionprops_bbox_coords,
     regionprops_centroid,
     regionprops_centroid_local,
@@ -147,6 +149,72 @@ def test_area(precompute_max, ndim, area_dtype, spacing):
     assert_allclose(
         ed, expected["equivalent_diameter_area"], rtol=1e-5, atol=1e-5
     )
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("spacing", [None, (1, 1, 1), (0.5, 0.35, 0.75)])
+@pytest.mark.parametrize(
+    "blob_kwargs", [{}, dict(blob_size_fraction=0.12, volume_fraction=0.3)]
+)
+def test_area_convex_and_solidity(ndim, spacing, blob_kwargs):
+    shape = (256, 512) if ndim == 2 else (64, 64, 80)
+    labels = get_labels_nd(shape, **blob_kwargs)
+    # discard any extra dimensions from spacing
+    if spacing is not None:
+        spacing = spacing[:ndim]
+
+    max_label = int(cp.max(labels))
+    area = regionprops_area(
+        labels,
+        spacing=spacing,
+        max_label=max_label,
+    )
+    _, _, images_convex = regionprops_image(
+        labels,
+        max_label=max_label,
+        compute_convex=True,
+    )
+    area_convex = regionprops_area_convex(
+        images_convex,
+        max_label=max_label,
+        spacing=spacing,
+    )
+    solidity = area / area_convex
+
+    # suppress any QHull warnings coming from the scikit-image implementation
+    warnings.filterwarnings(
+        "ignore",
+        message="Failed to get convex hull image",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="divide by zero",
+        category=RuntimeWarning,
+    )
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        spacing=spacing,
+        properties=["area", "area_convex", "solidity"],
+    )
+    warnings.resetwarnings()
+
+    assert_allclose(area, expected["area"])
+
+    # Note if 3d blobs are size 1 on one of the axes, it can cause QHull to
+    # fail and return a zeros convex image for that label. This has been
+    # resolved for cuCIM, but not yet for scikit-image.
+    # The test case with blob_kwargs != {} was chosen as a known good
+    # setting where such an edge case does NOT occur.
+    if blob_kwargs:
+        assert_allclose(area_convex, expected["area_convex"])
+        assert_allclose(solidity, expected["solidity"])
+    else:
+        # Can't compare to scikit-image in this case
+        # Just make sure the convex area is not smaller than the original
+        rtol = 1e-4
+        assert cp.all(area_convex >= (area - rtol))
+        assert not cp.any(cp.isnan(solidity))
 
 
 @pytest.mark.parametrize("ndim", [2, 3])
@@ -1033,27 +1101,59 @@ def test_euler(
 
 @pytest.mark.parametrize("ndim", [2, 3])
 @pytest.mark.parametrize("num_channels", [1, 3])
-def test_image(ndim, num_channels):
-    shape = (256, 512) if ndim == 2 else (35, 63, 37)
-    labels = get_labels_nd(shape)
+@pytest.mark.parametrize(
+    "blob_kwargs", [{}, dict(blob_size_fraction=0.12, volume_fraction=0.3)]
+)
+def test_image(ndim, num_channels, blob_kwargs):
+    shape = (256, 512) if ndim == 2 else (64, 64, 80)
+
+    labels = get_labels_nd(shape, **blob_kwargs)
     intensity_image = get_intensity_image(
         shape, dtype=cp.uint16, num_channels=num_channels
     )
     max_label = int(cp.max(labels))
-    images, intensity_images = regionprops_image(
-        labels, max_label=max_label, intensity_image=intensity_image
+    images, intensity_images, images_convex = regionprops_image(
+        labels,
+        max_label=max_label,
+        intensity_image=intensity_image,
+        compute_convex=True,
     )
     assert len(images) == max_label
     assert len(intensity_images) == max_label
+    assert len(images_convex) == max_label
 
+    # suppress any QHull warnings coming from the scikit-image implementation
+    warnings.filterwarnings(
+        "ignore",
+        message="Failed to get convex hull image",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="divide by zero",
+        category=RuntimeWarning,
+    )
     expected = measure_cpu.regionprops_table(
         cp.asnumpy(labels),
         intensity_image=cp.asnumpy(intensity_image),
-        properties=["image", "intensity_image"],
+        properties=["image", "intensity_image", "image_convex"],
     )
+    warnings.resetwarnings()
+
     for n in range(max_label):
         assert_array_equal(images[n], expected["image"][n])
         assert_array_equal(intensity_images[n], expected["intensity_image"][n])
+        # Note if 3d blobs are size 1 on one of the axes, it can cause QHull to
+        # fail and return a zeros convex image for that label. This has been
+        # resolved for cuCIM, but not yet for scikit-image.
+        # The test case with blob_kwargs != {} was chosen as a known good
+        # setting where such an edge case does NOT occur.
+        if blob_kwargs:
+            assert_array_equal(images_convex[n], expected["image_convex"][n])
+        else:
+            # Can't compare to scikit-image in this case
+            # Just make sure the convex size is not smaller than the original
+            assert (images_convex[n].sum()) >= (images[n].sum())
 
 
 @pytest.mark.parametrize("ndim", [2, 3])

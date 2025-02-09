@@ -1,5 +1,10 @@
+import math
+from collections.abc import Sequence
+
 import cupy as cp
 import numpy as np
+
+from cucim.skimage.morphology import convex_hull_image
 
 from ._regionprops_gpu_basic_kernels import (
     area_bbox_from_slices,
@@ -42,6 +47,7 @@ __all__ = [
     "equivalent_diameter_area",
     "regionprops_area",
     "regionprops_area_bbox",
+    "regionprops_area_convex",
     "regionprops_bbox_coords",
     "regionprops_centroid",
     "regionprops_centroid_local",
@@ -156,6 +162,7 @@ def regionprops_image(
     intensity_image=None,
     max_label=None,
     compute_image=True,
+    compute_convex=False,
     props_dict=None,
     on_cpu=False,
 ):
@@ -189,15 +196,25 @@ def regionprops_image(
         label_image[sl] == lab for lab, sl in enumerate(slices, start=1)
     )
 
+    if compute_convex:
+        image_convex = tuple(
+            convex_hull_image(
+                m, omit_empty_coords_check=True, float64_computation=True
+            )
+            for m in masks
+        )
+        if on_cpu:
+            image_convex = tuple(cp.asnumpy(m) for m in image_convex)
+        props_dict["image_convex"] = image_convex
+    else:
+        image_convex = None
+
     if on_cpu:
         masks = tuple(cp.asnumpy(m) for m in masks)
         if intensity_image is not None:
             intensity_image = cp.asnumpy(intensity_image)
 
-    if compute_image:
-        props_dict["image"] = masks
-        if intensity_image is None:
-            return props_dict["image"]
+    props_dict["image"] = masks
 
     if intensity_image is not None:
         if intensity_image.ndim > label_image.ndim:
@@ -222,7 +239,9 @@ def regionprops_image(
         props_dict["intensity_image"] = intensity_images
         if not compute_image:
             return props_dict["intensity_image"]
-    return props_dict["image"], props_dict["intensity_image"]
+    else:
+        intensity_images = None
+    return masks, intensity_images, image_convex
 
 
 def regionprops_coords(
@@ -343,6 +362,16 @@ requires["moments_normalized"] = {
     "moments_hu",
 }
 
+requires["image_convex"] = {
+    "area_convex",
+    "solidity",
+    "image_convex",
+}
+requires["area_convex"] = {
+    "area_convex",
+    "solidity",
+}
+
 requires["moments_central"] = (
     {
         "moments_central",
@@ -378,6 +407,7 @@ requires["moments_weighted"] = {
 
 requires["area"] = {
     "area",
+    "solidity",
     "extent",
     "equivalent_diameter_area",
 }
@@ -453,6 +483,31 @@ def _check_moment_order(moment_order: set, requested_moment_props: set):
                 f"can't compute {requested_moment_props} with " "moment_order<1"
             )
     return order
+
+
+def regionprops_area_convex(
+    images_convex,
+    max_label=None,
+    spacing=None,
+    area_dtype=cp.float64,
+    props_dict=None,
+):
+    if max_label is None:
+        max_label = len(images_convex)
+    if not isinstance(images_convex, Sequence):
+        raise ValueError("Expected `images_convex` to be a sequence of images")
+    area_convex = cp.zeros((max_label,), dtype=area_dtype)
+    for i in range(max_label):
+        area_convex[i] = images_convex[i].sum()
+    if spacing is not None:
+        if isinstance(spacing, cp.ndarray):
+            pixel_area = cp.product(spacing)
+        else:
+            pixel_area = math.prod(spacing)
+        area_convex *= pixel_area
+    if props_dict is not None:
+        props_dict["area_convex"] = area_convex
+    return area_convex
 
 
 def regionprops_dict(
@@ -805,7 +860,8 @@ def regionprops_dict(
 
     compute_images = "image" in requested_props
     compute_intensity_images = "intensity_image" in requested_props
-    if compute_intensity_images or compute_images:
+    compute_convex = any(requires["image_convex"] & requested_props)
+    if compute_intensity_images or compute_images or compute_convex:
         regionprops_image(
             label_image,
             intensity_image=intensity_image
@@ -814,7 +870,18 @@ def regionprops_dict(
             max_label=max_label,
             props_dict=out,
             compute_image=compute_images,
+            compute_convex=compute_convex,
         )
+
+    compute_area_convex = any(requires["area_convex"] & requested_props)
+    if compute_area_convex:
+        regionprops_area_convex(
+            out["image_convex"], max_label=max_label, props_dict=out
+        )
+
+    compute_solidity = "solidity" in requested_props
+    if compute_solidity:
+        out["solidity"] = out["area"] / out["area_convex"]
 
     compute_coords = "coords" in requested_props
     compute_coords_scaled = "coords_scaled" in requested_props
