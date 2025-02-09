@@ -531,9 +531,18 @@ def test_moments_2d(
         kwargs_cpu["intensity_image"] = cp.asnumpy(
             kwargs_cpu["intensity_image"]
         )
+
+    # ignore possible warning from skimage implementation
+    warnings.filterwarnings(
+        "ignore",
+        message="invalid value encountered in scalar power",
+        category=RuntimeWarning,
+    )
     expected = measure_cpu.regionprops_table(
         cp.asnumpy(labels), properties=[prop], **kwargs_cpu
     )
+    warnings.resetwarnings()
+
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
@@ -663,9 +672,18 @@ def test_moments_3d(
         kwargs_cpu["intensity_image"] = cp.asnumpy(
             kwargs_cpu["intensity_image"]
         )
+
+    # ignore possible warning from skimage implementation
+    warnings.filterwarnings(
+        "ignore",
+        message="invalid value encountered in scalar power",
+        category=RuntimeWarning,
+    )
     expected = measure_cpu.regionprops_table(
         cp.asnumpy(labels), properties=[prop], **kwargs_cpu
     )
+    warnings.resetwarnings()
+
     moments = regionprops_moments(
         labels, max_label=max_label, order=order, **kwargs
     )
