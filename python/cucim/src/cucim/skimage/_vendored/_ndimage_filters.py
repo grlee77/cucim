@@ -586,9 +586,9 @@ def uniform_filter(
         sizes,
         get,
         output,
-        mode,
+        modes,
         cval,
-        origin,
+        origins,
         algorithm=algorithm,
         mask=mask,
     )
