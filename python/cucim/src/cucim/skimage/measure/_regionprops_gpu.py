@@ -4,6 +4,8 @@ from collections.abc import Sequence
 import cupy as cp
 import numpy as np
 
+import cucim.skimage._vendored.ndimage as ndi
+from cucim.skimage.measure import label
 from cucim.skimage.morphology import convex_hull_image
 
 from ._regionprops_gpu_basic_kernels import (
@@ -160,6 +162,7 @@ def get_compressed_labels(
 def regionprops_image(
     label_image,
     intensity_image=None,
+    slices=None,
     max_label=None,
     compute_image=True,
     compute_convex=False,
@@ -182,14 +185,15 @@ def regionprops_image(
     if props_dict is None:
         props_dict = dict()
 
-    if "slice" not in props_dict:
-        regionprops_bbox_coords(
-            label_image,
-            max_label=max_label,
-            return_slices=True,
-            props_dict=props_dict,
-        )
-    slices = props_dict["slice"]
+    if slices is None:
+        if "slice" not in props_dict:
+            regionprops_bbox_coords(
+                label_image,
+                max_label=max_label,
+                return_slices=True,
+                props_dict=props_dict,
+            )
+        slices = props_dict["slice"]
 
     # mask so there will only be a single label value in each returned slice
     masks = tuple(
@@ -318,6 +322,114 @@ def regionprops_coords(
         if not compute_coords:
             return coords_scaled
     return coords, coords_scaled
+
+
+def regionprops_edge_mask(labels):
+    ndim = labels.ndim
+    slices = [
+        slice(
+            None,
+        )
+    ] * ndim
+    edge_mask = cp.zeros(labels.shape, dtype=bool)
+    for d in range(ndim):
+        edge_slices1 = slices[:d] + [slice(0, 1)] + slices[d + 1 :]
+        edge_slices2 = slices[:d] + [slice(-1, None)] + slices[d + 1 :]
+        edge_mask[tuple(edge_slices1)] = 1
+        edge_mask[tuple(edge_slices2)] = 1
+        slices[d] = slice(1, -1)
+    return edge_mask
+
+
+def regionprops_edge_pixels(labels, max_label=None):
+    if max_label is None:
+        max_label = int(labels.max())
+
+    # get mask of edge pixels
+    edge_mask = regionprops_edge_mask(labels)
+
+    # include a bin for the background
+    nbins = max_label + 1
+    # exclude background region from edge_counts
+    edge_counts = cp.bincount(labels[edge_mask], minlength=nbins)[1:]
+    return edge_counts
+
+
+def regionprops_fill_holes(
+    labels,
+    max_label=None,
+    props_dict=None,
+    background_label_is_common=True,
+):
+    """
+
+    Parameters
+    ----------
+    labels : cupy.ndarray
+        The label image
+    max_label : the maximum label present in labels
+        If None, will be determined internally.
+    props_dict : dict or None
+        Dictionary to store any measured properties.
+    background_label_is_common : bool, optional
+        If True, a faster algorithm is used that assumes that along the edges
+        of the `labels` image there are more background pixels than "hole"
+        piixels. If that is not true, set `background_label_is_common` to False
+        to use the `cupyx.scipy.ndimage.binary_fill_holes` (currently
+        inefficient particularly when most pixels are background pixels).
+
+    Notes
+    -----
+
+    """
+    if max_label is None:
+        max_label = int(labels.max())
+
+    # get mask of zero-valued regions
+    inverse_binary_mask = labels == 0
+    inverse_labels = label(inverse_binary_mask)
+
+    if background_label_is_common:
+        if props_dict is not None and "num_pixels" in props_dict:
+            npix = labels.size
+            npix_labeled = int(props_dict["num_pixels"].sum())
+            percent_background = 100 * (npix - npix_labeled) / npix
+            count_edges_only = percent_background > 10
+        else:
+            count_edges_only = True
+
+        if not count_edges_only:
+            inv_counts = cp.bincount(
+                inverse_labels[inverse_labels > 0], minlength=max_label
+            )
+
+            # assume the amount of background is > than the number of holes
+            background_index = int(cp.argmax(inv_counts))
+        else:
+            # get mask of edge pixels
+            edge_mask = regionprops_edge_mask(labels)
+
+            # assume that there are more background pixels than "hole" pixels
+            # along the border.
+            inv_counts = cp.bincount(
+                inverse_labels[edge_mask], minlength=max_label + 1
+            )[1:]
+            # assume the amount of background is > than the number of holes
+            background_index = int(cp.argmax(inv_counts)) + 1
+
+        inverse_binary_mask[inverse_labels == background_index] = 0
+        binary_holes_filled = (labels > 0) + inverse_binary_mask
+    else:
+        binary_holes_filled = ndi.binary_fill_holes(labels > 0)
+
+    labels_filled = label(binary_holes_filled)
+    if props_dict is not None:
+        props_dict["labels_filled"] = labels_filled
+    # images_filled, _, _ = regionprops_image(labels_filled, slices=slices)
+    # area_filled = regionprops_area(
+    #     props["labels_filled"], max_label=max_label, spacing=spacing
+    # )
+    return labels_filled
 
 
 need_moments_order1 = {
