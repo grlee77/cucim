@@ -1645,7 +1645,7 @@ def regionprops_inertia_tensor_eigvals(
             props_dict["axis_length_major"] = axis_lengths[..., 0]
             props_dict["axis_length_minor"] = axis_lengths[..., -1]
         if compute_eigenvectors:
-            props_dict["inertia_tensor_eigvecs"] = eigvecs
+            props_dict["inertia_tensor_eigenvectors"] = eigvecs
     # Note:
     #   For eigenvalues in descending order as returned here:
     #     ITK's flatness and elongation are:

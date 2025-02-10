@@ -18,6 +18,7 @@ from ._regionprops_gpu_basic_kernels import (
     regionprops_bbox_coords,
     regionprops_extent,
     regionprops_num_pixels,
+    regionprops_num_pixels_perimeter,
 )
 from ._regionprops_gpu_intensity_kernels import (
     regionprops_intensity_mean,
@@ -71,6 +72,11 @@ __all__ = [
     "regionprops_num_pixels",
     "regionprops_perimeter",
     "regionprops_perimeter_crofton",
+    # extra functions for cuCIM not currently in scikit-image
+    "regionprops_edge_mask",
+    "regionprops_num_boundary_pixels",
+    "regionprops_num_pixels_perimeter",
+    "regionprops_label_filled",
 ]
 
 
@@ -86,8 +92,8 @@ __all__ = [
 PROPS_GPU = {
     "area",
     "area_bbox",
-    # area_convex
-    # area_filled
+    "area_convex",
+    "area_filled",
     "bbox",
     "coords",
     "coords_scaled",
@@ -101,18 +107,20 @@ PROPS_GPU = {
     "equivalent_diameter_area",
     "euler",
     "extent",
-    # feret_diameter_mx
+    # feret_diameter_max
     "image",
-    # image_convex
-    # image_filled
+    "image_convex",
+    "image_filled",
     "inertia_tensor",
     "inertia_tensor_eigvals",
+    "inertia_tensor_eigenvectors",  # extra property not currently in skimage
     "intensity_image",
     "intensity_mean",
     "intensity_std",
     "intensity_max",
     "intensity_min",
     "label",
+    "label_filled",  # extra property not currently in skimage
     "moments",
     "moments_central",
     "moments_hu",
@@ -122,6 +130,8 @@ PROPS_GPU = {
     "moments_weighted_hu",
     "moments_weighted_normalized",
     "num_pixels",
+    "num_pixels_perimeter",  # extra property not currently in skimage
+    "num_boundary_pixels",  # extra property not currently in skimage
     "orientation",
     "perimeter",
     "perimeter_crofton",
@@ -325,6 +335,9 @@ def regionprops_coords(
 
 
 def regionprops_edge_mask(labels):
+    """Generate a binary mask corresponding to the pixels touching the image
+    boundary.
+    """
     ndim = labels.ndim
     slices = [
         slice(
@@ -341,7 +354,10 @@ def regionprops_edge_mask(labels):
     return edge_mask
 
 
-def regionprops_edge_pixels(labels, max_label=None):
+def regionprops_num_boundary_pixels(labels, max_label=None, props_dict=None):
+    """Determine the number of pixels touching the image boundary for each
+    labeled region.
+    """
     if max_label is None:
         max_label = int(labels.max())
 
@@ -352,10 +368,12 @@ def regionprops_edge_pixels(labels, max_label=None):
     nbins = max_label + 1
     # exclude background region from edge_counts
     edge_counts = cp.bincount(labels[edge_mask], minlength=nbins)[1:]
+    if props_dict is not None:
+        props_dict["num_boundary_pixels"] = edge_counts
     return edge_counts
 
 
-def regionprops_fill_holes(
+def regionprops_label_filled(
     labels,
     max_label=None,
     props_dict=None,
@@ -422,14 +440,10 @@ def regionprops_fill_holes(
     else:
         binary_holes_filled = ndi.binary_fill_holes(labels > 0)
 
-    labels_filled = label(binary_holes_filled)
+    label_filled = label(binary_holes_filled)
     if props_dict is not None:
-        props_dict["labels_filled"] = labels_filled
-    # images_filled, _, _ = regionprops_image(labels_filled, slices=slices)
-    # area_filled = regionprops_area(
-    #     props["labels_filled"], max_label=max_label, spacing=spacing
-    # )
-    return labels_filled
+        props_dict["label_filled"] = label_filled
+    return label_filled
 
 
 need_moments_order1 = {
@@ -444,6 +458,7 @@ need_moments_order2 = {
     "eccentricity",
     "inertia_tensor",
     "inertia_tensor_eigvals",
+    "inertia_tensor_eigenvectors",
     "moments",
     "moments_central",
     "moments_normalized",
@@ -459,10 +474,12 @@ requires = {}
 requires["inertia_tensor_eigvals"] = {
     "eccentricity",
     "inertia_tensor_eigvals",
+    "inertia_tensor_eigenvectors",
 }
 requires["inertia_tensor"] = {
     "inertia_tensor",
     "inertia_tensor_eigvals",
+    "inertia_tensor_eigenvectors",
     "axis_major_length",
     "axis_minor_length",
     "inertia_tensor",
@@ -546,6 +563,12 @@ requires["num_pixels"] = {
     "intensity_mean",
     "intensity_std",
     "num_pixels",
+}
+
+requires["label_filled"] = {
+    "area_filled",
+    "image_filled",
+    "label_filled",
 }
 
 ndim_2_only = {
@@ -707,6 +730,7 @@ def regionprops_dict(
             spacing=spacing,
             max_label=max_label,
             dtype=cp.float32,
+            filled=False,
             **perf_kwargs,
             props_dict=out,
         )
@@ -913,7 +937,10 @@ def regionprops_dict(
                 props_dict=out,
             )
 
-            if "inertia_tensor_eigvals" in requested_inertia_tensor_props:
+            if any(
+                requires["inertia_tensor_eigvals"]
+                & requested_inertia_tensor_props
+            ):
                 compute_axis_lengths = (
                     "axis_minor_length" in requested_inertia_tensor_props
                     or "axis_major_length" in requested_inertia_tensor_props
@@ -923,7 +950,11 @@ def regionprops_dict(
                     compute_axis_lengths=compute_axis_lengths,
                     compute_eccentricity=(
                         "eccentricity" in requested_inertia_tensor_props
-                    ),  # noqa: E501
+                    ),
+                    compute_eigenvectors=(
+                        "inertia_tensor_eigenvectors"
+                        in requested_inertia_tensor_props
+                    ),
                     props_dict=out,
                 )
 
@@ -1006,4 +1037,27 @@ def regionprops_dict(
             compute_coords_scaled=compute_coords_scaled,
             props_dict=out,
         )
+
+    compute_label_filled = any(requires["label_filled"] & requested_props)
+    if compute_label_filled:
+        regionprops_label_filled(
+            label_image,
+            max_label=max_label,
+            props_dict=out,
+        )
+        if "area_filled" in requested_props:
+            out["area_filled"] = regionprops_area(
+                out["label_filled"],
+                max_label=max_label,
+                filled=True,
+                props_dict=out,
+            )
+        if "image_filled" in requested_props:
+            out["image_filled"], _, _ = regionprops_image(
+                out["label_filled"],
+                max_label=max_label,
+                compute_image=True,
+                compute_convex=False,
+                props_dict=None,  # omit: using custom "image_filled" key
+            )
     return out

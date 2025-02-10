@@ -62,6 +62,10 @@ def regionprops_perimeter(
     of the field of view, so an accurate perimeter cannot be measured for such
     objects.
 
+    If the labeled regions have holes, the hole edges will be included in this
+    measurement. If this is not desired, use regionprops_label_filled to fill
+    the holes and then pass the filled labels image to this function.
+
     TODO(grelee): should be able to make this faster with a customized
     filter/kernel instead of convolve + bincount, etc.
 
@@ -247,6 +251,10 @@ def regionprops_perimeter_crofton(
     does. In any case, an object touching the image edge likely extends outside
     of the field of view, so an accurate perimeter cannot be measured for such
     objects.
+
+    If the labeled regions have holes, the hole edges will be included in this
+    measurement. If this is not desired, use regionprops_label_filled to fill
+    the holes and then pass the filled labels image to this function.
 
     TODO(grelee): should be able to make this faster with a customized
     filter/kernel instead of convolve + bincount, etc.

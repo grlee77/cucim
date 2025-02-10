@@ -3,6 +3,8 @@ import math
 import cupy as cp
 import numpy as np
 
+import cucim.skimage._vendored.ndimage as ndi
+
 from ._regionprops_gpu_utils import (
     _get_count_dtype,
     _includes,
@@ -20,6 +22,8 @@ __all__ = [
     "regionprops_bbox_coords",
     "regionprops_extent",
     "regionprops_num_pixels",
+    # extra functions for cuCIM not currently in scikit-image
+    "regionprops_num_pixels_perimeter",
 ]
 
 
@@ -271,9 +275,50 @@ def get_bbox_coords_kernel(
     )
 
 
+def regionprops_num_pixels_perimeter(
+    label_image,
+    max_label=None,
+    pixels_per_thread=16,
+    max_labels_per_thread=None,
+    props_dict=None,
+):
+    """Determine the number of pixels along the perimeter of each labeled
+    region.
+
+    Notes
+    -----
+    If the labeled regions have holes, the hole edges will be included in this
+    measurement. If this is not desired, use regionprops_label_filled to fill
+    the holes and then pass the filled labels image to this function.
+
+    For more accurate perimeter measurements, use `regionprops_perimeter` or
+    `regionprops_perimeter_crofton` instead.
+    """
+    if max_label is None:
+        max_label = int(label_image.max())
+    # remove non-boundary pixels
+    binary_label_mask = label_image > 0
+    footprint = ndi.generate_binary_structure(label_image.ndim, connectivity=1)
+    binary_label_mask_eroded = ndi.binary_erosion(binary_label_mask, footprint)
+    labeled_edges = label_image * ~binary_label_mask_eroded
+
+    num_pixels_perimeter = regionprops_num_pixels(
+        labeled_edges,
+        max_label=max_label,
+        filled=False,
+        pixels_per_thread=pixels_per_thread,
+        max_labels_per_thread=max_labels_per_thread,
+        props_dict=None,
+    )
+    if props_dict is not None:
+        props_dict[num_pixels_perimeter] = num_pixels_perimeter
+    return num_pixels_perimeter
+
+
 def regionprops_num_pixels(
     label_image,
     max_label=None,
+    filled=False,
     pixels_per_thread=16,
     max_labels_per_thread=None,
     props_dict=None,
@@ -281,6 +326,7 @@ def regionprops_num_pixels(
     if max_label is None:
         max_label = int(label_image.max())
     num_counts = max_label
+    num_pixels_prop_name = "num_pixels_filled" if filled else "num_pixels"
 
     count_dtype, int32_count = _get_count_dtype(label_image.size)
 
@@ -306,7 +352,7 @@ def regionprops_num_pixels(
         size=math.ceil(label_image.size / pixels_per_thread),
     )
     if props_dict is not None:
-        props_dict["num_pixels"] = counts
+        props_dict[num_pixels_prop_name] = counts
     return counts
 
 
@@ -315,14 +361,17 @@ def regionprops_area(
     spacing=None,
     max_label=None,
     dtype=cp.float32,
+    filled=False,
     pixels_per_thread=16,
     max_labels_per_thread=None,
     props_dict=None,
 ):
+    num_pixels_prop_name = "num_pixels_filled" if filled else "num_pixels"
+    area_prop_name = "area_filled" if filled else "area"
     # integer atomicAdd is faster than floating point so better to convert
     # after counting
-    if props_dict is not None and "num_pixels" in props_dict:
-        num_pixels = props_dict["num_pixels"]
+    if props_dict is not None and num_pixels_prop_name in props_dict:
+        num_pixels = props_dict[num_pixels_prop_name]
     else:
         num_pixels = regionprops_num_pixels(
             label_image,
@@ -331,7 +380,7 @@ def regionprops_area(
             max_labels_per_thread=max_labels_per_thread,
         )
         if props_dict is not None:
-            props_dict["num_pixels"] = num_pixels
+            props_dict[num_pixels_prop_name] = num_pixels
 
     area = num_pixels.astype(dtype)
     if spacing is not None:
@@ -342,7 +391,7 @@ def regionprops_area(
         area *= pixel_area
 
     if props_dict is not None:
-        props_dict["area"] = area
+        props_dict[area_prop_name] = area
     return area
 
 
