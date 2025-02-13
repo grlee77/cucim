@@ -1,12 +1,10 @@
-import math
-from collections.abc import Sequence
+import warnings
+from copy import copy
 
 import cupy as cp
 import numpy as np
 
-import cucim.skimage._vendored.ndimage as ndi
-from cucim.skimage.measure import label
-from cucim.skimage.morphology import convex_hull_image
+from cucim.skimage.measure._regionprops import COL_DTYPES, PROPS
 
 from ._regionprops_gpu_basic_kernels import (
     area_bbox_from_slices,
@@ -16,9 +14,18 @@ from ._regionprops_gpu_basic_kernels import (
     regionprops_area,
     regionprops_area_bbox,
     regionprops_bbox_coords,
+    regionprops_boundary_mask,
+    regionprops_coords,
     regionprops_extent,
+    regionprops_image,
+    regionprops_label_filled,
+    regionprops_num_boundary_pixels,
     regionprops_num_pixels,
     regionprops_num_pixels_perimeter,
+)
+from ._regionprops_gpu_convex import (
+    regionprops_area_convex,
+    regionprops_feret_diameter_max,
 )
 from ._regionprops_gpu_intensity_kernels import (
     regionprops_intensity_mean,
@@ -31,6 +38,7 @@ from ._regionprops_gpu_misc_kernels import (
     regionprops_perimeter_crofton,
 )
 from ._regionprops_gpu_moments_kernels import (
+    _check_moment_order,
     regionprops_centroid,
     regionprops_centroid_local,
     regionprops_centroid_weighted,
@@ -40,6 +48,7 @@ from ._regionprops_gpu_moments_kernels import (
     regionprops_moments_central,
     regionprops_moments_hu,
     regionprops_moments_normalized,
+    requires as moment_requirements,
 )
 from ._regionprops_gpu_utils import _find_close_labels, _get_min_integer_dtype
 
@@ -73,7 +82,7 @@ __all__ = [
     "regionprops_perimeter",
     "regionprops_perimeter_crofton",
     # extra functions for cuCIM not currently in scikit-image
-    "regionprops_edge_mask",
+    "regionprops_boundary_mask",
     "regionprops_num_boundary_pixels",
     "regionprops_num_pixels_perimeter",
     "regionprops_label_filled",
@@ -85,454 +94,59 @@ __all__ = [
 #
 # One caveat is that centroid/moment/inertia_tensor properties currently only
 # support 2D and 3D data with moments up to 3rd order.
-#
-# Comment lines indicate currently missing items that would be nice to support
-# in the future.
 
-PROPS_GPU = {
-    "area",
-    "area_bbox",
-    "area_convex",
-    "area_filled",
-    "bbox",
-    "coords",
-    "coords_scaled",
-    "axis_major_length",
-    "axis_minor_length",
-    "centroid",
-    "centroid_local",
-    "centroid_weighted",
-    "centroid_weighted_local",
-    "eccentricity",
-    "equivalent_diameter_area",
-    "euler",
-    "extent",
-    # feret_diameter_max
-    "image",
-    "image_convex",
-    "image_filled",
-    "inertia_tensor",
-    "inertia_tensor_eigvals",
-    "inertia_tensor_eigenvectors",  # extra property not currently in skimage
-    "intensity_image",
+# all properties from PROPS have been implemented
+PROPS_GPU = copy(PROPS)
+# extra properties not currently in scikit-image
+PROPS_GPU_EXTRA = {
+    "axis_lengths": "axis_lengths",
+    "inertia_tensor_eigenvectors": "inertia_tensor_eigenvectors",
+    "num_pixels_perimeter": "num_pixels_perimeter",
+    "num_boundary_pixels": "num_boundary_pixels",
+}
+PROPS_GPU.update(PROPS_GPU_EXTRA)
+
+CURRENT_PROPS_GPU = set(PROPS_GPU.values())
+
+COL_DTYPES_EXTRA = {
+    "axis_lengths": float,
+    "inertia_tensor_eigenvectors": float,
+    "num_pixels_perimeter": int,
+    "num_boundary_pixels": int,
+}
+COL_DTYPES_GPU = copy(COL_DTYPES)
+COL_DTYPES_GPU.update(COL_DTYPES_EXTRA)
+
+# There is also "label_filled" but this is a global filled labels image
+
+OBJECT_COLUMNS_GPU = [
+    col for col, dtype in COL_DTYPES_GPU.items() if dtype == object
+]
+
+# requires dictionary has key value pairs where the values for a given key
+# list the properties that require that key in order to compute.
+
+requires = copy(moment_requirements)
+
+# set of properties that require an intensity image
+need_intensity_image = {
     "intensity_mean",
     "intensity_std",
     "intensity_max",
     "intensity_min",
-    "label",
-    "label_filled",  # extra property not currently in skimage
-    "moments",
-    "moments_central",
-    "moments_hu",
-    "moments_normalized",
-    "moments_weighted",
-    "moments_weighted_central",
-    "moments_weighted_hu",
-    "moments_weighted_normalized",
-    "num_pixels",
-    "num_pixels_perimeter",  # extra property not currently in skimage
-    "num_boundary_pixels",  # extra property not currently in skimage
-    "orientation",
-    "perimeter",
-    "perimeter_crofton",
-    "slice",
-    # solidity
 }
-
-
-def get_compressed_labels(
-    labels, max_label, intensity_image=None, sort_labels=True
-):
-    """Produce raveled list of coordinates and label values, excluding any
-    background pixels.
-
-    Some region properties can be applied to this data format more efficiently,
-    than for the original labels image. I have not yet benchmarked when it may
-    be worth doing this initial step, though.
-    """
-    label_dtype = _get_min_integer_dtype(max_label, signed=False)
-    if labels.dtype != label_dtype:
-        labels = labels.astype(dtype=label_dtype)
-    coords_dtype = _get_min_integer_dtype(max(labels.shape), signed=False)
-    label_coords = cp.nonzero(labels)
-    if label_coords[0].dtype != coords_dtype:
-        label_coords = tuple(c.astype(coords_dtype) for c in label_coords)
-    labels1d = labels[label_coords]
-    if sort_labels:
-        sort_indices = cp.argsort(labels1d)
-        label_coords = tuple(c[sort_indices] for c in label_coords)
-        labels1d = labels1d[sort_indices]
-    if intensity_image:
-        img1d = intensity_image[label_coords]
-        return label_coords, labels1d, img1d
-    # max_label = int(labels1d[-1])
-    return label_coords, labels1d
-
-
-def regionprops_image(
-    label_image,
-    intensity_image=None,
-    slices=None,
-    max_label=None,
-    compute_image=True,
-    compute_convex=False,
-    props_dict=None,
-    on_cpu=False,
-):
-    """Return tuples of images of isolated label and/or intensities.
-
-    Each image incorporates only the bounding box region for a given label.
-
-    Length of the tuple(s) is equal to `max_label`.
-
-    Notes
-    -----
-    This is provided only for completeness, but unlike for the RegionProps
-    class, these are not used to compute any of the other properties.
-    """
-    if max_label is None:
-        max_label = int(label_image.max())
-    if props_dict is None:
-        props_dict = dict()
-
-    if slices is None:
-        if "slice" not in props_dict:
-            regionprops_bbox_coords(
-                label_image,
-                max_label=max_label,
-                return_slices=True,
-                props_dict=props_dict,
-            )
-        slices = props_dict["slice"]
-
-    # mask so there will only be a single label value in each returned slice
-    masks = tuple(
-        label_image[sl] == lab for lab, sl in enumerate(slices, start=1)
-    )
-
-    if compute_convex:
-        image_convex = tuple(
-            convex_hull_image(
-                m, omit_empty_coords_check=True, float64_computation=True
-            )
-            for m in masks
-        )
-        if on_cpu:
-            image_convex = tuple(cp.asnumpy(m) for m in image_convex)
-        props_dict["image_convex"] = image_convex
-    else:
-        image_convex = None
-
-    if on_cpu:
-        masks = tuple(cp.asnumpy(m) for m in masks)
-        if intensity_image is not None:
-            intensity_image = cp.asnumpy(intensity_image)
-
-    props_dict["image"] = masks
-
-    if intensity_image is not None:
-        if intensity_image.ndim > label_image.ndim:
-            if intensity_image.ndim != label_image.ndim + 1:
-                raise ValueError(
-                    "Unexpected intensity_image.ndim. Should be "
-                    "label_image.ndim or label_image.ndim + 1"
-                )
-            imslices = tuple(sl + (slice(None),) for sl in slices)
-            intensity_images = tuple(
-                intensity_image[sl] * mask[..., cp.newaxis]
-                for img, (sl, mask) in enumerate(zip(imslices, masks), start=1)
-            )
-
-        else:
-            intensity_images = tuple(
-                intensity_image[sl] * mask
-                for img, (sl, mask) in enumerate(zip(slices, masks), start=1)
-            )
-        if on_cpu:
-            intensity_images = (cp.asnumpy(img) for img in intensity_images)
-        props_dict["intensity_image"] = intensity_images
-        if not compute_image:
-            return props_dict["intensity_image"]
-    else:
-        intensity_images = None
-    return masks, intensity_images, image_convex
-
-
-def regionprops_coords(
-    label_image,
-    max_label=None,
-    spacing=None,
-    compute_coords=True,
-    compute_coords_scaled=False,
-    props_dict=None,
-):
-    """Return tuple(s) of arrays of coordinates for each labeled region.
-
-    Length of the tuple(s) is equal to `max_label`.
-
-    Notes
-    -----
-    This is provided only for completeness, but unlike for the RegionProps
-    class, these are not used to compute any of the other properties.
-    """
-    if max_label is None:
-        max_label = int(label_image.max())
-    if props_dict is None:
-        props_dict = dict()
-
-    coords_concat, _ = get_compressed_labels(
-        label_image, max_label=max_label, sort_labels=True
-    )
-
-    if "num_pixels" not in props_dict:
-        num_pixels = regionprops_num_pixels(
-            label_image, max_label=max_label, props_dict=props_dict
-        )
-    else:
-        num_pixels = props_dict["num_pixels"]
-
-    # stack ndim arrays into a single (pixels, ndim) array
-    coords_concat = cp.stack(coords_concat, axis=-1)
-
-    # scale based on spacing
-    if compute_coords_scaled:
-        max_exact_float32_int = 16777216  # 2 ** 24
-        max_sz = max(label_image.shape)
-        float_type = (
-            cp.float32 if max_sz < max_exact_float32_int else cp.float64
-        )
-        coords_concat_scaled = coords_concat.astype(float_type)
-        if spacing is not None:
-            scale_factor = cp.asarray(spacing, dtype=float_type)[cp.newaxis, :]
-            coords_concat_scaled *= scale_factor
-        coords_scaled = []
-
-    if compute_coords:
-        coords = []
-
-    # split separate labels out of the concatenated array above
-    num_pixels_cpu = cp.asnumpy(num_pixels)
-    slice_start = 0
-    slice_stops = np.cumsum(num_pixels_cpu)
-    for slice_stop in slice_stops:
-        sl = slice(slice_start, slice_stop)
-        if compute_coords:
-            coords.append(coords_concat[sl, :])
-        if compute_coords_scaled:
-            coords_scaled.append(coords_concat_scaled[sl, :])
-        slice_start = slice_stop
-    coords = tuple(coords)
-    if compute_coords:
-        props_dict["coords"] = coords
-        if not compute_coords_scaled:
-            return coords
-    if compute_coords_scaled:
-        coords_scaled = tuple(coords_scaled)
-        props_dict["coords_scaled"] = coords_scaled
-        if not compute_coords:
-            return coords_scaled
-    return coords, coords_scaled
-
-
-def regionprops_edge_mask(labels):
-    """Generate a binary mask corresponding to the pixels touching the image
-    boundary.
-    """
-    ndim = labels.ndim
-    slices = [
-        slice(
-            None,
-        )
-    ] * ndim
-    edge_mask = cp.zeros(labels.shape, dtype=bool)
-    for d in range(ndim):
-        edge_slices1 = slices[:d] + [slice(0, 1)] + slices[d + 1 :]
-        edge_slices2 = slices[:d] + [slice(-1, None)] + slices[d + 1 :]
-        edge_mask[tuple(edge_slices1)] = 1
-        edge_mask[tuple(edge_slices2)] = 1
-        slices[d] = slice(1, -1)
-    return edge_mask
-
-
-def regionprops_num_boundary_pixels(labels, max_label=None, props_dict=None):
-    """Determine the number of pixels touching the image boundary for each
-    labeled region.
-    """
-    if max_label is None:
-        max_label = int(labels.max())
-
-    # get mask of edge pixels
-    edge_mask = regionprops_edge_mask(labels)
-
-    # include a bin for the background
-    nbins = max_label + 1
-    # exclude background region from edge_counts
-    edge_counts = cp.bincount(labels[edge_mask], minlength=nbins)[1:]
-    if props_dict is not None:
-        props_dict["num_boundary_pixels"] = edge_counts
-    return edge_counts
-
-
-def regionprops_label_filled(
-    labels,
-    max_label=None,
-    props_dict=None,
-    background_label_is_common=True,
-):
-    """
-
-    Parameters
-    ----------
-    labels : cupy.ndarray
-        The label image
-    max_label : the maximum label present in labels
-        If None, will be determined internally.
-    props_dict : dict or None
-        Dictionary to store any measured properties.
-    background_label_is_common : bool, optional
-        If True, a faster algorithm is used that assumes that along the edges
-        of the `labels` image there are more background pixels than "hole"
-        piixels. If that is not true, set `background_label_is_common` to False
-        to use the `cupyx.scipy.ndimage.binary_fill_holes` (currently
-        inefficient particularly when most pixels are background pixels).
-
-    Notes
-    -----
-
-    """
-    if max_label is None:
-        max_label = int(labels.max())
-
-    # get mask of zero-valued regions
-    inverse_binary_mask = labels == 0
-    inverse_labels = label(inverse_binary_mask)
-
-    if background_label_is_common:
-        if props_dict is not None and "num_pixels" in props_dict:
-            npix = labels.size
-            npix_labeled = int(props_dict["num_pixels"].sum())
-            percent_background = 100 * (npix - npix_labeled) / npix
-            count_edges_only = percent_background > 10
-        else:
-            count_edges_only = True
-
-        if not count_edges_only:
-            inv_counts = cp.bincount(
-                inverse_labels[inverse_labels > 0], minlength=max_label
-            )
-
-            # assume the amount of background is > than the number of holes
-            background_index = int(cp.argmax(inv_counts))
-        else:
-            # get mask of edge pixels
-            edge_mask = regionprops_edge_mask(labels)
-
-            # assume that there are more background pixels than "hole" pixels
-            # along the border.
-            inv_counts = cp.bincount(
-                inverse_labels[edge_mask], minlength=max_label + 1
-            )[1:]
-            # assume the amount of background is > than the number of holes
-            background_index = int(cp.argmax(inv_counts)) + 1
-
-        inverse_binary_mask[inverse_labels == background_index] = 0
-        binary_holes_filled = (labels > 0) + inverse_binary_mask
-    else:
-        binary_holes_filled = ndi.binary_fill_holes(labels > 0)
-
-    label_filled = label(binary_holes_filled)
-    if props_dict is not None:
-        props_dict["label_filled"] = label_filled
-    return label_filled
-
-
-need_moments_order1 = {
-    "centroid",
-    "centroid_local",  # unless ndim > 3
-    "centroid_weighted",
-    "centroid_weighted_local",
-}
-need_moments_order2 = {
-    "axis_major_length",
-    "axis_minor_length",
-    "eccentricity",
-    "inertia_tensor",
-    "inertia_tensor_eigvals",
-    "inertia_tensor_eigenvectors",
-    "moments",
-    "moments_central",
-    "moments_normalized",
-    "moments_weighted",
-    "moments_weighted_central",
-    "moments_weighted_normalized",
-    "orientation",
-}
-need_moments_order3 = {"moments_hu", "moments_weighted_hu"}
-
-requires = {}
-
-requires["inertia_tensor_eigvals"] = {
-    "eccentricity",
-    "inertia_tensor_eigvals",
-    "inertia_tensor_eigenvectors",
-}
-requires["inertia_tensor"] = {
-    "inertia_tensor",
-    "inertia_tensor_eigvals",
-    "inertia_tensor_eigenvectors",
-    "axis_major_length",
-    "axis_minor_length",
-    "inertia_tensor",
-    "orientation",
-} | requires["inertia_tensor_eigvals"]
-
-requires["moments_normalized"] = {
-    "moments_normalized",
-    "moments_hu",
-}
+need_intensity_image = need_intensity_image | requires["moments_weighted"]
 
 requires["image_convex"] = {
     "area_convex",
+    "feret_diameter_max" "image_convex",
     "solidity",
-    "image_convex",
 }
+
 requires["area_convex"] = {
     "area_convex",
     "solidity",
 }
-
-requires["moments_central"] = (
-    {
-        "moments_central",
-    }
-    | requires["moments_normalized"]
-    | requires["inertia_tensor"]
-)
-
-requires["moments"] = {
-    "centroid",
-    "centroid_local",  # unless ndim > 3
-    "moments",
-} | requires["moments_central"]
-
-requires["moments_weighted_normalized"] = {
-    "moments_weighted_normalized",
-    "moments_weighted_hu",
-}
-
-requires["moments_weighted_central"] = {
-    "moments_weighted_central",
-} | requires["moments_weighted_normalized"]
-
-requires["moments_weighted"] = {
-    "centroid_weighted",
-    "centroid_weighted_local",
-    "moments_weighted",
-} | requires["moments_weighted_central"]
-
-# Technically don't need bbox for centroid and centroid_weighted if no other
-# moments are going to be computed, but probably best to just always compute
-# them via the moments
 
 requires["area"] = {
     "area",
@@ -571,6 +185,7 @@ requires["label_filled"] = {
     "label_filled",
 }
 
+# set of properties that can only be computed for 2D regions
 ndim_2_only = {
     "eccentricity",
     "moments_hu",
@@ -579,70 +194,6 @@ ndim_2_only = {
     "perimeter",
     "perimeter_crofton",
 }
-
-need_intensity_image = {
-    "intensity_mean",
-    "intensity_std",
-    "intensity_max",
-    "intensity_min",
-}
-need_intensity_image = need_intensity_image | requires["moments_weighted"]
-
-
-def _check_moment_order(moment_order: set, requested_moment_props: set):
-    if moment_order is None:
-        if any(requested_moment_props | need_moments_order3):
-            order = 3
-        elif any(requested_moment_props | need_moments_order2):
-            order = 2
-        elif any(requested_moment_props | need_moments_order1):
-            order = 1
-        else:
-            raise ValueError(
-                "could not determine moment order from "
-                "{requested_moment_props}"
-            )
-    else:
-        # use user-provided moment_order
-        order = moment_order
-        if order < 3 and any(requested_moment_props | need_moments_order3):
-            raise ValueError(
-                f"can't compute {requested_moment_props} with " "moment_order<3"
-            )
-        if order < 2 and any(requested_moment_props | need_moments_order2):
-            raise ValueError(
-                f"can't compute {requested_moment_props} with " "moment_order<2"
-            )
-        if order < 1 and any(requested_moment_props | need_moments_order1):
-            raise ValueError(
-                f"can't compute {requested_moment_props} with " "moment_order<1"
-            )
-    return order
-
-
-def regionprops_area_convex(
-    images_convex,
-    max_label=None,
-    spacing=None,
-    area_dtype=cp.float64,
-    props_dict=None,
-):
-    if max_label is None:
-        max_label = len(images_convex)
-    if not isinstance(images_convex, Sequence):
-        raise ValueError("Expected `images_convex` to be a sequence of images")
-    area_convex = cp.zeros((max_label,), dtype=area_dtype)
-    for i in range(max_label):
-        area_convex[i] = images_convex[i].sum()
-    if spacing is not None:
-        if isinstance(spacing, cp.ndarray):
-            pixel_area = cp.product(spacing)
-        else:
-            pixel_area = math.prod(spacing)
-        area_convex *= pixel_area
-    if props_dict is not None:
-        props_dict["area_convex"] = area_convex
-    return area_convex
 
 
 def regionprops_dict(
@@ -656,12 +207,17 @@ def regionprops_dict(
 ):
     from cucim.skimage.measure._regionprops import PROPS
 
-    supported_properties = set(PROPS.values())
+    supported_properties = CURRENT_PROPS_GPU
     properties = set(properties)
 
     valid_names = properties & supported_properties
     invalid_names = set(properties) - valid_names
     valid_names = list(valid_names)
+
+    # Use only the modern names internally, but keep list of mappings back to
+    # any deprecated names in restore_legacy_names and use that at the end to
+    # restore the requested deprecated property names.
+    restore_legacy_names = dict()
     for name in invalid_names:
         if name in PROPS:
             vname = PROPS[name]
@@ -670,9 +226,18 @@ def regionprops_dict(
                     f"Property name: {name} is a duplicate of {vname}"
                 )
             else:
+                restore_legacy_names[vname] = name
                 valid_names.append(vname)
         else:
             raise ValueError(f"Unrecognized property name: {name}")
+    for v in restore_legacy_names.values():
+        invalid_names.discard(v)
+    # warn if there are any names that did not match a deprecated name
+    if invalid_names:
+        warnings.warn(
+            "The following property names were unrecognized and will not be "
+            "computed: {invalid_names}"
+        )
 
     requested_props = set(sorted(valid_names))
 
@@ -802,6 +367,20 @@ def regionprops_dict(
 
         if "extent" in requested_props:
             out["extent"] = out["area"] / out["area_bbox"]
+
+    if "num_boundary_pixels" in requested_props:
+        regionprops_num_boundary_pixels(
+            label_image,
+            max_label=max_label,
+            props_dict=out,
+        )
+
+    if "num_pixels_perimeter" in requested_props:
+        regionprops_num_pixels_perimeter(
+            label_image,
+            max_label=max_label,
+            props_dict=out,
+        )
 
     requested_unweighted_moment_props = requested_props & requires["moments"]
     compute_unweighted_moments = any(requested_unweighted_moment_props)
@@ -1002,7 +581,7 @@ def regionprops_dict(
                 )
 
     compute_images = "image" in requested_props
-    compute_intensity_images = "intensity_image" in requested_props
+    compute_intensity_images = "image_intensity" in requested_props
     compute_convex = any(requires["image_convex"] & requested_props)
     if compute_intensity_images or compute_images or compute_convex:
         regionprops_image(
@@ -1025,6 +604,14 @@ def regionprops_dict(
     compute_solidity = "solidity" in requested_props
     if compute_solidity:
         out["solidity"] = out["area"] / out["area_convex"]
+
+    compute_feret_diameter_max = "feret_diameter_max" in requested_props
+    if compute_feret_diameter_max:
+        regionprops_feret_diameter_max(
+            out["image_convex"],
+            spacing=spacing,
+            props_dict=out,
+        )
 
     compute_coords = "coords" in requested_props
     compute_coords_scaled = "coords_scaled" in requested_props
@@ -1060,4 +647,73 @@ def regionprops_dict(
                 compute_convex=False,
                 props_dict=None,  # omit: using custom "image_filled" key
             )
+
+    # If user had requested properties via their deprecated names, set the
+    # canonical names for the computed properties to the corresponding
+    # deprecated one.
+    for k, v in restore_legacy_names.items():
+        out[v] = out.pop(k)
+    return out
+
+
+def _props_dict_to_table(
+    props_dict, properties, separator="-", copy_to_host=False
+):
+    out = {}
+    for prop in properties:
+        # Copy the original property name so the output will have the
+        # user-provided property name in the case of deprecated names.
+        orig_prop = prop
+        # determine the current property name for any deprecated property.
+        prop = PROPS_GPU.get(prop, prop)
+        dtype = COL_DTYPES_GPU[
+            prop
+        ]  # TODO: also update for GPU-only properties?
+
+        # is_0dim_array = isinstance(rp, cp.ndarray) and rp.ndim == 0
+        rp = props_dict[orig_prop]
+
+        is_scalar_prop = False
+        is_multicolumn = False
+        if isinstance(rp, cp.ndarray):
+            is_scalar_prop = rp.ndim == 1
+            is_multicolumn = not is_scalar_prop
+        if is_scalar_prop:
+            if copy_to_host:
+                rp = cp.asnumpy(rp)
+            out[orig_prop] = rp
+            print(f"type({prop}) = 'scalar'")
+        elif is_multicolumn:
+            if copy_to_host:
+                rp = cp.asnumpy(rp)
+            shape = rp.shape[1:]
+            # precompute property column names and locations
+            modified_props = []
+            locs = []
+            for ind in np.ndindex(shape):
+                modified_props.append(
+                    separator.join(map(str, (orig_prop,) + ind))
+                )
+                locs.append((slice(None),) + ind)
+            for i, modified_prop in enumerate(modified_props):
+                out[modified_prop] = rp[locs[i]]
+            print(f"type({prop}) = 'multi-column'")
+        elif prop in OBJECT_COLUMNS_GPU:
+            print(f"type({prop}) = 'object'")
+            n = len(rp)
+            # keep objects in a NumPy array
+            column_buffer = np.empty(n, dtype=dtype)
+            if copy_to_host:
+                for i in range(n):
+                    column_buffer[i] = cp.asnumpy(rp[i])
+                out[orig_prop] = column_buffer
+            else:
+                for i in range(n):
+                    column_buffer[i] = rp[i]
+                out[orig_prop] = np.copy(column_buffer)
+        else:
+            warnings.warn(
+                f"Type unknown for property: {prop}, storing it as-is."
+            )
+            out[orig_prop] = rp
     return out

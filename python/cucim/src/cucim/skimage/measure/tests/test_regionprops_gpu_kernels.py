@@ -4,6 +4,7 @@ import warnings
 from copy import deepcopy
 
 import cupy as cp
+import numpy as np
 import pytest
 from cupy.testing import (
     assert_allclose,
@@ -13,6 +14,7 @@ from scipy.ndimage import find_objects as cpu_find_objects
 from skimage import measure as measure_cpu
 
 from cucim.skimage import data, measure
+from cucim.skimage._vendored import ndimage as ndi
 from cucim.skimage.measure._regionprops_gpu import (
     _find_close_labels,
     area_bbox_from_slices,
@@ -28,6 +30,7 @@ from cucim.skimage.measure._regionprops_gpu import (
     regionprops_coords,
     regionprops_euler,
     regionprops_extent,
+    regionprops_feret_diameter_max,
     regionprops_image,
     regionprops_inertia_tensor,
     regionprops_inertia_tensor_eigvals,
@@ -50,6 +53,7 @@ def get_labels_nd(
     volume_fraction=0.25,
     rng=5,
     insert_holes=False,
+    dilate_blobs=False,
 ):
     ndim = len(shape)
     blobs_kwargs = dict(
@@ -60,6 +64,9 @@ def get_labels_nd(
     blobs = data.binary_blobs(max(shape), n_dim=ndim, **blobs_kwargs)
     # crop to rectangular
     blobs = blobs[tuple(slice(s) for s in shape)]
+
+    if dilate_blobs:
+        blobs = ndi.binary_dilation(blobs, 3)
 
     if insert_holes:
         blobs2_kwargs = dict(
@@ -1154,13 +1161,13 @@ def test_image(ndim, num_channels, blob_kwargs):
     expected = measure_cpu.regionprops_table(
         cp.asnumpy(labels),
         intensity_image=cp.asnumpy(intensity_image),
-        properties=["image", "intensity_image", "image_convex"],
+        properties=["image", "image_intensity", "image_convex"],
     )
     warnings.resetwarnings()
 
     for n in range(max_label):
         assert_array_equal(images[n], expected["image"][n])
-        assert_array_equal(intensity_images[n], expected["intensity_image"][n])
+        assert_array_equal(intensity_images[n], expected["image_intensity"][n])
         # Note if 3d blobs are size 1 on one of the axes, it can cause QHull to
         # fail and return a zeros convex image for that label. This has been
         # resolved for cuCIM, but not yet for scikit-image.
@@ -1204,3 +1211,56 @@ def test_coords(ndim, spacing):
         assert_allclose(
             coords_scaled[n], expected["coords_scaled"][n], rtol=1e-5
         )
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("spacing", [None, (1, 1, 1), (0.5, 0.35, 0.75)])
+@pytest.mark.parametrize(
+    "blob_kwargs", [dict(blob_size_fraction=0.15, volume_fraction=0.1)]
+)
+def test_feret_diameter_max(ndim, spacing, blob_kwargs):
+    shape = (1024, 2048) if ndim == 2 else (64, 80, 48)
+    # use dilate blobs to avoid error from singleton dimension regions in
+    # scikit-image
+    labels = get_labels_nd(shape, dilate_blobs=ndim == 3, **blob_kwargs)
+    # discard any extra dimensions from spacing
+    if spacing is not None:
+        spacing = spacing[:ndim]
+
+    max_label = int(cp.max(labels))
+    _, _, images_convex = regionprops_image(
+        labels,
+        max_label=max_label,
+        compute_convex=True,
+    )
+    feret_diameters = regionprops_feret_diameter_max(
+        images_convex,
+        spacing=spacing,
+    )
+
+    # suppress any QHull warnings coming from the scikit-image implementation
+    warnings.filterwarnings(
+        "ignore",
+        message="Failed to get convex hull image",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="divide by zero",
+        category=RuntimeWarning,
+    )
+    expected = measure_cpu.regionprops_table(
+        cp.asnumpy(labels),
+        spacing=spacing,
+        properties=["num_pixels", "feret_diameter_max"],
+    )
+    warnings.resetwarnings()
+
+    # print(f"{ndim=}, {spacing=}, {max_label=}")
+    # print(f"num_pixels={expected['num_pixels']}")
+    # print(f"diameters={expected['feret_diameter_max']}")
+    max_diff = np.max(
+        np.abs(feret_diameters.get() - expected["feret_diameter_max"])
+    )
+    # print(f"max_diff = {max_diff}")
+    assert max_diff < math.sqrt(ndim)

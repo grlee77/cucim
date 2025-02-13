@@ -16,7 +16,7 @@ import cupyx.scipy.fft as fftmodule
 import numpy as np
 from cupyx.scipy.fft import next_fast_len
 
-from .._shared.utils import _supported_float_type
+from .._shared.utils import _ndarray_argwhere, _supported_float_type
 
 
 def _masked_phase_cross_correlation(
@@ -96,7 +96,7 @@ def _masked_phase_cross_correlation(
     )
 
     # Generalize to the average of multiple equal maxima
-    maxima = cp.stack(cp.nonzero(xcorr == xcorr.max()), axis=1)
+    maxima = _ndarray_argwhere(xcorr == xcorr.max())
     center = cp.mean(maxima, axis=0)
     shifts = center - cp.asarray(reference_image.shape) + 1
 

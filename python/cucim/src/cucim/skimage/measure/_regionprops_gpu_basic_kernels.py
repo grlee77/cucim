@@ -4,9 +4,12 @@ import cupy as cp
 import numpy as np
 
 import cucim.skimage._vendored.ndimage as ndi
+from cucim.skimage.measure import label
+from cucim.skimage.morphology import convex_hull_image
 
 from ._regionprops_gpu_utils import (
     _get_count_dtype,
+    _get_min_integer_dtype,
     _includes,
     _unravel_loop_index,
     _unravel_loop_index_declarations,
@@ -20,11 +23,35 @@ __all__ = [
     "regionprops_area",
     "regionprops_area_bbox",
     "regionprops_bbox_coords",
+    "regionprops_coords",
     "regionprops_extent",
+    "regionprops_image",
     "regionprops_num_pixels",
     # extra functions for cuCIM not currently in scikit-image
     "regionprops_num_pixels_perimeter",
 ]
+
+
+# For n nonzero elements cupy.nonzero returns a tuple of length ndim where
+# each element is an array of size (n, ) corresponding to the coordinates on
+# a specific axis.
+#
+# Often for regionprops purposes we would rather have a single array of
+# size (n, ndim) instead of a the tuple of arrays.
+#
+# CuPy's `_ndarray_argwhere` (used internally by cupy.nonzero) already provides
+# this but is not part of the public API. To guard against potential future
+# change we provide a less efficient fallback implementation.
+try:
+    from cupy._core._routines_indexing import _ndarray_argwhere
+except ImportError:
+
+    def _ndarray_argwhere(a):
+        """Stack the result of cupy.nonzero into a single array
+
+        output shape will be (num_nonzero, ndim)
+        """
+        return cp.stack(cp.nonzero(a), axis=-1)
 
 
 def _get_bbox_code(uint_t, ndim, array_size):
@@ -285,6 +312,9 @@ def regionprops_num_pixels_perimeter(
     """Determine the number of pixels along the perimeter of each labeled
     region.
 
+    This is a n-dimensional implementation so in 3D it is the number of pixels
+    on the surface of the region.
+
     Notes
     -----
     If the labeled regions have holes, the hole edges will be included in this
@@ -311,7 +341,7 @@ def regionprops_num_pixels_perimeter(
         props_dict=None,
     )
     if props_dict is not None:
-        props_dict[num_pixels_perimeter] = num_pixels_perimeter
+        props_dict["num_pixels_perimeter"] = num_pixels_perimeter
     return num_pixels_perimeter
 
 
@@ -588,3 +618,321 @@ def regionprops_extent(area, area_bbox, props_dict=None):
     if props_dict is not None:
         props_dict["extent"] = extent
     return extent
+
+
+def regionprops_image(
+    label_image,
+    intensity_image=None,
+    slices=None,
+    max_label=None,
+    compute_image=True,
+    compute_convex=False,
+    store_convex_hull_objects=False,
+    props_dict=None,
+    on_cpu=False,
+):
+    """Return tuples of images of isolated label and/or intensities.
+
+    Each image incorporates only the bounding box region for a given label.
+
+    Length of the tuple(s) is equal to `max_label`.
+
+    Notes
+    -----
+    This is provided only for completeness, but unlike for the RegionProps
+    class, these are not used to compute any of the other properties.
+    """
+    if max_label is None:
+        max_label = int(label_image.max())
+    if props_dict is None:
+        props_dict = dict()
+
+    if slices is None:
+        if "slice" not in props_dict:
+            regionprops_bbox_coords(
+                label_image,
+                max_label=max_label,
+                return_slices=True,
+                props_dict=props_dict,
+            )
+        slices = props_dict["slice"]
+
+    # mask so there will only be a single label value in each returned slice
+    masks = tuple(
+        label_image[sl] == lab for lab, sl in enumerate(slices, start=1)
+    )
+
+    if compute_convex:
+        convex_results = tuple(
+            convex_hull_image(
+                m,
+                omit_empty_coords_check=True,
+                float64_computation=True,
+                return_hull=store_convex_hull_objects,
+            )
+            for m in masks
+        )
+        if store_convex_hull_objects:
+            image_convex = tuple(r[0] for r in convex_results)
+            hull_objects = tuple(r[1] for r in convex_results)
+        else:
+            image_convex = convex_results
+
+        if on_cpu:
+            image_convex = tuple(cp.asnumpy(m) for m in image_convex)
+        props_dict["image_convex"] = image_convex
+        if store_convex_hull_objects:
+            props_dict["convex_hull_objects"] = hull_objects
+    else:
+        image_convex = None
+
+    if on_cpu:
+        masks = tuple(cp.asnumpy(m) for m in masks)
+        if intensity_image is not None:
+            intensity_image = cp.asnumpy(intensity_image)
+
+    props_dict["image"] = masks
+
+    if intensity_image is not None:
+        if intensity_image.ndim > label_image.ndim:
+            if intensity_image.ndim != label_image.ndim + 1:
+                raise ValueError(
+                    "Unexpected intensity_image.ndim. Should be "
+                    "label_image.ndim or label_image.ndim + 1"
+                )
+            imslices = tuple(sl + (slice(None),) for sl in slices)
+            intensity_images = tuple(
+                intensity_image[sl] * mask[..., cp.newaxis]
+                for img, (sl, mask) in enumerate(zip(imslices, masks), start=1)
+            )
+
+        else:
+            intensity_images = tuple(
+                intensity_image[sl] * mask
+                for img, (sl, mask) in enumerate(zip(slices, masks), start=1)
+            )
+        if on_cpu:
+            intensity_images = (cp.asnumpy(img) for img in intensity_images)
+        props_dict["image_intensity"] = intensity_images
+        if not compute_image:
+            return props_dict["image_intensity"]
+    else:
+        intensity_images = None
+    return masks, intensity_images, image_convex
+
+
+def get_compressed_labels(
+    labels, max_label, intensity_image=None, sort_labels=True
+):
+    """Produce raveled list of coordinates and label values, excluding any
+    background pixels.
+
+    Some region properties can be applied to this data format more efficiently,
+    than for the original labels image. I have not yet benchmarked when it may
+    be worth doing this initial step, though.
+    """
+    label_dtype = _get_min_integer_dtype(max_label, signed=False)
+    if labels.dtype != label_dtype:
+        labels = labels.astype(dtype=label_dtype)
+    coords_dtype = _get_min_integer_dtype(max(labels.shape), signed=False)
+    label_coords = cp.nonzero(labels)
+    if label_coords[0].dtype != coords_dtype:
+        label_coords = tuple(c.astype(coords_dtype) for c in label_coords)
+    labels1d = labels[label_coords]
+    if sort_labels:
+        sort_indices = cp.argsort(labels1d)
+        label_coords = tuple(c[sort_indices] for c in label_coords)
+        labels1d = labels1d[sort_indices]
+    if intensity_image:
+        img1d = intensity_image[label_coords]
+        return label_coords, labels1d, img1d
+    # max_label = int(labels1d[-1])
+    return label_coords, labels1d
+
+
+def regionprops_coords(
+    label_image,
+    max_label=None,
+    spacing=None,
+    compute_coords=True,
+    compute_coords_scaled=False,
+    props_dict=None,
+):
+    """Return tuple(s) of arrays of coordinates for each labeled region.
+
+    Length of the tuple(s) is equal to `max_label`.
+
+    Notes
+    -----
+    This is provided only for completeness, but unlike for the RegionProps
+    class, these are not used to compute any of the other properties.
+    """
+    if max_label is None:
+        max_label = int(label_image.max())
+    if props_dict is None:
+        props_dict = dict()
+
+    coords_concat, _ = get_compressed_labels(
+        label_image, max_label=max_label, sort_labels=True
+    )
+
+    if "num_pixels" not in props_dict:
+        num_pixels = regionprops_num_pixels(
+            label_image, max_label=max_label, props_dict=props_dict
+        )
+    else:
+        num_pixels = props_dict["num_pixels"]
+
+    # stack ndim arrays into a single (pixels, ndim) array
+    coords_concat = cp.stack(coords_concat, axis=-1)
+
+    # scale based on spacing
+    if compute_coords_scaled:
+        max_exact_float32_int = 16777216  # 2 ** 24
+        max_sz = max(label_image.shape)
+        float_type = (
+            cp.float32 if max_sz < max_exact_float32_int else cp.float64
+        )
+        coords_concat_scaled = coords_concat.astype(float_type)
+        if spacing is not None:
+            scale_factor = cp.asarray(spacing, dtype=float_type).reshape(1, -1)
+            coords_concat_scaled *= scale_factor
+        coords_scaled = []
+
+    if compute_coords:
+        coords = []
+
+    # split separate labels out of the concatenated array above
+    num_pixels_cpu = cp.asnumpy(num_pixels)
+    slice_start = 0
+    slice_stops = np.cumsum(num_pixels_cpu)
+    for slice_stop in slice_stops:
+        sl = slice(slice_start, slice_stop)
+        if compute_coords:
+            coords.append(coords_concat[sl, :])
+        if compute_coords_scaled:
+            coords_scaled.append(coords_concat_scaled[sl, :])
+        slice_start = slice_stop
+    coords = tuple(coords)
+    if compute_coords:
+        props_dict["coords"] = coords
+        if not compute_coords_scaled:
+            return coords
+    if compute_coords_scaled:
+        coords_scaled = tuple(coords_scaled)
+        props_dict["coords_scaled"] = coords_scaled
+        if not compute_coords:
+            return coords_scaled
+    return coords, coords_scaled
+
+
+def regionprops_boundary_mask(labels):
+    """Generate a binary mask corresponding to the pixels touching the image
+    boundary.
+    """
+    ndim = labels.ndim
+    slices = [
+        slice(
+            None,
+        )
+    ] * ndim
+    boundary_mask = cp.zeros(labels.shape, dtype=bool)
+    for d in range(ndim):
+        edge_slices1 = slices[:d] + [slice(0, 1)] + slices[d + 1 :]
+        edge_slices2 = slices[:d] + [slice(-1, None)] + slices[d + 1 :]
+        boundary_mask[tuple(edge_slices1)] = 1
+        boundary_mask[tuple(edge_slices2)] = 1
+        slices[d] = slice(1, -1)
+    return boundary_mask
+
+
+def regionprops_num_boundary_pixels(labels, max_label=None, props_dict=None):
+    """Determine the number of pixels touching the image boundary for each
+    labeled region.
+    """
+    if max_label is None:
+        max_label = int(labels.max())
+
+    # get mask of edge pixels
+    boundary_mask = regionprops_boundary_mask(labels)
+
+    # include a bin for the background
+    nbins = max_label + 1
+    # exclude background region from edge_counts
+    edge_counts = cp.bincount(labels[boundary_mask], minlength=nbins)[1:]
+    if props_dict is not None:
+        props_dict["num_boundary_pixels"] = edge_counts
+    return edge_counts
+
+
+def regionprops_label_filled(
+    labels,
+    max_label=None,
+    props_dict=None,
+    background_label_is_common=True,
+):
+    """
+
+    Parameters
+    ----------
+    labels : cupy.ndarray
+        The label image
+    max_label : the maximum label present in labels
+        If None, will be determined internally.
+    props_dict : dict or None
+        Dictionary to store any measured properties.
+    background_label_is_common : bool, optional
+        If True, a faster algorithm is used that assumes that along the edges
+        of the `labels` image there are more background pixels than "hole"
+        piixels. If that is not true, set `background_label_is_common` to False
+        to use the `cupyx.scipy.ndimage.binary_fill_holes` (currently
+        inefficient particularly when most pixels are background pixels).
+
+    Notes
+    -----
+
+    """
+    if max_label is None:
+        max_label = int(labels.max())
+
+    # get mask of zero-valued regions
+    inverse_binary_mask = labels == 0
+    inverse_labels = label(inverse_binary_mask)
+
+    if background_label_is_common:
+        if props_dict is not None and "num_pixels" in props_dict:
+            npix = labels.size
+            npix_labeled = int(props_dict["num_pixels"].sum())
+            percent_background = 100 * (npix - npix_labeled) / npix
+            count_edges_only = percent_background > 10
+        else:
+            count_edges_only = True
+
+        if not count_edges_only:
+            inv_counts = cp.bincount(
+                inverse_labels[inverse_labels > 0], minlength=max_label
+            )
+
+            # assume the amount of background is > than the number of holes
+            background_index = int(cp.argmax(inv_counts))
+        else:
+            # get mask of edge pixels
+            boundary_mask = regionprops_boundary_mask(labels)
+
+            # assume that there are more background pixels than "hole" pixels
+            # along the border.
+            inv_counts = cp.bincount(
+                inverse_labels[boundary_mask], minlength=max_label + 1
+            )[1:]
+            # assume the amount of background is > than the number of holes
+            background_index = int(cp.argmax(inv_counts)) + 1
+
+        inverse_binary_mask[inverse_labels == background_index] = 0
+        binary_holes_filled = (labels > 0) + inverse_binary_mask
+    else:
+        binary_holes_filled = ndi.binary_fill_holes(labels > 0)
+
+    label_filled = label(binary_holes_filled)
+    if props_dict is not None:
+        props_dict["label_filled"] = label_filled
+    return label_filled

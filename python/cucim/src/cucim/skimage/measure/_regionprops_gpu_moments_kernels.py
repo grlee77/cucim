@@ -1414,6 +1414,9 @@ def regionprops_inertia_tensor(
             moments_central.shape[:-ndim], dtype=moments_central.dtype
         )
         kernel(moments_central, itensor, orientation, size=nbatch)
+        if props_dict is not None:
+            props_dict["inertia_tensor"] = itensor
+            props_dict["orientation"] = orientation
         return itensor, orientation
 
     kernel(moments_central, itensor, size=nbatch)
@@ -1642,8 +1645,8 @@ def regionprops_inertia_tensor_eigvals(
             props_dict["eccentricity"] = eccentricity
         if compute_axis_lengths:
             props_dict["axis_lengths"] = axis_lengths
-            props_dict["axis_length_major"] = axis_lengths[..., 0]
-            props_dict["axis_length_minor"] = axis_lengths[..., -1]
+            props_dict["axis_major_length"] = axis_lengths[..., 0]
+            props_dict["axis_minor_length"] = axis_lengths[..., -1]
         if compute_eigenvectors:
             props_dict["inertia_tensor_eigenvectors"] = eigvecs
     # Note:
@@ -1827,3 +1830,112 @@ def regionprops_centroid_weighted(
     elif compute_global:
         return centroid_global
     return centroid_local
+
+
+requires = dict()
+
+requires["inertia_tensor_eigvals"] = {
+    "eccentricity",
+    "inertia_tensor_eigvals",
+    "inertia_tensor_eigenvectors",
+}
+requires["inertia_tensor"] = {
+    "inertia_tensor",
+    "inertia_tensor_eigvals",
+    "inertia_tensor_eigenvectors",
+    "axis_major_length",
+    "axis_minor_length",
+    "inertia_tensor",
+    "orientation",
+} | requires["inertia_tensor_eigvals"]
+
+requires["moments_normalized"] = {
+    "moments_normalized",
+    "moments_hu",
+}
+
+requires["moments_central"] = (
+    {
+        "moments_central",
+    }
+    | requires["moments_normalized"]
+    | requires["inertia_tensor"]
+)
+
+requires["moments"] = {
+    "centroid",
+    "centroid_local",  # unless ndim > 3
+    "moments",
+} | requires["moments_central"]
+
+requires["moments_weighted_normalized"] = {
+    "moments_weighted_normalized",
+    "moments_weighted_hu",
+}
+
+requires["moments_weighted_central"] = {
+    "moments_weighted_central",
+} | requires["moments_weighted_normalized"]
+
+requires["moments_weighted"] = {
+    "centroid_weighted",
+    "centroid_weighted_local",
+    "moments_weighted",
+} | requires["moments_weighted_central"]
+
+
+need_moments_order1 = {
+    "centroid",
+    "centroid_local",  # unless ndim > 3
+    "centroid_weighted",
+    "centroid_weighted_local",
+}
+
+need_moments_order2 = {
+    "axis_major_length",
+    "axis_minor_length",
+    "eccentricity",
+    "inertia_tensor",
+    "inertia_tensor_eigvals",
+    "inertia_tensor_eigenvectors",
+    "moments",
+    "moments_central",
+    "moments_normalized",
+    "moments_weighted",
+    "moments_weighted_central",
+    "moments_weighted_normalized",
+    "orientation",
+}
+
+need_moments_order3 = {"moments_hu", "moments_weighted_hu"}
+
+
+def _check_moment_order(moment_order: set, requested_moment_props: set):
+    if moment_order is None:
+        if any(requested_moment_props | need_moments_order3):
+            order = 3
+        elif any(requested_moment_props | need_moments_order2):
+            order = 2
+        elif any(requested_moment_props | need_moments_order1):
+            order = 1
+        else:
+            raise ValueError(
+                "could not determine moment order from "
+                "{requested_moment_props}"
+            )
+    else:
+        # use user-provided moment_order
+        order = moment_order
+        if order < 3 and any(requested_moment_props | need_moments_order3):
+            raise ValueError(
+                f"can't compute {requested_moment_props} with " "moment_order<3"
+            )
+        if order < 2 and any(requested_moment_props | need_moments_order2):
+            raise ValueError(
+                f"can't compute {requested_moment_props} with " "moment_order<2"
+            )
+        if order < 1 and any(requested_moment_props | need_moments_order1):
+            raise ValueError(
+                f"can't compute {requested_moment_props} with " "moment_order<1"
+            )
+    return order

@@ -18,7 +18,7 @@ except ImportError:
     unique_rows_available = False
 
 
-from cucim.skimage._shared.utils import warn
+from cucim.skimage._shared.utils import _ndarray_argwhere, warn
 from cucim.skimage._vendored import ndimage as ndi
 from cucim.skimage.measure._label import label
 from cucim.skimage.measure._regionprops_gpu_utils import _unravel_loop_index
@@ -90,6 +90,7 @@ def convex_hull_image(
     omit_empty_coords_check=False,
     float64_computation=True,
     cpu_fallback_threshold=None,
+    return_hull=False,
 ):
     """Compute the convex hull image of a binary image.
 
@@ -110,7 +111,9 @@ def convex_hull_image(
         some points erroneously being classified as being outside the hull.
     include_borders: bool, optional
         If ``False``, vertices/edges are excluded from the final hull mask.
-
+    return_hull: bool, optional
+        If ``True``, return the convex hull object in addition to the hull
+        image.
 
     Extra Parameters
     ----------------
@@ -127,6 +130,8 @@ def convex_hull_image(
     -------
     hull : (M, N) array of bool
         Binary image with pixels in convex hull set to True.
+    hull_object : scipy.spatial.ConvexHull, optional
+        Convex hull object. Only returned if ``return_hull=True``.
 
     Notes
     -----
@@ -149,9 +154,11 @@ def convex_hull_image(
     original_shape = image.shape
     image = cp.squeeze(image)
     if image.ndim < 2:
+        if return_hull:
+            return image, None
         return image
 
-    if image.size < cpu_fallback_threshold:
+    if image.size < cpu_fallback_threshold and not return_hull:
         # Fallback to pure CPU implementation
         from skimage import morphology as morphology_cpu
 
@@ -188,6 +195,8 @@ def convex_hull_image(
             "Returning empty image",
             UserWarning,
         )
+        if return_hull:
+            return np.zeros(image.shape, dtype=bool), None
         return np.zeros(image.shape, dtype=bool)
 
     if image.dtype != cp.dtype(bool):
@@ -201,7 +210,7 @@ def convex_hull_image(
     # xor with eroded version to keep only edge pixels of the binary image
     image_boundary = cp.bitwise_xor(image, ndi.binary_erosion(image, 3))
 
-    coords = cp.stack(cp.nonzero(image_boundary), axis=-1)
+    coords = _ndarray_argwhere(image_boundary)
 
     # Add a vertex for the middle of each pixel edge
     if offset_coordinates:
@@ -223,6 +232,8 @@ def convex_hull_image(
             f"Returning empty image, see error message below:\n"
             f"{err}"
         )
+        if return_hull:
+            return cp.zeros(image.shape, dtype=bool), hull
         return cp.zeros(image.shape, dtype=bool)
 
     coord_dtype = cp.min_scalar_type(max(image.shape))
@@ -240,7 +251,10 @@ def convex_hull_image(
     convex_image = cp.empty_like(image)
     hull_equations = cp.asarray(hull.equations, dtype=float_dtype)
     kernel(image, hull_equations, tolerance, convex_image)
-    return convex_image.reshape(original_shape)
+    convex_image = convex_image.reshape(original_shape)
+    if return_hull:
+        return convex_image, hull
+    return convex_image
 
 
 def convex_hull_object(
