@@ -1832,57 +1832,33 @@ def regionprops_centroid_weighted(
     return centroid_local
 
 
+# The code below contains logic regarding dependencies between various moment
+# properties. This is used by `regionprops_dict` to plan which properties
+# need to be computed when a particular subset is requested.
+
 requires = dict()
 
-requires["inertia_tensor_eigvals"] = {
-    "eccentricity",
-    "inertia_tensor_eigvals",
-    "inertia_tensor_eigenvectors",
-}
-requires["inertia_tensor"] = {
-    "inertia_tensor",
-    "inertia_tensor_eigvals",
-    "inertia_tensor_eigenvectors",
-    "axis_major_length",
-    "axis_minor_length",
-    "inertia_tensor",
-    "orientation",
-} | requires["inertia_tensor_eigvals"]
-
-requires["moments_normalized"] = {
-    "moments_normalized",
-    "moments_hu",
-}
-
-requires["moments_central"] = (
-    {
-        "moments_central",
-    }
-    | requires["moments_normalized"]
-    | requires["inertia_tensor"]
-)
-
-requires["moments"] = {
-    "centroid",
-    "centroid_local",  # unless ndim > 3
-    "moments",
-} | requires["moments_central"]
-
-requires["moments_weighted_normalized"] = {
-    "moments_weighted_normalized",
-    "moments_weighted_hu",
-}
-
-requires["moments_weighted_central"] = {
-    "moments_weighted_central",
-} | requires["moments_weighted_normalized"]
-
-requires["moments_weighted"] = {
-    "centroid_weighted",
-    "centroid_weighted_local",
-    "moments_weighted",
-} | requires["moments_weighted_central"]
-
+# create adjacency list of direct dependencies
+# For each property, the values in the dict are a direct dependency of the key
+moment_deps = dict()
+moment_deps["moments"] = ["bbox"]
+moment_deps["moments_weighted"] = ["bbox"]
+moment_deps["eccentricity"] = ["inertia_tensor_eigvals"]
+moment_deps["axis_major_length"] = ["inertia_tensor_eigvals"]
+moment_deps["axis_minor_length"] = ["inertia_tensor_eigvals"]
+moment_deps["inertia_tensor_eigenvectors"] = ["inertia_tensor_eigvals"]
+moment_deps["inertia_tensor_eigvals"] = ["inertia_tensor"]
+moment_deps["orientation"] = ["inertia_tensor"]
+moment_deps["moments_hu"] = ["moments_normalized"]
+moment_deps["moments_normalized"] = ["moments_central"]
+moment_deps["inertia_tensor"] = ["moments_central"]
+moment_deps["moments_central"] = ["moments"]
+moment_deps["centroid"] = ["moments"]
+moment_deps["centroid_local"] = ["moments"]
+moment_deps["moments_weighted_central"] = ["moments_weighted"]
+moment_deps["moments_weighted_normalized"] = ["moments_weighted_central"]
+moment_deps["centroid_weighted"] = ["moments_weighted"]
+moment_deps["centroid_weighted_local"] = ["moments_weighted"]
 
 need_moments_order1 = {
     "centroid",

@@ -15,6 +15,12 @@ try:
 except ImportError:
     have_cdist = False
 
+convex_deps = dict()
+convex_deps["image_convex"] = ["image"]  # computed by regionprops_image
+convex_deps["area_convex"] = ["image_convex"]
+convex_deps["feret_diameter_max"] = ["image_convex"]
+convex_deps["solidity"] = ["area", "area_convex"]
+
 
 def pdist_max_blockwise(
     coords,

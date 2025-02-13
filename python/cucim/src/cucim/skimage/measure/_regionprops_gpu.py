@@ -8,6 +8,7 @@ from cucim.skimage.measure._regionprops import COL_DTYPES, PROPS
 
 from ._regionprops_gpu_basic_kernels import (
     area_bbox_from_slices,
+    basic_deps,
     equivalent_diameter_area,
     equivalent_diameter_area_2d,
     equivalent_diameter_area_3d,
@@ -20,14 +21,16 @@ from ._regionprops_gpu_basic_kernels import (
     regionprops_image,
     regionprops_label_filled,
     regionprops_num_boundary_pixels,
+    regionprops_num_perimeter_pixels,
     regionprops_num_pixels,
-    regionprops_num_pixels_perimeter,
 )
 from ._regionprops_gpu_convex import (
+    convex_deps,
     regionprops_area_convex,
     regionprops_feret_diameter_max,
 )
 from ._regionprops_gpu_intensity_kernels import (
+    intensity_deps,
     regionprops_intensity_mean,
     regionprops_intensity_min_max,
     regionprops_intensity_std,
@@ -39,6 +42,7 @@ from ._regionprops_gpu_misc_kernels import (
 )
 from ._regionprops_gpu_moments_kernels import (
     _check_moment_order,
+    moment_deps,
     regionprops_centroid,
     regionprops_centroid_local,
     regionprops_centroid_weighted,
@@ -48,7 +52,6 @@ from ._regionprops_gpu_moments_kernels import (
     regionprops_moments_central,
     regionprops_moments_hu,
     regionprops_moments_normalized,
-    requires as moment_requirements,
 )
 from ._regionprops_gpu_utils import _find_close_labels, _get_min_integer_dtype
 
@@ -84,7 +87,7 @@ __all__ = [
     # extra functions for cuCIM not currently in scikit-image
     "regionprops_boundary_mask",
     "regionprops_num_boundary_pixels",
-    "regionprops_num_pixels_perimeter",
+    "regionprops_num_perimeter_pixels",
     "regionprops_label_filled",
 ]
 
@@ -101,8 +104,9 @@ PROPS_GPU = copy(PROPS)
 PROPS_GPU_EXTRA = {
     "axis_lengths": "axis_lengths",
     "inertia_tensor_eigenvectors": "inertia_tensor_eigenvectors",
-    "num_pixels_perimeter": "num_pixels_perimeter",
+    "num_perimeter_pixels": "num_perimeter_pixels",
     "num_boundary_pixels": "num_boundary_pixels",
+    "perimeter_on_border_ratio": "perimeter_on_border_ratio",
 }
 PROPS_GPU.update(PROPS_GPU_EXTRA)
 
@@ -111,79 +115,61 @@ CURRENT_PROPS_GPU = set(PROPS_GPU.values())
 COL_DTYPES_EXTRA = {
     "axis_lengths": float,
     "inertia_tensor_eigenvectors": float,
-    "num_pixels_perimeter": int,
+    "num_perimeter_pixels": int,
     "num_boundary_pixels": int,
 }
+
+# expand column dtypes from _regionprops to include the extra properties
 COL_DTYPES_GPU = copy(COL_DTYPES)
 COL_DTYPES_GPU.update(COL_DTYPES_EXTRA)
 
-# There is also "label_filled" but this is a global filled labels image
+# Any extra 'property' that is computed on the full labels image and not
+# per-region.
+GLOBAL_PROPS = {"label_filled"}
 
+# list of the columns that are stored as a numpy object array when converted
+# to tabular format by `regionprops_table`
 OBJECT_COLUMNS_GPU = [
     col for col, dtype in COL_DTYPES_GPU.items() if dtype == object
 ]
 
-# requires dictionary has key value pairs where the values for a given key
-# list the properties that require that key in order to compute.
 
-requires = copy(moment_requirements)
+# `property_deps` is a dictionary where each key is a property and values are
+# the other properties that property directly depends on (indirect dependencies
+# do not need to be listed as that is handled by traversing a tree structure via
+# get_property_dependencies below).
+property_deps = dict()
+property_deps.update(basic_deps)
+property_deps.update(convex_deps)
+property_deps.update(intensity_deps)
+property_deps.update(moment_deps)
 
-# set of properties that require an intensity image
-need_intensity_image = {
-    "intensity_mean",
-    "intensity_std",
-    "intensity_max",
-    "intensity_min",
-}
-need_intensity_image = need_intensity_image | requires["moments_weighted"]
 
-requires["image_convex"] = {
-    "area_convex",
-    "feret_diameter_max" "image_convex",
-    "solidity",
-}
+def get_property_dependencies(dependencies, node):
+    """Get all direct and indirect dependencies for a specific property"""
+    visited = set()
+    result = []
 
-requires["area_convex"] = {
-    "area_convex",
-    "solidity",
-}
+    def depth_first_search(n):
+        if n not in visited:
+            visited.add(n)
+            if n in dependencies:
+                for dep in dependencies[n]:
+                    depth_first_search(dep)
+            # If n is not in dependencies, assume it has no dependencies
+            result.append(n)
 
-requires["area"] = {
-    "area",
-    "solidity",
-    "extent",
-    "equivalent_diameter_area",
-}
+    depth_first_search(node)
+    return set(result)
 
-requires["area_bbox"] = {
-    "area_bbox",
-    "extent",
+
+# precompute full set of direct and indirect dependencies for each property
+property_requirements = {
+    k: get_property_dependencies(property_deps, k) for k in CURRENT_PROPS_GPU
 }
 
-requires["bbox"] = (
-    {
-        "bbox",
-        "slice",
-    }
-    | requires["area_bbox"]
-    | requires["moments"]
-    | requires["moments_weighted"]
-)
-
-requires["num_pixels"] = {
-    "area",
-    "coords",
-    "coords_scaled",
-    "intensity_mean",
-    "intensity_std",
-    "num_pixels",
-}
-
-requires["label_filled"] = {
-    "area_filled",
-    "image_filled",
-    "label_filled",
-}
+# set of properties that require an intensity_image also be provided
+need_intensity_image = set(intensity_deps.keys()) | {"moments_weighted"}
 
 # set of properties that can only be computed for 2D regions
 ndim_2_only = {
@@ -201,13 +187,12 @@ def regionprops_dict(
     intensity_image=None,
     spacing=None,
     moment_order=None,
+    max_label=None,
     pixels_per_thread=32,
     max_labels_per_thread=4,
     properties=[],
 ):
-    from cucim.skimage.measure._regionprops import PROPS
-
-    supported_properties = CURRENT_PROPS_GPU
+    supported_properties = CURRENT_PROPS_GPU | GLOBAL_PROPS
     properties = set(properties)
 
     valid_names = properties & supported_properties
@@ -241,6 +226,13 @@ def regionprops_dict(
 
     requested_props = set(sorted(valid_names))
 
+    if len(requested_props) == 0:
+        return {}
+
+    required_props = set()
+    for prop in requested_props:
+        required_props.update(property_requirements[prop])
+
     ndim = label_image.ndim
     if ndim != 2:
         invalid_names = requested_props & ndim_2_only
@@ -261,7 +253,8 @@ def regionprops_dict(
         has_intensity = True
 
     out = {}
-    max_label = int(label_image.max())
+    if max_label is None:
+        max_label = int(label_image.max())
     label_dtype = _get_min_integer_dtype(max_label, signed=False)
     # For performance, shrink label's data type to the minimum possible
     # unsigned integer type.
@@ -269,9 +262,9 @@ def regionprops_dict(
         label_image = label_image.astype(label_dtype)
 
     # create vector of label values
-    if "label" in requested_props:
+    if "label" in required_props:
         out["label"] = cp.arange(1, max_label + 1, dtype=label_dtype)
-        requested_props.discard("label")
+        # required_props.discard("label")
 
     perf_kwargs = {}
     if pixels_per_thread is not None:
@@ -279,17 +272,16 @@ def regionprops_dict(
     if max_labels_per_thread is not None:
         perf_kwargs["max_labels_per_thread"] = max_labels_per_thread
 
-    requested_num_pixels_props = requested_props & requires["num_pixels"]
-    compute_num_pixels = any(requested_num_pixels_props)
-    if compute_num_pixels:
+    if "num_pixels" in required_props:
         regionprops_num_pixels(
             label_image,
             max_label=max_label,
             **perf_kwargs,
             props_dict=out,
         )
+        # required_props.discard("num_pixels")
 
-    if any(requested_props & requires["area"]):
+    if "area" in required_props:
         regionprops_area(
             label_image,
             spacing=spacing,
@@ -300,7 +292,7 @@ def regionprops_dict(
             props_dict=out,
         )
 
-        if "equivalent_diameter_area" in requested_props:
+        if "equivalent_diameter_area" in required_props:
             if ndim == 2:
                 ed = equivalent_diameter_area_2d(out["area"])
             elif ndim == 3:
@@ -310,7 +302,7 @@ def regionprops_dict(
             out["equivalent_diameter_area"] = ed
 
     if has_intensity:
-        if "intensity_std" in requested_props:
+        if "intensity_std" in required_props:
             # std also computes mean
             regionprops_intensity_std(
                 label_image,
@@ -322,7 +314,7 @@ def regionprops_dict(
                 props_dict=out,
             )
 
-        elif "intensity_mean" in requested_props:
+        elif "intensity_mean" in required_props:
             regionprops_intensity_mean(
                 label_image,
                 intensity_image,
@@ -332,8 +324,8 @@ def regionprops_dict(
                 props_dict=out,
             )
 
-        compute_min = "intensity_min" in requested_props
-        compute_max = "intensity_max" in requested_props
+        compute_min = "intensity_min" in required_props
+        compute_max = "intensity_max" in required_props
         if compute_min or compute_max:
             regionprops_intensity_min_max(
                 label_image,
@@ -345,19 +337,18 @@ def regionprops_dict(
                 props_dict=out,
             )
 
-    requested_bbox_props = requested_props & requires["bbox"]
-    compute_bbox = any(requested_bbox_props)
+    compute_bbox = "bbox" in required_props
     if compute_bbox:
         # compute bbox (and slice)
         regionprops_bbox_coords(
             label_image,
             max_label=max_label,
-            return_slices="slice" in requested_bbox_props,
+            return_slices="slice" in required_props,
             **perf_kwargs,
             props_dict=out,
         )
 
-        if any(requested_props & requires["area_bbox"]):
+        if "area_bbox" in required_props:
             regionprops_area_bbox(
                 out["bbox"],
                 area_dtype=cp.float32,
@@ -365,43 +356,37 @@ def regionprops_dict(
                 props_dict=out,
             )
 
-        if "extent" in requested_props:
+        if "extent" in required_props:
             out["extent"] = out["area"] / out["area_bbox"]
 
-    if "num_boundary_pixels" in requested_props:
+    if "num_boundary_pixels" in required_props:
         regionprops_num_boundary_pixels(
             label_image,
             max_label=max_label,
             props_dict=out,
         )
 
-    if "num_pixels_perimeter" in requested_props:
-        regionprops_num_pixels_perimeter(
+    if "num_perimeter_pixels" in required_props:
+        regionprops_num_perimeter_pixels(
             label_image,
             max_label=max_label,
             props_dict=out,
         )
 
-    requested_unweighted_moment_props = requested_props & requires["moments"]
-    compute_unweighted_moments = any(requested_unweighted_moment_props)
-    requested_weighted_moment_props = (
-        requested_props & requires["moments_weighted"]
-    )
-    compute_weighted_moments = any(requested_weighted_moment_props)
+    if "perimeter_on_border_ratio" in required_props:
+        out["perimeter_on_border_ratio"] = (
+            out["num_boundary_pixels"] / out["num_perimeter_pixels"]
+        )
 
-    requested_moment_props = (
-        requested_unweighted_moment_props | requested_weighted_moment_props
-    )  # noqa: E501
-    compute_moments = any(requested_moment_props)
-
-    requested_inertia_tensor_props = (
-        requested_props & requires["inertia_tensor"]
-    )
-    compute_inertia_tensor = any(requested_inertia_tensor_props)
+    compute_unweighted_moments = "moments" in required_props
+    compute_weighted_moments = "moments_weighted" in required_props
+    compute_moments = compute_unweighted_moments or compute_weighted_moments
+    compute_inertia_tensor = "inertia_tensor" in required_props
 
     if compute_moments:
+        required_moment_props = set(moment_deps.keys()) & required_props
         # determine minimum necessary order (or validate the user-provided one)
-        order = _check_moment_order(moment_order, requested_moment_props)
+        order = _check_moment_order(moment_order, required_moment_props)
 
         imgs = []
         if compute_unweighted_moments:
@@ -422,9 +407,9 @@ def regionprops_dict(
             )
 
         compute_centroid_local = (
-            "centroid_local" in requested_unweighted_moment_props
+            "centroid_local" in required_moment_props
         )  # noqa:E501
-        compute_centroid = "centroid" in requested_unweighted_moment_props
+        compute_centroid = "centroid" in required_moment_props
         if compute_centroid or compute_centroid_local:
             regionprops_centroid_weighted(
                 moments_raw=out["moments"],
@@ -437,10 +422,10 @@ def regionprops_dict(
             )
 
         compute_centroid_weighted_local = (
-            "centroid_weighted_local" in requested_weighted_moment_props
+            "centroid_weighted_local" in required_moment_props
         )  # noqa: E501
         compute_centroid_weighted = (
-            "centroid_weighted" in requested_weighted_moment_props
+            "centroid_weighted" in required_moment_props
         )  # noqa: E501
         if compute_centroid_weighted or compute_centroid_weighted_local:
             regionprops_centroid_weighted(
@@ -453,15 +438,12 @@ def regionprops_dict(
                 props_dict=out,
             )
 
-        if any(requested_unweighted_moment_props & requires["moments_central"]):
+        if "moments_central" in required_moment_props:
             regionprops_moments_central(
                 out["moments"], ndim=ndim, weighted=False, props_dict=out
             )
 
-            if any(
-                requested_unweighted_moment_props
-                & requires["moments_normalized"]
-            ):
+            if "moments_normalized" in required_moment_props:
                 regionprops_moments_normalized(
                     out["moments_central"],
                     ndim=ndim,
@@ -470,25 +452,19 @@ def regionprops_dict(
                     weighted=False,
                     props_dict=out,
                 )
-                if "moments_hu" in requested_unweighted_moment_props:
+                if "moments_hu" in required_moment_props:
                     regionprops_moments_hu(
                         out["moments_normalized"],
                         weighted=False,
                         props_dict=out,
                     )
 
-        if any(
-            requested_weighted_moment_props
-            & requires["moments_weighted_central"]
-        ):
+        if "moments_weighted_central" in required_moment_props:
             regionprops_moments_central(
                 out["moments"], ndim, weighted=True, props_dict=out
             )
 
-            if any(
-                requested_weighted_moment_props
-                & requires["moments_weighted_normalized"]
-            ):
+            if "moments_weighted_normalized" in required_moment_props:
                 regionprops_moments_normalized(
                     out["moments_weighted_central"],
                     ndim=ndim,
@@ -498,7 +474,7 @@ def regionprops_dict(
                     props_dict=out,
                 )
 
-                if "moments_weighted_hu" in requested_weighted_moment_props:
+                if "moments_weighted_hu" in required_moment_props:
                     regionprops_moments_hu(
                         out["moments_weighted_normalized"],
                         weighted=True,
@@ -511,35 +487,31 @@ def regionprops_dict(
                 out["moments_central"],
                 ndim=ndim,
                 compute_orientation=(
-                    "orientation" in requested_inertia_tensor_props
+                    "orientation" in required_moment_props
                 ),  # noqa: E501
                 props_dict=out,
             )
 
-            if any(
-                requires["inertia_tensor_eigvals"]
-                & requested_inertia_tensor_props
-            ):
+            if "inertia_tensor_eigvals" in required_moment_props:
                 compute_axis_lengths = (
-                    "axis_minor_length" in requested_inertia_tensor_props
-                    or "axis_major_length" in requested_inertia_tensor_props
+                    "axis_minor_length" in required_moment_props
+                    or "axis_major_length" in required_moment_props
                 )
                 regionprops_inertia_tensor_eigvals(
                     out["inertia_tensor"],
                     compute_axis_lengths=compute_axis_lengths,
                     compute_eccentricity=(
-                        "eccentricity" in requested_inertia_tensor_props
+                        "eccentricity" in required_moment_props
                     ),
                     compute_eigenvectors=(
-                        "inertia_tensor_eigenvectors"
-                        in requested_inertia_tensor_props
+                        "inertia_tensor_eigenvectors" in required_moment_props
                     ),
                     props_dict=out,
                 )
 
-        compute_perimeter = "perimeter" in requested_props
-        compute_perimeter_crofton = "perimeter_crofton" in requested_props
-        compute_euler = "euler_number" in requested_props
+        compute_perimeter = "perimeter" in required_props
+        compute_perimeter_crofton = "perimeter_crofton" in required_props
+        compute_euler = "euler_number" in required_props
 
         if compute_euler or compute_perimeter or compute_perimeter_crofton:
             # precompute list of labels with <2 pixels space between them
@@ -580,9 +552,9 @@ def regionprops_dict(
                     props_dict=out,
                 )
 
-    compute_images = "image" in requested_props
-    compute_intensity_images = "image_intensity" in requested_props
-    compute_convex = any(requires["image_convex"] & requested_props)
+    compute_images = "image" in required_props
+    compute_intensity_images = "image_intensity" in required_props
+    compute_convex = "image_convex" in required_props
     if compute_intensity_images or compute_images or compute_convex:
         regionprops_image(
             label_image,
@@ -595,26 +567,23 @@ def regionprops_dict(
             compute_convex=compute_convex,
         )
 
-    compute_area_convex = any(requires["area_convex"] & requested_props)
-    if compute_area_convex:
+    if "area_convex" in required_props:
         regionprops_area_convex(
             out["image_convex"], max_label=max_label, props_dict=out
         )
 
-    compute_solidity = "solidity" in requested_props
-    if compute_solidity:
+    if "solidity" in required_props:
         out["solidity"] = out["area"] / out["area_convex"]
 
-    compute_feret_diameter_max = "feret_diameter_max" in requested_props
-    if compute_feret_diameter_max:
+    if "feret_diameter_max" in required_props:
         regionprops_feret_diameter_max(
             out["image_convex"],
             spacing=spacing,
             props_dict=out,
         )
 
-    compute_coords = "coords" in requested_props
-    compute_coords_scaled = "coords_scaled" in requested_props
+    compute_coords = "coords" in required_props
+    compute_coords_scaled = "coords_scaled" in required_props
     if compute_coords or compute_coords_scaled:
         regionprops_coords(
             label_image,
@@ -625,21 +594,20 @@ def regionprops_dict(
             props_dict=out,
         )
 
-    compute_label_filled = any(requires["label_filled"] & requested_props)
-    if compute_label_filled:
+    if "label_filled" in required_props:
         regionprops_label_filled(
             label_image,
             max_label=max_label,
             props_dict=out,
         )
-        if "area_filled" in requested_props:
+        if "area_filled" in required_props:
             out["area_filled"] = regionprops_area(
                 out["label_filled"],
                 max_label=max_label,
                 filled=True,
                 props_dict=out,
             )
-        if "image_filled" in requested_props:
+        if "image_filled" in required_props:
             out["image_filled"], _, _ = regionprops_image(
                 out["label_filled"],
                 max_label=max_label,
@@ -653,6 +621,12 @@ def regionprops_dict(
     # deprecated one.
     for k, v in restore_legacy_names.items():
         out[v] = out.pop(k)
+
+    # remove dependenct properties that were not explicitly requested
+    extra_props = required_props - requested_props
+    # print(f"removing extra properties: {extra_props}")
+    for k in extra_props:
+        out.pop(k)
     return out
 
 
@@ -682,7 +656,6 @@ def _props_dict_to_table(
             if copy_to_host:
                 rp = cp.asnumpy(rp)
             out[orig_prop] = rp
-            print(f"type({prop}) = 'scalar'")
         elif is_multicolumn:
             if copy_to_host:
                 rp = cp.asnumpy(rp)
@@ -697,9 +670,7 @@ def _props_dict_to_table(
                 locs.append((slice(None),) + ind)
             for i, modified_prop in enumerate(modified_props):
                 out[modified_prop] = rp[locs[i]]
-            print(f"type({prop}) = 'multi-column'")
         elif prop in OBJECT_COLUMNS_GPU:
-            print(f"type({prop}) = 'object'")
             n = len(rp)
             # keep objects in a NumPy array
             column_buffer = np.empty(n, dtype=dtype)

@@ -28,9 +28,33 @@ __all__ = [
     "regionprops_image",
     "regionprops_num_pixels",
     # extra functions for cuCIM not currently in scikit-image
-    "regionprops_num_pixels_perimeter",
+    "regionprops_num_perimeter_pixels",
 ]
 
+
+basic_deps = dict()
+basic_deps["bbox"] = []
+basic_deps["image"] = []
+basic_deps["label"] = []
+basic_deps["label_filled"] = []
+basic_deps["num_pixels"] = []
+basic_deps["area"] = ["num_pixels"]
+basic_deps["coords"] = ["num_pixels"]
+basic_deps["coords_scaled"] = ["num_pixels"]
+basic_deps["area_bbox"] = ["bbox"]
+basic_deps["extent"] = ["area", "area_bbox"]
+basic_deps["slice"] = ["bbox"]
+basic_deps["area_filled"] = ["label_filled"]
+basic_deps["image_filled"] = ["label_filled"]
+
+# From ITK (not currently in scikit-image). Useful to exclude objects based on
+# how much of their perimeter lies on the image boundary.
+basic_deps["num_perimeter_pixels"] = []
+basic_deps["num_boundary_pixels"] = []
+basic_deps["perimeter_on_border_ratio"] = [
+    "num_perimeter_pixels",
+    "num_boundary_pixels",
+]
 
 # For n nonzero elements cupy.nonzero returns a tuple of length ndim where
 # each element is an array of size (n, ) corresponding to the coordinates on
@@ -302,7 +326,7 @@ def get_bbox_coords_kernel(
     )
 
 
-def regionprops_num_pixels_perimeter(
+def regionprops_num_perimeter_pixels(
     label_image,
     max_label=None,
     pixels_per_thread=16,
@@ -332,7 +356,7 @@ def regionprops_num_pixels_perimeter(
     binary_label_mask_eroded = ndi.binary_erosion(binary_label_mask, footprint)
     labeled_edges = label_image * ~binary_label_mask_eroded
 
-    num_pixels_perimeter = regionprops_num_pixels(
+    num_perimeter_pixels = regionprops_num_pixels(
         labeled_edges,
         max_label=max_label,
         filled=False,
@@ -341,8 +365,8 @@ def regionprops_num_pixels_perimeter(
         props_dict=None,
     )
     if props_dict is not None:
-        props_dict["num_pixels_perimeter"] = num_pixels_perimeter
-    return num_pixels_perimeter
+        props_dict["num_perimeter_pixels"] = num_perimeter_pixels
+    return num_perimeter_pixels
 
 
 def regionprops_num_pixels(

@@ -14,6 +14,12 @@ __all__ = [
     "regionprops_intensity_std",
 ]
 
+intensity_deps = dict()
+intensity_deps["intensity_min"] = []
+intensity_deps["intensity_max"] = []
+intensity_deps["intensity_mean"] = ["num_pixels"]
+intensity_deps["intensity_std"] = ["num_pixels"]
+
 
 def _get_img_sums_code(
     c_sum_type,
