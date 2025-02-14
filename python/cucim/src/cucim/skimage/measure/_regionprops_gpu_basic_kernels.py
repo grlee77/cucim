@@ -44,11 +44,12 @@ basic_deps["coords_scaled"] = ["num_pixels"]
 basic_deps["area_bbox"] = ["bbox"]
 basic_deps["extent"] = ["area", "area_bbox"]
 basic_deps["slice"] = ["bbox"]
-basic_deps["area_filled"] = ["label_filled"]
+basic_deps["area_filled"] = ["label_filled", "num_pixels_filled"]
 basic_deps["image_filled"] = ["label_filled"]
 
 # From ITK (not currently in scikit-image). Useful to exclude objects based on
 # how much of their perimeter lies on the image boundary.
+basic_deps["num_pixels_filled"] = []
 basic_deps["num_perimeter_pixels"] = []
 basic_deps["num_boundary_pixels"] = []
 basic_deps["perimeter_on_border_ratio"] = [
@@ -919,7 +920,9 @@ def regionprops_label_filled(
     if max_label is None:
         max_label = int(labels.max())
 
-    # get mask of zero-valued regions
+    # make sure all background pixels at the boundary have the same label
+    labels = cp.pad(labels, 1, mode="constant", constant_values=0)
+
     inverse_binary_mask = labels == 0
     inverse_labels = label(inverse_binary_mask)
 
@@ -959,4 +962,5 @@ def regionprops_label_filled(
     label_filled = label(binary_holes_filled)
     if props_dict is not None:
         props_dict["label_filled"] = label_filled
-    return label_filled
+    label_filled = label_filled[(slice(1, -1),) * label_filled.ndim]
+    return cp.ascontiguousarray(label_filled)

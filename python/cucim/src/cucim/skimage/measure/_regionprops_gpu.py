@@ -1,10 +1,15 @@
 import warnings
+from collections.abc import Callable
 from copy import copy
 
 import cupy as cp
 import numpy as np
 
-from cucim.skimage.measure._regionprops import COL_DTYPES, PROPS
+from cucim.skimage.measure._regionprops import (
+    COL_DTYPES,
+    PROPS,
+    _infer_number_of_required_args,
+)
 
 from ._regionprops_gpu_basic_kernels import (
     area_bbox_from_slices,
@@ -185,15 +190,22 @@ ndim_2_only = {
 def regionprops_dict(
     label_image,
     intensity_image=None,
+    *,
     spacing=None,
+    extra_properties=None,
     moment_order=None,
     max_label=None,
     pixels_per_thread=32,
     max_labels_per_thread=4,
     properties=[],
+    to_table=False,
+    table_separator="-",
+    table_on_host=False,
 ):
     supported_properties = CURRENT_PROPS_GPU | GLOBAL_PROPS
     properties = set(properties)
+    if extra_properties is None:
+        extra_properties = []
 
     valid_names = properties & supported_properties
     invalid_names = set(properties) - valid_names
@@ -552,8 +564,10 @@ def regionprops_dict(
                     props_dict=out,
                 )
 
-    compute_images = "image" in required_props
-    compute_intensity_images = "image_intensity" in required_props
+    compute_images = ("image" in required_props) or (len(extra_properties) > 0)
+    compute_intensity_images = ("image_intensity" in required_props) or (
+        (intensity_image is not None) and (len(extra_properties) > 0)
+    )
     compute_convex = "image_convex" in required_props
     if compute_intensity_images or compute_images or compute_convex:
         regionprops_image(
@@ -622,16 +636,74 @@ def regionprops_dict(
     for k, v in restore_legacy_names.items():
         out[v] = out.pop(k)
 
+    # allow extra properties to be a list of callable functions
+    # logic is set to match that in regionprops/regionprops_table
+    for func in extra_properties:
+        if not isinstance(func, Callable):
+            raise ValueError(
+                "extra_properties must be a list of callable functions, got "
+                f"{type(func)}"
+            )
+        name = func.__name__
+        n_args = _infer_number_of_required_args(func)
+        images = out["image"]
+        # determine whether func requires intensity image
+        results = []
+        if n_args == 2:
+            if intensity_image is not None:
+                images_intensity = out["image_intensity"]
+                for image, image_intensity in zip(images, images_intensity):
+                    multichannel = label_image.shape < intensity_image.shape
+                    multichannel = label_image.shape < intensity_image.shape
+                    if multichannel:
+                        multichannel_list = [
+                            func(images, images_intensity[..., i])
+                            for i in range(images_intensity.shape[-1])
+                        ]
+                        results.append(cp.stack(multichannel_list, axis=-1))
+                    else:
+                        results.append(func(image, image_intensity))
+            else:
+                raise AttributeError(
+                    f"intensity image required to calculate {name}"
+                )
+        elif n_args == 1:
+            for image in images:
+                results.append(func(image))
+        else:
+            raise AttributeError(
+                f"Custom regionprop function's number of arguments must "
+                f"be 1 or 2, but {name} takes {n_args} arguments."
+            )
+        is_cupy_array = isinstance(results[0], cp.ndarray)
+        if is_cupy_array:
+            out[name] = cp.stack(results, axis=0)
+        else:
+            out[name] = results
+
     # remove dependenct properties that were not explicitly requested
-    extra_props = required_props - requested_props
+    unrequested_props = required_props - requested_props
     # print(f"removing extra properties: {extra_props}")
-    for k in extra_props:
+    for k in unrequested_props:
         out.pop(k)
+
+    if to_table:
+        out = _props_dict_to_table(
+            out,
+            list(out.keys()),
+            separator=table_separator,
+            copy_to_host=table_on_host,
+            extra_property_names=tuple(f.__name__ for f in extra_properties),
+        )
     return out
 
 
 def _props_dict_to_table(
-    props_dict, properties, separator="-", copy_to_host=False
+    props_dict,
+    properties,
+    extra_property_names=[],
+    separator="-",
+    copy_to_host=False,
 ):
     out = {}
     for prop in properties:
@@ -640,12 +712,20 @@ def _props_dict_to_table(
         orig_prop = prop
         # determine the current property name for any deprecated property.
         prop = PROPS_GPU.get(prop, prop)
-        dtype = COL_DTYPES_GPU[
-            prop
-        ]  # TODO: also update for GPU-only properties?
-
         # is_0dim_array = isinstance(rp, cp.ndarray) and rp.ndim == 0
         rp = props_dict[orig_prop]
+        if prop in extra_property_names:
+            dtype = np.object_
+            if isinstance(rp, cp.ndarray):
+                if rp.dtype.kind in "bui":
+                    dtype = int
+                else:
+                    dtype = float
+            else:
+                dtype = np.object_
+        else:
+            # TODO: also update for GPU-only properties?
+            dtype = COL_DTYPES_GPU[prop]
 
         is_scalar_prop = False
         is_multicolumn = False
@@ -659,6 +739,14 @@ def _props_dict_to_table(
         elif is_multicolumn:
             if copy_to_host:
                 rp = cp.asnumpy(rp)
+            if prop == "bbox":
+                # TODO(grelee): change order of columns to match scikit-image
+                # so this reshuffling isn't needed?
+                ndim = rp.shape[-1] // 2
+                sort_indices = []
+                for i in range(2):
+                    sort_indices += list(range(i, 2 * ndim, 2))
+                rp = rp[:, sort_indices]
             shape = rp.shape[1:]
             # precompute property column names and locations
             modified_props = []
@@ -670,7 +758,7 @@ def _props_dict_to_table(
                 locs.append((slice(None),) + ind)
             for i, modified_prop in enumerate(modified_props):
                 out[modified_prop] = rp[locs[i]]
-        elif prop in OBJECT_COLUMNS_GPU:
+        elif prop in OBJECT_COLUMNS_GPU or prop in extra_property_names:
             n = len(rp)
             # keep objects in a NumPy array
             column_buffer = np.empty(n, dtype=dtype)
