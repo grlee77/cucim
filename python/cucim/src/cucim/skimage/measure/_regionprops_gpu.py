@@ -17,6 +17,7 @@ from ._regionprops_gpu_basic_kernels import (
     equivalent_diameter_area,
     equivalent_diameter_area_2d,
     equivalent_diameter_area_3d,
+    equivalent_spherical_perimeter,
     regionprops_area,
     regionprops_area_bbox,
     regionprops_bbox_coords,
@@ -90,6 +91,7 @@ __all__ = [
     "regionprops_perimeter",
     "regionprops_perimeter_crofton",
     # extra functions for cuCIM not currently in scikit-image
+    "equivalent_spherical_perimeter",  # as in ITK
     "regionprops_boundary_mask",
     "regionprops_num_boundary_pixels",
     "regionprops_num_perimeter_pixels",
@@ -111,7 +113,10 @@ PROPS_GPU_EXTRA = {
     "inertia_tensor_eigenvectors": "inertia_tensor_eigenvectors",
     "num_perimeter_pixels": "num_perimeter_pixels",
     "num_boundary_pixels": "num_boundary_pixels",
+    # a few extra parameters as in ITK
     "perimeter_on_border_ratio": "perimeter_on_border_ratio",
+    "equivalent_spherical_perimeter": "equivalent_spherical_perimeter",
+    "equivalent_ellipsoid_diameter": "equivalent_ellipsoid_diameter",
 }
 PROPS_GPU.update(PROPS_GPU_EXTRA)
 
@@ -312,6 +317,10 @@ def regionprops_dict(
             else:
                 ed = equivalent_diameter_area(out["area"], float(ndim))
             out["equivalent_diameter_area"] = ed
+            if "equivalent_spherical_perimeter" in required_props:
+                out[
+                    "equivalent_spherical_perimeter"
+                ] = equivalent_spherical_perimeter(out["area"], ndim, ed)
 
     if has_intensity:
         if "intensity_std" in required_props:
@@ -520,6 +529,16 @@ def regionprops_dict(
                     ),
                     props_dict=out,
                 )
+
+                if "equivalent_ellipsoid_diameter" in required_moment_props:
+                    # compute equivalent ellipsoid diameters as in ITK
+                    eigenvals = out["inertia_tensor_eigvals"]
+                    evals_prod = cp.prod(eigenvals, axis=1, keepdims=True)
+                    edet = cp.power(evals_prod, 1 / ndim)
+                    equiv_diam = out["equivalent_diameter_area"][:, cp.newaxis]
+                    out["equivalent_ellipsoid_diameter"] = equiv_diam * cp.sqrt(
+                        eigenvals / edet
+                    )
 
         compute_perimeter = "perimeter" in required_props
         compute_perimeter_crofton = "perimeter_crofton" in required_props

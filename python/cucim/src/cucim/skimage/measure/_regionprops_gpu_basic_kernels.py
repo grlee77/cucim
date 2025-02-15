@@ -28,6 +28,7 @@ __all__ = [
     "regionprops_image",
     "regionprops_num_pixels",
     # extra functions for cuCIM not currently in scikit-image
+    "equivalent_spherical_perimeter",
     "regionprops_num_perimeter_pixels",
 ]
 
@@ -46,7 +47,8 @@ basic_deps["extent"] = ["area", "area_bbox"]
 basic_deps["slice"] = ["bbox"]
 basic_deps["area_filled"] = ["label_filled", "num_pixels_filled"]
 basic_deps["image_filled"] = ["label_filled"]
-
+basic_deps["equivalent_diameter_area"] = ["area"]
+basic_deps["equivalent_spherical_perimeter"] = ["equivalent_diameter_area"]
 # From ITK (not currently in scikit-image). Useful to exclude objects based on
 # how much of their perimeter lies on the image boundary.
 basic_deps["num_pixels_filled"] = []
@@ -462,7 +464,25 @@ def equivalent_diameter_area_3d(area):
 
 @cp.fuse()
 def equivalent_diameter_area(area, ndim):
+    """The formula is equivalent to ITK's HyperSphereRadiusFromVolume.
+
+    This will be equal to 2 * GetEquivalentSphericalRadius() from ITK.
+    """
     return cp.pow(2.0 * ndim * area / cp.pi, 1.0 / ndim)
+
+
+@cp.fuse()
+def equivalent_spherical_perimeter(area, ndim, diameter):
+    """Equivalent of ITK's GetEquivalentSphericalPerimeter"""
+    return ndim * area / (0.5 * diameter)
+
+
+@cp.fuse()
+def hypersphere_radius_from_volume(ndim, volume):
+    return cp.pow(
+        volume * math.gamma(ndim / 2 + 1) / math.pow(math.pi, ndim * 0.5),
+        1.0 / ndim,
+    )
 
 
 def regionprops_bbox_coords(
@@ -894,7 +914,6 @@ def regionprops_label_filled(
     labels,
     max_label=None,
     props_dict=None,
-    background_label_is_common=True,
 ):
     """
 
@@ -906,12 +925,6 @@ def regionprops_label_filled(
         If None, will be determined internally.
     props_dict : dict or None
         Dictionary to store any measured properties.
-    background_label_is_common : bool, optional
-        If True, a faster algorithm is used that assumes that along the edges
-        of the `labels` image there are more background pixels than "hole"
-        piixels. If that is not true, set `background_label_is_common` to False
-        to use the `cupyx.scipy.ndimage.binary_fill_holes` (currently
-        inefficient particularly when most pixels are background pixels).
 
     Notes
     -----
@@ -923,43 +936,25 @@ def regionprops_label_filled(
     # make sure all background pixels at the boundary have the same label
     labels = cp.pad(labels, 1, mode="constant", constant_values=0)
 
-    inverse_binary_mask = labels == 0
+    binary_labels = labels > 0
+
+    # assign unique labels the background and holes
+    inverse_binary_mask = ~binary_labels
     inverse_labels = label(inverse_binary_mask)
 
-    if background_label_is_common:
-        if props_dict is not None and "num_pixels" in props_dict:
-            npix = labels.size
-            npix_labeled = int(props_dict["num_pixels"].sum())
-            percent_background = 100 * (npix - npix_labeled) / npix
-            count_edges_only = percent_background > 10
-        else:
-            count_edges_only = True
+    # After inversion, what was originally the background will now be the
+    # first foreground label encountered. This is ensured due to the
+    # single voxel padding done above and the fact that the `label`
+    # function scans linearly through the array.
+    background_index = 1
+    # set the background back to 0 in the inverse mask so we have a mask
+    # of just the holes
+    inverse_binary_mask[inverse_labels == background_index] = 0
 
-        if not count_edges_only:
-            inv_counts = cp.bincount(
-                inverse_labels[inverse_labels > 0], minlength=max_label
-            )
-
-            # assume the amount of background is > than the number of holes
-            background_index = int(cp.argmax(inv_counts))
-        else:
-            # get mask of edge pixels
-            boundary_mask = regionprops_boundary_mask(labels)
-
-            # assume that there are more background pixels than "hole" pixels
-            # along the border.
-            inv_counts = cp.bincount(
-                inverse_labels[boundary_mask], minlength=max_label + 1
-            )[1:]
-            # assume the amount of background is > than the number of holes
-            background_index = int(cp.argmax(inv_counts)) + 1
-
-        inverse_binary_mask[inverse_labels == background_index] = 0
-        binary_holes_filled = (labels > 0) + inverse_binary_mask
-    else:
-        binary_holes_filled = ndi.binary_fill_holes(labels > 0)
-
+    # add binary holes to the original mask and relabel
+    binary_holes_filled = cp.logical_or(binary_labels, inverse_binary_mask)
     label_filled = label(binary_holes_filled)
+
     if props_dict is not None:
         props_dict["label_filled"] = label_filled
     label_filled = label_filled[(slice(1, -1),) * label_filled.ndim]
