@@ -59,27 +59,6 @@ basic_deps["perimeter_on_border_ratio"] = [
     "num_boundary_pixels",
 ]
 
-# For n nonzero elements cupy.nonzero returns a tuple of length ndim where
-# each element is an array of size (n, ) corresponding to the coordinates on
-# a specific axis.
-#
-# Often for regionprops purposes we would rather have a single array of
-# size (n, ndim) instead of a the tuple of arrays.
-#
-# CuPy's `_ndarray_argwhere` (used internally by cupy.nonzero) already provides
-# this but is not part of the public API. To guard against potential future
-# change we provide a less efficient fallback implementation.
-try:
-    from cupy._core._routines_indexing import _ndarray_argwhere
-except ImportError:
-
-    def _ndarray_argwhere(a):
-        """Stack the result of cupy.nonzero into a single array
-
-        output shape will be (num_nonzero, ndim)
-        """
-        return cp.stack(cp.nonzero(a), axis=-1)
-
 
 def _get_bbox_code(uint_t, ndim, array_size):
     """
@@ -126,11 +105,11 @@ def _get_bbox_code(uint_t, ndim, array_size):
     source_post = f"""
           // bounding box outputs
           atomicMin(&bbox[(lab - 1)*{2 * ndim}], bbox_min[{ndim}*ii]);
-          atomicMax(&bbox[(lab - 1)*{2 * ndim} + 1], bbox_max[{ndim}*ii]);"""
+          atomicMax(&bbox[(lab - 1)*{2 * ndim} + {ndim}], bbox_max[{ndim}*ii]);"""  # noqa: E501
     for d in range(1, ndim):
         source_post += f"""
-          atomicMin(&bbox[(lab - 1)*{2*ndim} + {2*d}], bbox_min[{ndim}*ii + {d}]);
-          atomicMax(&bbox[(lab - 1)*{2*ndim} + {2*d + 1}], bbox_max[{ndim}*ii + {d}]);"""  # noqa: E501
+          atomicMin(&bbox[(lab - 1)*{2*ndim} + {d}], bbox_min[{ndim}*ii + {d}]);
+          atomicMax(&bbox[(lab - 1)*{2*ndim} + {d + ndim}], bbox_max[{ndim}*ii + {d}]);"""  # noqa: E501
     return source_pre, source_operation, source_post
 
 
@@ -537,9 +516,9 @@ def regionprops_bbox_coords(
     ndim = label_image.ndim
     bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
 
-    # Initialize value for atomicMin on even coordinates
+    # Initialize value for atomicMin on first ndim coordinates
     # The value for atomicMax columns is already 0 as desired.
-    bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+    bbox_coords[:, :ndim] = cp.iinfo(coord_dtype).max
 
     # make a copy if the inputs are not already C-contiguous
     if not label_image.flags.c_contiguous:
@@ -560,8 +539,8 @@ def regionprops_bbox_coords(
             # explicitly writing out the 2d case here for clarity
             bbox_slices = [
                 (
-                    slice(int(box[0]), int(box[1])),
-                    slice(int(box[2]), int(box[3])),
+                    slice(int(box[0]), int(box[2])),
+                    slice(int(box[1]), int(box[3])),
                 )
                 for box in bbox_coords_cpu
             ]
@@ -569,8 +548,7 @@ def regionprops_bbox_coords(
             # general n-dimensional case
             bbox_slices = [
                 tuple(
-                    slice(int(box[2 * d]), int(box[2 * d + 1]))
-                    for d in range(ndim)
+                    slice(int(box[d]), int(box[d + ndim])) for d in range(ndim)
                 )
                 for box in bbox_coords_cpu
             ]
@@ -598,9 +576,9 @@ def get_area_bbox_kernel(
     """
     for d in range(ndim):
         source += f"""
-           dim_max_offset = i * {2 * ndim} + {2*d + 1};
-           num_pixels_bbox *= bbox[dim_max_offset] - bbox[dim_max_offset - 1];
-        """
+           dim_max_offset = i * {2 * ndim} + {d + ndim};
+           num_pixels_bbox *= bbox[dim_max_offset] - bbox[dim_max_offset - {ndim}];
+        """  # noqa: E501
     source += """
         area_bbox = num_pixels_bbox * pixel_area;
     """

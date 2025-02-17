@@ -132,7 +132,7 @@ def regionprops_perimeter(
                 f"recomputing {labels_close.size} of {max_label} "
                 "labels due to close proximity."
             )
-            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
+            _, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     max_val = 50  # 1 + sum of kernel weights used for convolve above
     min_integer_type = _get_min_integer_dtype(
@@ -308,7 +308,7 @@ def regionprops_perimeter_crofton(
                 f"recomputing {labels_close.size} of {max_label} labels"
                 " due to close proximity."
             )
-            bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
+            _, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     max_val = 16  # 1 + (sum of the kernel weights) used for convolve above
     min_integer_type = _get_min_integer_dtype(
@@ -534,7 +534,7 @@ def regionprops_euler(
             f"recomputing {labels_close.size} of {max_label} labels"
             " due to close proximity."
         )
-        bbox, slices = regionprops_bbox_coords(labels, return_slices=True)
+        _, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     min_integer_type = _get_min_integer_dtype(
         (max_label + 1) * filter_bins, signed=False

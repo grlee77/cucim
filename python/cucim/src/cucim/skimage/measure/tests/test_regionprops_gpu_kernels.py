@@ -409,15 +409,15 @@ def test_bbox_coords_and_area(precompute_max, ndim, dtype, return_slices):
     if ndim == 2:
         # TODO make ordering of bbox consistent with regionprops bbox?
         assert_allclose(bbox[:, 0], expected_bbox["bbox-0"])
-        assert_allclose(bbox[:, 2], expected_bbox["bbox-1"])
-        assert_allclose(bbox[:, 1], expected_bbox["bbox-2"])
+        assert_allclose(bbox[:, 1], expected_bbox["bbox-1"])
+        assert_allclose(bbox[:, 2], expected_bbox["bbox-2"])
         assert_allclose(bbox[:, 3], expected_bbox["bbox-3"])
     elif ndim == 3:
         assert_allclose(bbox[:, 0], expected_bbox["bbox-0"])
-        assert_allclose(bbox[:, 2], expected_bbox["bbox-1"])
-        assert_allclose(bbox[:, 4], expected_bbox["bbox-2"])
-        assert_allclose(bbox[:, 1], expected_bbox["bbox-3"])
-        assert_allclose(bbox[:, 3], expected_bbox["bbox-4"])
+        assert_allclose(bbox[:, 1], expected_bbox["bbox-1"])
+        assert_allclose(bbox[:, 2], expected_bbox["bbox-2"])
+        assert_allclose(bbox[:, 3], expected_bbox["bbox-3"])
+        assert_allclose(bbox[:, 4], expected_bbox["bbox-4"])
         assert_allclose(bbox[:, 5], expected_bbox["bbox-5"])
 
     # compute area_bbox from bbox array

@@ -23,6 +23,33 @@ __all__ = [
 ]
 
 
+# The code below contains logic regarding dependencies between various moment
+# properties. This is used by `regionprops_dict` to plan which properties
+# need to be computed when a particular subset is requested.
+
+# create adjacency list of direct dependencies
+# For each property, the values in the dict are a direct dependency of the key
+moment_deps = dict()
+moment_deps["moments"] = ["bbox"]
+moment_deps["moments_weighted"] = ["bbox"]
+moment_deps["eccentricity"] = ["inertia_tensor_eigvals"]
+moment_deps["axis_major_length"] = ["inertia_tensor_eigvals"]
+moment_deps["axis_minor_length"] = ["inertia_tensor_eigvals"]
+moment_deps["inertia_tensor_eigenvectors"] = ["inertia_tensor_eigvals"]
+moment_deps["inertia_tensor_eigvals"] = ["inertia_tensor"]
+moment_deps["orientation"] = ["inertia_tensor"]
+moment_deps["moments_hu"] = ["moments_normalized"]
+moment_deps["moments_normalized"] = ["moments_central"]
+moment_deps["inertia_tensor"] = ["moments_central"]
+moment_deps["moments_central"] = ["moments"]
+moment_deps["centroid"] = ["moments"]
+moment_deps["centroid_local"] = ["moments"]
+moment_deps["moments_weighted_central"] = ["moments_weighted"]
+moment_deps["moments_weighted_normalized"] = ["moments_weighted_central"]
+moment_deps["centroid_weighted"] = ["moments_weighted"]
+moment_deps["centroid_weighted_local"] = ["moments_weighted"]
+
+
 def regionprops_centroid(
     label_image,
     max_label=None,
@@ -78,9 +105,9 @@ def regionprops_centroid(
     # bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
     centroid_sums = cp.zeros((max_label, ndim), dtype=cp.uint64)
 
-    # # Initialize value for atomicMin on even coordinates
+    # # Initialize value for atomicMin on first ndim coordinates
     # # The value for atomicMax columns is already 0 as desired.
-    # bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+    # bbox_coords[:, :ndim] = cp.iinfo(coord_dtype).max
 
     # make a copy if the inputs are not already C-contiguous
     if not label_image.flags.c_contiguous:
@@ -124,7 +151,7 @@ def get_centroid_local_kernel(coord_dtype, ndim):
     for d in range(ndim):
         source += f"""
             atomicAdd(&centroid_sums[(L - 1) * {ndim} + {d}],
-                      in_coord[{d}] - bbox[(L - 1) * {2 * ndim} + {2*d}]);
+                      in_coord[{d}] - bbox[(L - 1) * {2 * ndim} + {d}]);
         """
     source += """
         atomicAdd(&centroid_counts[L - 1], 1);
@@ -214,9 +241,9 @@ def regionprops_centroid_local(
 
         bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
 
-        # Initialize value for atomicMin on even coordinates
+        # Initialize value for atomicMin on first ndim coordinates
         # The value for atomicMax columns is already 0 as desired.
-        bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+        bbox_coords[:, :ndim] = cp.iinfo(coord_dtype).max
 
         # make a copy if the inputs are not already C-contiguous
         if not label_image.flags.c_contiguous:
@@ -300,7 +327,7 @@ def _get_raw_moments_code(
     for d in range(ndim):
         source_operation += f"""
                 {moments_c_type} c{d} = in_coord[{d}]
-                            - bbox[(current_label - 1) * {2 * ndim} + {2*d}];"""
+                            - bbox[(current_label - 1) * {2 * ndim} + {d}];"""
         if has_spacing:
             source_operation += f"""
                 c{d} *= spacing[{d}];"""
@@ -669,9 +696,9 @@ def regionprops_moments(
 
         bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
 
-        # Initialize value for atomicMin on even coordinates
+        # Initialize value for atomicMin on first ndim coordinates
         # The value for atomicMax columns is already 0 as desired.
-        bbox_coords[:, ::2] = cp.iinfo(coord_dtype).max
+        bbox_coords[:, :ndim] = cp.iinfo(coord_dtype).max
 
         bbox_kernel(
             label_image,
@@ -1715,7 +1742,7 @@ def get_centroid_weighted_kernel(
         if compute_global:
             spc = "" if unit_spacing else f" * spacing[{d}]"
             source += f"""
-            out_global[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0 + bbox[offset_coords + {d * 2}]{spc};"""  # noqa: E501
+            out_global[offset_out + {d}] = moments_raw[offset + {axis_offset}] / m0 + bbox[offset_coords + {d}]{spc};"""  # noqa: E501
         axis_offset *= 2
     if num_channels > 1:
         source += """
@@ -1832,34 +1859,6 @@ def regionprops_centroid_weighted(
     return centroid_local
 
 
-# The code below contains logic regarding dependencies between various moment
-# properties. This is used by `regionprops_dict` to plan which properties
-# need to be computed when a particular subset is requested.
-
-requires = dict()
-
-# create adjacency list of direct dependencies
-# For each property, the values in the dict are a direct dependency of the key
-moment_deps = dict()
-moment_deps["moments"] = ["bbox"]
-moment_deps["moments_weighted"] = ["bbox"]
-moment_deps["eccentricity"] = ["inertia_tensor_eigvals"]
-moment_deps["axis_major_length"] = ["inertia_tensor_eigvals"]
-moment_deps["axis_minor_length"] = ["inertia_tensor_eigvals"]
-moment_deps["inertia_tensor_eigenvectors"] = ["inertia_tensor_eigvals"]
-moment_deps["inertia_tensor_eigvals"] = ["inertia_tensor"]
-moment_deps["orientation"] = ["inertia_tensor"]
-moment_deps["moments_hu"] = ["moments_normalized"]
-moment_deps["moments_normalized"] = ["moments_central"]
-moment_deps["inertia_tensor"] = ["moments_central"]
-moment_deps["moments_central"] = ["moments"]
-moment_deps["centroid"] = ["moments"]
-moment_deps["centroid_local"] = ["moments"]
-moment_deps["moments_weighted_central"] = ["moments_weighted"]
-moment_deps["moments_weighted_normalized"] = ["moments_weighted_central"]
-moment_deps["centroid_weighted"] = ["moments_weighted"]
-moment_deps["centroid_weighted_local"] = ["moments_weighted"]
-
 need_moments_order1 = {
     "centroid",
     "centroid_local",  # unless ndim > 3
@@ -1887,6 +1886,7 @@ need_moments_order3 = {"moments_hu", "moments_weighted_hu"}
 
 
 def _check_moment_order(moment_order: set, requested_moment_props: set):
+    """Helper function for input validation in regionprops_dict"""
     if moment_order is None:
         if any(requested_moment_props | need_moments_order3):
             order = 3

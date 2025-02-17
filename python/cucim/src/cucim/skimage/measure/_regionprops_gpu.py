@@ -758,14 +758,6 @@ def _props_dict_to_table(
         elif is_multicolumn:
             if copy_to_host:
                 rp = cp.asnumpy(rp)
-            if prop == "bbox":
-                # TODO(grelee): change order of columns to match scikit-image
-                # so this reshuffling isn't needed?
-                ndim = rp.shape[-1] // 2
-                sort_indices = []
-                for i in range(2):
-                    sort_indices += list(range(i, 2 * ndim, 2))
-                rp = rp[:, sort_indices]
             shape = rp.shape[1:]
             # precompute property column names and locations
             modified_props = []
