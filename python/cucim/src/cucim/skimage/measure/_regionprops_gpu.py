@@ -42,6 +42,7 @@ from ._regionprops_gpu_intensity_kernels import (
     regionprops_intensity_std,
 )
 from ._regionprops_gpu_misc_kernels import (
+    misc_deps,
     regionprops_euler,
     regionprops_perimeter,
     regionprops_perimeter_crofton,
@@ -111,12 +112,15 @@ PROPS_GPU = copy(PROPS)
 PROPS_GPU_EXTRA = {
     "axis_lengths": "axis_lengths",
     "inertia_tensor_eigenvectors": "inertia_tensor_eigenvectors",
+    # a few extra parameters as in ITK
     "num_perimeter_pixels": "num_perimeter_pixels",
     "num_boundary_pixels": "num_boundary_pixels",
-    # a few extra parameters as in ITK
     "perimeter_on_border_ratio": "perimeter_on_border_ratio",
     "equivalent_spherical_perimeter": "equivalent_spherical_perimeter",
     "equivalent_ellipsoid_diameter": "equivalent_ellipsoid_diameter",
+    "flatness": "flatness",
+    "elongation": "elongation",
+    "roundness": "roundness",
 }
 PROPS_GPU.update(PROPS_GPU_EXTRA)
 
@@ -127,6 +131,12 @@ COL_DTYPES_EXTRA = {
     "inertia_tensor_eigenvectors": float,
     "num_perimeter_pixels": int,
     "num_boundary_pixels": int,
+    "perimeter_on_border_ratio": float,
+    "equivalent_spherical_perimeter": float,
+    "equivalent_ellipsoid_diameter": float,
+    "flatness": float,
+    "elongation": float,
+    "roundness": float,
 }
 
 # expand column dtypes from _regionprops to include the extra properties
@@ -152,6 +162,7 @@ property_deps = dict()
 property_deps.update(basic_deps)
 property_deps.update(convex_deps)
 property_deps.update(intensity_deps)
+property_deps.update(misc_deps)
 property_deps.update(moment_deps)
 
 
@@ -540,6 +551,14 @@ def regionprops_dict(
                         eigenvals / edet
                     )
 
+                if "elongation" in required_moment_props:
+                    itensor = out["inertia_tensor"]
+                    out["elongation"] = itensor[0] / itensor[1]
+
+                if "flatness" in required_moment_props:
+                    itensor = out["inertia_tensor"]
+                    out["flatness"] = itensor[-2] / itensor[-1]
+
         compute_perimeter = "perimeter" in required_props
         compute_perimeter_crofton = "perimeter_crofton" in required_props
         compute_euler = "euler_number" in required_props
@@ -573,6 +592,12 @@ def regionprops_dict(
                     labels_close=labels_close,
                     props_dict=out,
                 )
+                if "roundness" in required_props:
+                    out["roundness"] = (
+                        out["equivalent_spherical_perimeter"]
+                        / out["perimeter_crofton"]
+                    )
+
             if compute_euler:
                 regionprops_euler(
                     label_image,

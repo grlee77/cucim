@@ -14,6 +14,12 @@ __all__ = [
     "regionprops_perimeter_crofton",
 ]
 
+misc_deps = dict()
+misc_deps["perimeter"] = ["slice"]
+misc_deps["perimeter_crofton"] = ["slice"]
+misc_deps["euler"] = ["slice"]
+misc_deps["roundness"] = ["perimeter_crofton", "equivalent_spherical_perimeter"]
+
 
 def regionprops_perimeter(
     labels,
@@ -128,11 +134,14 @@ def regionprops_perimeter(
             labels_close = _find_close_labels(labels, binary_image, max_label)
         # regions to recompute
         if labels_close.size > 0:
-            print(
-                f"recomputing {labels_close.size} of {max_label} "
-                "labels due to close proximity."
-            )
-            _, slices = regionprops_bbox_coords(labels, return_slices=True)
+            if props_dict is not None and "slice" in props_dict:
+                slices = props_dict["slice"]
+            else:
+                print(
+                    f"recomputing {labels_close.size} of {max_label} "
+                    "labels due to close proximity."
+                )
+                _, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     max_val = 50  # 1 + sum of kernel weights used for convolve above
     min_integer_type = _get_min_integer_dtype(
@@ -304,11 +313,14 @@ def regionprops_perimeter_crofton(
 
     if robust:
         if labels_close.size > 0:
-            print(
-                f"recomputing {labels_close.size} of {max_label} labels"
-                " due to close proximity."
-            )
-            _, slices = regionprops_bbox_coords(labels, return_slices=True)
+            if props_dict is not None and "slice" in props_dict:
+                slices = props_dict["slice"]
+            else:
+                print(
+                    f"recomputing {labels_close.size} of {max_label} labels"
+                    " due to close proximity."
+                )
+                _, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     max_val = 16  # 1 + (sum of the kernel weights) used for convolve above
     min_integer_type = _get_min_integer_dtype(
@@ -530,11 +542,14 @@ def regionprops_euler(
     labels_dilated = ndi.grey_dilation(labels_pad, 3, mode="constant")
 
     if robust and labels_close.size > 0:
-        print(
-            f"recomputing {labels_close.size} of {max_label} labels"
-            " due to close proximity."
-        )
-        _, slices = regionprops_bbox_coords(labels, return_slices=True)
+        if props_dict is not None and "slice" in props_dict:
+            slices = props_dict["slice"]
+        else:
+            print(
+                f"recomputing {labels_close.size} of {max_label} labels"
+                " due to close proximity."
+            )
+            _, slices = regionprops_bbox_coords(labels, return_slices=True)
 
     min_integer_type = _get_min_integer_dtype(
         (max_label + 1) * filter_bins, signed=False
