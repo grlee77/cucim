@@ -117,10 +117,6 @@ PROPS_GPU_EXTRA = {
     "num_boundary_pixels": "num_boundary_pixels",
     "perimeter_on_border_ratio": "perimeter_on_border_ratio",
     "equivalent_spherical_perimeter": "equivalent_spherical_perimeter",
-    "equivalent_ellipsoid_diameter": "equivalent_ellipsoid_diameter",
-    "flatness": "flatness",
-    "elongation": "elongation",
-    "roundness": "roundness",
 }
 PROPS_GPU.update(PROPS_GPU_EXTRA)
 
@@ -133,10 +129,6 @@ COL_DTYPES_EXTRA = {
     "num_boundary_pixels": int,
     "perimeter_on_border_ratio": float,
     "equivalent_spherical_perimeter": float,
-    "equivalent_ellipsoid_diameter": float,
-    "flatness": float,
-    "elongation": float,
-    "roundness": float,
 }
 
 # expand column dtypes from _regionprops to include the extra properties
@@ -199,8 +191,11 @@ ndim_2_only = {
     "moments_weighted_hu",
     "orientation",
     "perimeter",
-    "perimeter_crofton",
+    "perimeter_crofton",  # could be updated to 3D/nD
+    "roundness",  # could be updated to 3D/nD
 }
+
+CURRENT_PROPS_GPU
 
 
 def regionprops_dict(
@@ -540,24 +535,6 @@ def regionprops_dict(
                     ),
                     props_dict=out,
                 )
-
-                if "equivalent_ellipsoid_diameter" in required_moment_props:
-                    # compute equivalent ellipsoid diameters as in ITK
-                    eigenvals = out["inertia_tensor_eigvals"]
-                    evals_prod = cp.prod(eigenvals, axis=1, keepdims=True)
-                    edet = cp.power(evals_prod, 1 / ndim)
-                    equiv_diam = out["equivalent_diameter_area"][:, cp.newaxis]
-                    out["equivalent_ellipsoid_diameter"] = equiv_diam * cp.sqrt(
-                        eigenvals / edet
-                    )
-
-                if "elongation" in required_moment_props:
-                    itensor = out["inertia_tensor"]
-                    out["elongation"] = itensor[0] / itensor[1]
-
-                if "flatness" in required_moment_props:
-                    itensor = out["inertia_tensor"]
-                    out["flatness"] = itensor[-2] / itensor[-1]
 
         compute_perimeter = "perimeter" in required_props
         compute_perimeter_crofton = "perimeter_crofton" in required_props

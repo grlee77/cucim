@@ -48,9 +48,6 @@ moment_deps["moments_weighted_central"] = ["moments_weighted"]
 moment_deps["moments_weighted_normalized"] = ["moments_weighted_central"]
 moment_deps["centroid_weighted"] = ["moments_weighted"]
 moment_deps["centroid_weighted_local"] = ["moments_weighted"]
-# extra properties from ITK
-moment_deps["elongation"] = ["inertia_tensor_eigvals"]
-moment_deps["flatness"] = ["inertia_tensor_eigvals"]
 
 
 def regionprops_centroid(

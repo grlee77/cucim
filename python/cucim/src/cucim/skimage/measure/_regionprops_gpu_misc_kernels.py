@@ -18,7 +18,6 @@ misc_deps = dict()
 misc_deps["perimeter"] = ["slice"]
 misc_deps["perimeter_crofton"] = ["slice"]
 misc_deps["euler"] = ["slice"]
-misc_deps["roundness"] = ["perimeter_crofton", "equivalent_spherical_perimeter"]
 
 
 def regionprops_perimeter(
