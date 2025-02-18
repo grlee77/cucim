@@ -192,7 +192,6 @@ ndim_2_only = {
     "orientation",
     "perimeter",
     "perimeter_crofton",  # could be updated to 3D/nD
-    "roundness",  # could be updated to 3D/nD
 }
 
 CURRENT_PROPS_GPU
@@ -208,6 +207,7 @@ def regionprops_dict(
     max_label=None,
     pixels_per_thread=32,
     max_labels_per_thread=4,
+    faster_convex=False,
     properties=[],
     to_table=False,
     table_separator="-",
@@ -488,7 +488,7 @@ def regionprops_dict(
 
         if "moments_weighted_central" in required_moment_props:
             regionprops_moments_central(
-                out["moments"], ndim, weighted=True, props_dict=out
+                out["moments_weighted"], ndim, weighted=True, props_dict=out
             )
 
             if "moments_weighted_normalized" in required_moment_props:
@@ -569,11 +569,6 @@ def regionprops_dict(
                     labels_close=labels_close,
                     props_dict=out,
                 )
-                if "roundness" in required_props:
-                    out["roundness"] = (
-                        out["equivalent_spherical_perimeter"]
-                        / out["perimeter_crofton"]
-                    )
 
             if compute_euler:
                 regionprops_euler(
@@ -600,6 +595,7 @@ def regionprops_dict(
             props_dict=out,
             compute_image=compute_images,
             compute_convex=compute_convex,
+            offset_coordinates=not faster_convex,
         )
 
     if "area_convex" in required_props:

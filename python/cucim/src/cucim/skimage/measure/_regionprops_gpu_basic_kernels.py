@@ -651,6 +651,7 @@ def regionprops_image(
     compute_image=True,
     compute_convex=False,
     store_convex_hull_objects=False,
+    offset_coordinates=True,
     props_dict=None,
     on_cpu=False,
 ):
@@ -689,6 +690,7 @@ def regionprops_image(
         convex_results = tuple(
             convex_hull_image(
                 m,
+                offset_coordinates=offset_coordinates,
                 omit_empty_coords_check=True,
                 float64_computation=True,
                 return_hull=store_convex_hull_objects,
@@ -836,8 +838,9 @@ def regionprops_coords(
         if compute_coords_scaled:
             coords_scaled.append(coords_concat_scaled[sl, :])
         slice_start = slice_stop
-    coords = tuple(coords)
+
     if compute_coords:
+        coords = tuple(coords)
         props_dict["coords"] = coords
         if not compute_coords_scaled:
             return coords
