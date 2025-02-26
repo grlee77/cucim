@@ -100,8 +100,6 @@ def _unravel_loop_index(
         in_coord[0] = temp_idx;"""
     return code
 
-    _get_min_integer_dtype,
-
 
 def _reverse_label_values(label_image, max_label):
     """reverses the value of all labels (keeping background value=0 the same)"""
