@@ -12,7 +12,6 @@ from cucim.skimage.measure._regionprops import (
 )
 
 from ._regionprops_gpu_basic_kernels import (
-    area_bbox_from_slices,
     basic_deps,
     equivalent_diameter_area,
     equivalent_diameter_area_2d,
@@ -63,7 +62,6 @@ from ._regionprops_gpu_moments_kernels import (
 from ._regionprops_gpu_utils import _find_close_labels, _get_min_integer_dtype
 
 __all__ = [
-    "area_bbox_from_slices",
     "equivalent_diameter_area_2d",
     "equivalent_diameter_area_3d",
     "equivalent_diameter_area",

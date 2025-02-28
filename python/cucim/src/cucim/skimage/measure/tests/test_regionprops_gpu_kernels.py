@@ -17,7 +17,6 @@ from cucim.skimage import data, measure
 from cucim.skimage._vendored import ndimage as ndi
 from cucim.skimage.measure._regionprops_gpu import (
     _find_close_labels,
-    area_bbox_from_slices,
     equivalent_diameter_area_2d,
     equivalent_diameter_area_3d,
     regionprops_area,
@@ -425,13 +424,6 @@ def test_bbox_coords_and_area(precompute_max, ndim, dtype, return_slices):
         bbox, area_dtype=cp.float32, spacing=spacing
     )
     assert_allclose(area_bbox, expected_bbox["area_bbox"], rtol=1e-5)
-
-    if return_slices:
-        # compute area_bbox from slices
-        area_bbox = area_bbox_from_slices(
-            slices, area_dtype=cp.float32, spacing=spacing
-        )
-        assert_allclose(area_bbox, expected_bbox["area_bbox"], rtol=1e-5)
 
 
 @pytest.mark.parametrize("local", [False, True])

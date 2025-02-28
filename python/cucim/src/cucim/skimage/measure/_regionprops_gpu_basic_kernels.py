@@ -16,7 +16,6 @@ from ._regionprops_gpu_utils import (
 )
 
 __all__ = [
-    "area_bbox_from_slices",
     "equivalent_diameter_area",
     "equivalent_diameter_area_2d",
     "equivalent_diameter_area_3d",
@@ -614,26 +613,6 @@ def regionprops_area_bbox(
     if props_dict is not None:
         props_dict["area_bbox"] = area_bbox
     return area_bbox
-
-
-def area_bbox_from_slices(slices, area_dtype=cp.float32, spacing=None):
-    num_label = len(slices)
-    if spacing is None:
-        pixel_area = 1.0
-    else:
-        if isinstance(spacing, cp.ndarray):
-            pixel_area = cp.product(spacing)
-        else:
-            pixel_area = math.prod(spacing)
-
-    area_bbox = np.empty((num_label,), dtype=area_dtype)
-    for i, slice_tuple in enumerate(slices):
-        num_pixels = 1
-        for sl in slice_tuple:
-            num_pixels *= sl.stop - sl.start
-        area_bbox[i] = num_pixels * pixel_area
-
-    return cp.asarray(area_bbox)
 
 
 def regionprops_extent(area, area_bbox, props_dict=None):
