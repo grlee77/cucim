@@ -53,28 +53,18 @@ moment_deps["centroid_weighted_local"] = ["moments_weighted"]
 def regionprops_centroid(
     label_image,
     max_label=None,
-    coord_dtype=cp.uint32,
     pixels_per_thread=16,
     max_labels_per_thread=None,
     props_dict=None,
 ):
-    """
-    Parameters
-    ----------
-    label_image : cp.ndarray
-        Image containing labels where 0 is the background and sequential
-        values > 0 are the labels.
-    max_label : int or None
-        The maximum label value present in label_image. Will be computed if not
-        provided.
-    coord_dtype : dtype, optional
-        The data type to use for coordinate calculations. Should be
-        ``cp.uint32`` or ``cp.uint64``.
+    """Compute the centroid of each labeled region in the image.
+
+    reuses "num_pixels" from previously computed properties if present
+
+    writes "centroid" to `props_dict`
 
     Returns
     -------
-    counts : cp.ndarray
-        The number of samples in each region.
     centroid : cp.ndarray
         The centroid of each region.
     """
@@ -102,12 +92,7 @@ def regionprops_centroid(
         max_labels_per_thread=max_labels_per_thread,
     )
 
-    # bbox_coords = cp.zeros((max_label, 2 * ndim), dtype=coord_dtype)
     centroid_sums = cp.zeros((max_label, ndim), dtype=cp.uint64)
-
-    # # Initialize value for atomicMin on first ndim coordinates
-    # # The value for atomicMax columns is already 0 as desired.
-    # bbox_coords[:, :ndim] = cp.iinfo(coord_dtype).max
 
     # make a copy if the inputs are not already C-contiguous
     if not label_image.flags.c_contiguous:
@@ -177,6 +162,13 @@ def regionprops_centroid_local(
 
     dimensions supported: nD
 
+    reuses "moments" from previously computed properties if present
+    reuses "bbox" from previously computed properties if present
+
+    writes "centroid_local" to `props_dict`
+    writes "bbox" to `props_dict` if it was not already present
+    writes "num_pixels" to `props_dict` if it was not already present
+
     Parameters
     ----------
     label_image : cp.ndarray
@@ -195,7 +187,19 @@ def regionprops_centroid_local(
         The number of samples in each region.
     centroid_local : cp.ndarray
         The local centroids
+
+    Notes
+    -----
+    The centroid could also be extracted from the raw moments
+    computed via `regionprops_moments`. That will be more efficient than
+    running this separate function if additional moment-based properties
+    are also needed.
+
+    This function is also useful for data with more than 3 dimensions as
+    regionprops_moments currently only supports 2D and 3D data.
     """
+    if props_dict is None:
+        props_dict = {}
     if max_label is None:
         max_label = int(label_image.max())
 
@@ -204,7 +208,7 @@ def regionprops_centroid_local(
 
     ndim = label_image.ndim
 
-    if props_dict is not None and "moments" in props_dict and ndim in [2, 3]:
+    if "moments" in props_dict and ndim in [2, 3]:
         # already have the moments needed in previously computed properties
         moments = props_dict["moments"]
         # can't compute if only zeroth moment is present
@@ -219,10 +223,10 @@ def regionprops_centroid_local(
                 centroid_local[:, 0] = moments[:, 1, 0, 0] / m0
                 centroid_local[:, 1] = moments[:, 0, 1, 0] / m0
                 centroid_local[:, 2] = moments[:, 0, 0, 1] / m0
-        props_dict["centroid_local"] = centroid_local
-        return centroid_local
+            props_dict["centroid_local"] = centroid_local
+            return centroid_local
 
-    if props_dict is not None and "bbox" in props_dict:
+    if "bbox" in props_dict:
         # reuse previously computed bounding box coordinates
         bbox_coords = props_dict["bbox"]
         if bbox_coords.dtype != coord_dtype:
@@ -255,6 +259,8 @@ def regionprops_centroid_local(
             bbox_coords,
             size=math.ceil(label_image.size / pixels_per_thread),
         )
+        if "bbox" not in props_dict:
+            props_dict["bbox"] = bbox_coords
 
     counts = cp.zeros((max_label,), dtype=cp.uint32)
     centroids_sums = cp.zeros((max_label, ndim), dtype=cp.uint64)
@@ -266,10 +272,9 @@ def regionprops_centroid_local(
     )
 
     centroid_local = centroids_sums / counts[:, cp.newaxis]
-    if props_dict is not None:
-        props_dict["centroid_local"] = centroid_local
-        if "num_pixels" not in props_dict:
-            props_dict["num_pixels"] = counts
+    props_dict["centroid_local"] = centroid_local
+    if "num_pixels" not in props_dict:
+        props_dict["num_pixels"] = counts
     return centroid_local
 
 
@@ -616,7 +621,13 @@ def regionprops_moments(
     max_labels_per_thread=None,
     props_dict=None,
 ):
-    """
+    """Compute the raw moments of the labeled regions.
+
+    reuses "bbox" from previously computed properties if present
+
+    writes "moments" to `props_dict` if `intensity_image` is not provided
+    writes "moments_weighted" to `props_dict` if `intensity_image` is provided
+
     Parameters
     ----------
     label_image : cp.ndarray
@@ -669,6 +680,10 @@ def regionprops_moments(
         present in the `moments` output at position 1 to give
         ``shape = (max_label, ) + (num_channels, ) + (order + 1,) * ndim``.
     """
+
+    if props_dict is None:
+        props_dict = {}
+
     if max_label is None:
         max_label = int(label_image.max())
 
@@ -679,7 +694,7 @@ def regionprops_moments(
 
     int32_coords = max(label_image.shape) < 2**32
     coord_dtype = cp.dtype(cp.uint32 if int32_coords else cp.uint64)
-    if props_dict is not None and "bbox" in props_dict:
+    if "bbox" in props_dict:
         bbox_coords = props_dict["bbox"]
         if bbox_coords.dtype != coord_dtype:
             bbox_coords = bbox_coords.astype(coord_dtype)
@@ -748,11 +763,10 @@ def regionprops_moments(
         input_args = input_args + (intensity_image,)
     size = math.ceil(label_image.size / pixels_per_thread)
     moments_kernel(*input_args, moments, size=size)
-    if props_dict is not None:
-        if weighted:
-            props_dict["moments_weighted"] = moments
-        else:
-            props_dict["moments"] = moments
+    if weighted:
+        props_dict["moments_weighted"] = moments
+    else:
+        props_dict["moments"] = moments
     return moments
 
 
@@ -942,6 +956,17 @@ def get_moments_central_kernel(
 def regionprops_moments_central(
     moments_raw, ndim, weighted=False, props_dict=None
 ):
+    """Compute the central moments of the labeled regions.
+
+    Computes the central moments from raw moments.
+
+    Writes "moments_central" to `props_dict` if `weighted` is ``False``.
+
+    Writes "moments_weighted_central" to `props_dict` if `weighted` is ``True``.
+    """
+    if props_dict is None:
+        props_dict = {}
+
     if moments_raw.ndim == 2 + ndim:
         num_channels = moments_raw.shape[1]
     elif moments_raw.ndim == 1 + ndim:
@@ -1133,7 +1158,14 @@ def regionprops_moments_normalized(
     weighted=False,
     props_dict=None,
 ):
-    """
+    """Compute the normalizedcentral moments of the labeled regions.
+
+    Computes normalized central moments from central moments.
+
+    Writes "moments_normalized" to `props_dict` if `weighted` is ``False``.
+
+    Writes "moments_weighted_normalized" to `props_dict` if `weighted` is
+    ``True``.
 
     Notes
     -----
@@ -1276,6 +1308,16 @@ def get_moments_hu_kernel(moments_dtype):
 
 
 def regionprops_moments_hu(moments_normalized, weighted=False, props_dict=None):
+    """Compute the 2D Hu invariant moments from 3rd ordernormalized central
+    moments.
+
+    Writes "moments_hu" to `props_dict` if `weighted` is ``False``
+
+    Writes "moments_weighted_hu" to `props_dict` if `weighted` is ``True``.
+    """
+    if props_dict is None:
+        props_dict = {}
+
     if moments_normalized.ndim == 4:
         num_channels = moments_normalized.shape[1]
     elif moments_normalized.ndim == 3:
@@ -1408,8 +1450,18 @@ def get_inertia_tensor_kernel(moments_dtype, ndim, compute_orientation):
 def regionprops_inertia_tensor(
     moments_central, ndim, compute_orientation=False, props_dict=None
 ):
+    """ "Compute the inertia tensor from the central moments.
+
+    The input to this function is the output of `regionprops_moments_central`.
+
+    Writes "inertia_tensor" to `props_dict`.
+    Writes "orientation" to `props_dict` if `compute_orientation` is ``True``.
+    """
     if ndim < 2 or ndim > 3:
         raise ValueError("inertia tensor only implemented for 2D and 3D images")
+    if compute_orientation and ndim != 2:
+        raise ValueError("orientation can only be computed for ndim=2")
+
     nbatch = math.prod(moments_central.shape[:-ndim])
 
     if moments_central.dtype.kind != "f":
@@ -1435,8 +1487,6 @@ def regionprops_inertia_tensor(
     itensor_shape = moments_central.shape[:-ndim] + (ndim, ndim)
     itensor = cp.zeros(itensor_shape, dtype=moments_central.dtype)
     if compute_orientation:
-        if ndim != 2:
-            raise ValueError("orientation can only be computed for ndim=2")
         orientation = cp.zeros(
             moments_central.shape[:-ndim], dtype=moments_central.dtype
         )
@@ -1621,6 +1671,21 @@ def regionprops_inertia_tensor_eigvals(
     compute_eccentricity=False,
     props_dict=None,
 ):
+    """ "Compute the inertia tensor eigenvalues (and eigenvectors) from the
+    inertia tensor of each labeled region.
+
+    The input to this function is the output of `regionprops_inertia_tensor`.
+
+    writes "inertia_tensor_eigvals" to `props_dict`
+    if compute_eigenvectors:
+        - writes "inertia_tensor_eigenvectors" to `props_dict`
+    if compute_axis_lengths:
+        - writes "axis_major_length" to `props_dict`
+        - writes "axis_minor_length" to `props_dict`
+        - writes "axis_lengths" to `props_dict`
+    if compute_eccentricity:
+        - writes "eccentricity" to `props_dict`
+    """
     # inertia tensor should have shape (ndim, ndim) on last two axes
     ndim = inertia_tensor.shape[-1]
     if ndim < 2 or ndim > 3:
@@ -1661,30 +1726,18 @@ def regionprops_inertia_tensor_eigvals(
         # swap from ascending to descending order
         eigvals = eigvals[:, ::-1]
         eigvecs = eigvecs[:, ::-1]
-        outputs = [eigvals, eigvecs]
-        if compute_axis_lengths:
-            outputs.append(axis_lengths)
-        if compute_eccentricity:
-            outputs.append(eccentricity)
-    if props_dict is not None:
-        props_dict["inertia_tensor_eigvals"] = eigvals
-        if compute_eccentricity:
-            props_dict["eccentricity"] = eccentricity
-        if compute_axis_lengths:
-            props_dict["axis_lengths"] = axis_lengths
-            props_dict["axis_major_length"] = axis_lengths[..., 0]
-            props_dict["axis_minor_length"] = axis_lengths[..., -1]
-        if compute_eigenvectors:
-            props_dict["inertia_tensor_eigenvectors"] = eigvecs
-    # Note:
-    #   For eigenvalues in descending order as returned here:
-    #     ITK's flatness and elongation are:
-    #           flatness = cp.sqrt(eigvecs[-2] / eigvecs[-1])
-    #           elongation = cp.sqrt(eigvecs[0] / eigvecs[1])
-    #   (for 2D those are the same, but not in other dimensions)
-    if len(outputs) == 1:
-        return outputs[0]
-    return tuple(outputs)
+    if props_dict is None:
+        props_dict = {}
+    props_dict["inertia_tensor_eigvals"] = eigvals
+    if compute_eccentricity:
+        props_dict["eccentricity"] = eccentricity
+    if compute_axis_lengths:
+        props_dict["axis_lengths"] = axis_lengths
+        props_dict["axis_major_length"] = axis_lengths[..., 0]
+        props_dict["axis_minor_length"] = axis_lengths[..., -1]
+    if compute_eigenvectors:
+        props_dict["inertia_tensor_eigenvectors"] = eigvecs
+    return props_dict
 
 
 @cp.memoize(for_each_device=True)
@@ -1778,6 +1831,25 @@ def regionprops_centroid_weighted(
     spacing=None,
     props_dict=None,
 ):
+    """Centroid (in global or local coordinates) from 1st order moment matrix
+
+    If `compute_local` the centroid is in local coordinates, otherwise it is in
+    global coordinates.
+
+    `bbox` property must be provided either via kwarg or within `props_dict` if
+    `compute_global` is ``True``.
+
+    if weighted:
+        if compute_global:
+            writes "centroid_weighted" to `props_dict`
+        if compute_local:
+            writes "centroid_weighted_local" to `props_dict`
+    else:
+        if compute_global:
+            writes "centroid" to `props_dict`
+        if compute_local:
+            writes "centroid_local" to `props_dict`
+    """
     max_label = moments_raw.shape[0]
     if moments_raw.ndim == ndim + 2:
         num_channels = moments_raw.shape[1]
@@ -1787,9 +1859,13 @@ def regionprops_centroid_weighted(
         raise ValueError("moments_raw has unexpected shape")
 
     if compute_global and bbox is None:
-        raise ValueError(
-            "bbox coordinates must be provided to get the non-local centroid"
-        )
+        if "bbox" in props_dict:
+            bbox = props_dict["bbox"]
+        else:
+            raise ValueError(
+                "bbox coordinates must be provided to get the non-local "
+                "centroid"
+            )
 
     if not (compute_local or compute_global):
         raise ValueError(
@@ -1841,22 +1917,20 @@ def regionprops_centroid_weighted(
     # Note: order of inputs and outputs here must match
     #       get_centroid_weighted_kernel
     kernel(*inputs, *outputs, size=max_label)
-    if props_dict is not None:
-        if compute_local:
-            if weighted:
-                props_dict["centroid_weighted_local"] = centroid_local
-            else:
-                props_dict["centroid_local"] = centroid_local
-        if compute_global:
-            if weighted:
-                props_dict["centroid_weighted"] = centroid_global
-            else:
-                props_dict["centroid"] = centroid_global
-    if compute_global and compute_local:
-        return centroid_global, compute_local
-    elif compute_global:
-        return centroid_global
-    return centroid_local
+    if props_dict is None:
+        props_dict = {}
+    if compute_local:
+        if weighted:
+            props_dict["centroid_weighted_local"] = centroid_local
+        else:
+            props_dict["centroid_local"] = centroid_local
+    if compute_global:
+        if weighted:
+            props_dict["centroid_weighted"] = centroid_global
+        else:
+            props_dict["centroid"] = centroid_global
+
+    return props_dict
 
 
 need_moments_order1 = {
@@ -1885,7 +1959,7 @@ need_moments_order2 = {
 need_moments_order3 = {"moments_hu", "moments_weighted_hu"}
 
 
-def _check_moment_order(moment_order: set, requested_moment_props: set):
+def _check_moment_order(moment_order: int | None, requested_moment_props: set):
     """Helper function for input validation in regionprops_dict"""
     if moment_order is None:
         if any(requested_moment_props | need_moments_order3):

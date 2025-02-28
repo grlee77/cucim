@@ -111,6 +111,10 @@ def regionprops_perimeter(
 ):
     """Calculate total perimeter of all objects in binary image.
 
+    when `robust` is ``True``, reuses "slice" from `props_dict`
+
+    writes "perimeter" to `props_dict`
+
     Parameters
     ----------
     labels : (M, N) ndarray
@@ -337,6 +341,10 @@ def regionprops_perimeter_crofton(
 ):
     """Calculate total Crofton perimeter of all objects in binary image.
 
+    when `robust` is ``True``, reuses "slice" from `props_dict`
+
+    writes "perimeter_crofton" to `props_dict`
+
     Parameters
     ----------
     labels : (M, N) ndarray
@@ -558,6 +566,10 @@ def regionprops_euler(
     For 2D objects, the Euler number is the number of objects minus the number
     of holes. For 3D objects, the Euler number is obtained as the number of
     objects plus the number of holes, minus the number of tunnels, or loops.
+
+    when `robust` is ``True``, reuses "slice" from `props_dict`
+
+    writes "euler_number" to `props_dict`
 
     Parameters
     ----------

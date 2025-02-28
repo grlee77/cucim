@@ -22,6 +22,16 @@ def regionprops_area_convex(
     area_dtype=cp.float64,
     props_dict=None,
 ):
+    """Compute the area of each convex image.
+
+    writes "area_convex" to props_dict
+
+    Parameters
+    ----------
+    images_convex : sequence of cupy.ndarray
+        Convex images for each region as produced by ``regionprops_image`` with
+        ``compute_convex=True``.
+    """
     if max_label is None:
         max_label = len(images_convex)
     if not isinstance(images_convex, Sequence):
@@ -95,10 +105,13 @@ def regionprops_feret_diameter_max(
     """Compute the maximum Feret diameter of the convex hull of each image in
     images_convex.
 
+    writes "feret_diameter_max" to props_dict
+
     Parameters
     ----------
-    image_convex : cupy.ndarray
-        The convex hull of the region.
+    images_convex : sequence of cupy.ndarray
+        Convex images for each region as produced by ``regionprops_image`` with
+        ``compute_convex=True``.
     spacing : tuple of float, optional
         The pixel spacing of the image.
     props_dict : dict, optional

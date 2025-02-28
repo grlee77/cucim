@@ -274,7 +274,7 @@ def test_mean_intensity(
     )
 
     max_label = int(cp.max(labels)) if precompute_max else None
-    counts, means = regionprops_intensity_mean(
+    props_dict = regionprops_intensity_mean(
         labels, intensity_image, max_label=max_label, mean_dtype=mean_dtype
     )
     expected = measure_cpu.regionprops_table(
@@ -282,13 +282,17 @@ def test_mean_intensity(
         intensity_image=cp.asnumpy(intensity_image),
         properties=["num_pixels", "intensity_mean"],
     )
-    assert_array_equal(counts, expected["num_pixels"])
+    assert_array_equal(props_dict["num_pixels"], expected["num_pixels"])
     if num_channels == 1:
-        assert_allclose(means, expected["intensity_mean"], rtol=1e-3)
+        assert_allclose(
+            props_dict["intensity_mean"], expected["intensity_mean"], rtol=1e-3
+        )
     else:
         for c in range(num_channels):
             assert_allclose(
-                means[..., c], expected[f"intensity_mean-{c}"], rtol=1e-3
+                props_dict["intensity_mean"][..., c],
+                expected[f"intensity_mean-{c}"],
+                rtol=1e-3,
             )
 
 
@@ -319,7 +323,8 @@ def test_intensity_min_and_max(
         max_label=max_label,
         compute_min=compute_min,
         compute_max=compute_max,
-    )
+    )[op_name]
+
     expected = measure_cpu.regionprops_table(
         cp.asnumpy(labels),
         intensity_image=cp.asnumpy(intensity_image),
@@ -358,7 +363,7 @@ def test_intensity_std(
         labels[53, 53:55] = max_label + 2
         max_label += 2
 
-    counts, means, stds = regionprops_intensity_std(
+    props_dict = regionprops_intensity_std(
         labels, intensity_image, max_label=max_label, std_dtype=std_dtype
     )
     expected = measure_cpu.regionprops_table(
@@ -366,17 +371,25 @@ def test_intensity_std(
         intensity_image=cp.asnumpy(intensity_image),
         properties=["num_pixels", "intensity_mean", "intensity_std"],
     )
-    assert_array_equal(counts, expected["num_pixels"])
+    assert_array_equal(props_dict["num_pixels"], expected["num_pixels"])
     if num_channels == 1:
-        assert_allclose(means, expected["intensity_mean"], rtol=1e-3)
-        assert_allclose(stds, expected["intensity_std"], rtol=1e-3)
+        assert_allclose(
+            props_dict["intensity_mean"], expected["intensity_mean"], rtol=1e-3
+        )
+        assert_allclose(
+            props_dict["intensity_std"], expected["intensity_std"], rtol=1e-3
+        )
     else:
         for c in range(num_channels):
             assert_allclose(
-                means[..., c], expected[f"intensity_mean-{c}"], rtol=1e-3
+                props_dict["intensity_mean"][..., c],
+                expected[f"intensity_mean-{c}"],
+                rtol=1e-3,
             )
             assert_allclose(
-                stds[..., c], expected[f"intensity_std-{c}"], rtol=1e-3
+                props_dict["intensity_std"][..., c],
+                expected[f"intensity_std-{c}"],
+                rtol=1e-3,
             )
 
 
@@ -451,8 +464,8 @@ def test_centroid(via_moments, local, ndim):
                 compute_global=False,
                 weighted=False,
                 props_dict=props,
-            )
-            assert "centroid_local" in props
+            )[name]
+            assert name in props
         else:
             centroid = regionprops_centroid_local(labels, max_label=max_label)
     else:
@@ -466,8 +479,8 @@ def test_centroid(via_moments, local, ndim):
                 compute_global=True,
                 weighted=False,
                 props_dict=props,
-            )
-            assert "centroid" in props
+            )[name]
+            assert name in props
         else:
             centroid = regionprops_centroid(labels, max_label=max_label)
     expected = measure_cpu.regionprops_table(
@@ -846,24 +859,19 @@ def test_inertia_tensor(
 
     assert itensor.shape[-2:] == (ndim, ndim)
 
-    outputs = regionprops_inertia_tensor_eigvals(
+    props_dict = regionprops_inertia_tensor_eigvals(
         itensor,
         compute_axis_lengths=compute_axis_lengths,
         compute_eccentricity=compute_eccentricity,
     )
-    if compute_eccentricity and compute_axis_lengths:
-        eigvals, axis_lengths, eccentricity = outputs
-        assert axis_lengths.shape == (max_label, ndim)
+    eigvals = props_dict["inertia_tensor_eigvals"]
+    assert eigvals.shape == (max_label, ndim)
+    if compute_eccentricity:
+        eccentricity = props_dict["eccentricity"]
         assert eccentricity.shape == (max_label,)
-    elif compute_axis_lengths:
-        eigvals, axis_lengths = outputs
+    if compute_axis_lengths:
+        axis_lengths = props_dict["axis_lengths"]
         assert axis_lengths.shape == (max_label, ndim)
-    elif compute_eccentricity:
-        eigvals, eccentricity = outputs
-        assert eccentricity.shape == (max_label,)
-    else:
-        eigvals = outputs
-        assert eigvals.shape == (max_label, ndim)
 
     # Do not compare to scikit-image via measure_cpu due to unhandled
     # ValueError: math domain error in scikit-image.
@@ -981,7 +989,8 @@ def test_centroid_weighted(
         compute_local=local,
         compute_global=not local,
         spacing=spacing,
-    )
+    )[prop]
+
     assert centroids.shape[-1] == ndim
 
     rtol = 1e-7

@@ -27,6 +27,8 @@ __all__ = [
     "regionprops_image",
     "regionprops_num_pixels",
     # extra functions for cuCIM not currently in scikit-image
+    "regionprops_label_filled",
+    "regionprops_num_boundary_pixels",
     "equivalent_spherical_perimeter",
     "regionprops_num_perimeter_pixels",
 ]
@@ -320,6 +322,8 @@ def regionprops_num_perimeter_pixels(
     This is a n-dimensional implementation so in 3D it is the number of pixels
     on the surface of the region.
 
+    Writes "num_perimeter_pixels" to `props_dict` if it is not None.
+
     Notes
     -----
     If the labeled regions have holes, the hole edges will be included in this
@@ -358,6 +362,17 @@ def regionprops_num_pixels(
     max_labels_per_thread=None,
     props_dict=None,
 ):
+    """Determine the number of pixels in each labeled region.
+
+    The `filled` flag should be used to indicate if the "label_image" has
+    already had holes filled via `regionprops_label_filled`.
+
+    if filled:
+        - writes "num_pixels_filled" to `props_dict`
+    else:
+        - writes "num_pixels" to `props_dict`
+    """
+
     if max_label is None:
         max_label = int(label_image.max())
     num_counts = max_label
@@ -401,6 +416,15 @@ def regionprops_area(
     max_labels_per_thread=None,
     props_dict=None,
 ):
+    """Determine the area of each labeled region.
+
+    if filled:
+        - will reuse "num_pixels_filled" from `props_dict` if present
+        - will write "area_filled" to `props_dict`
+    else:
+        - will reuse "num_pixels" from `props_dict` if present
+        - will write "area" to `props_dict`
+    """
     num_pixels_prop_name = "num_pixels_filled" if filled else "num_pixels"
     area_prop_name = "area_filled" if filled else "area"
     # integer atomicAdd is faster than floating point so better to convert
@@ -411,11 +435,11 @@ def regionprops_area(
         num_pixels = regionprops_num_pixels(
             label_image,
             max_label=max_label,
+            filled=filled,
             pixels_per_thread=pixels_per_thread,
             max_labels_per_thread=max_labels_per_thread,
+            props_dict=props_dict,
         )
-        if props_dict is not None:
-            props_dict[num_pixels_prop_name] = num_pixels
 
     area = num_pixels.astype(dtype)
     if spacing is not None:
@@ -432,11 +456,13 @@ def regionprops_area(
 
 @cp.fuse()
 def equivalent_diameter_area_2d(area):
+    """2d specialization of equivalent_diameter_area."""
     return cp.sqrt(4.0 * area / cp.pi)
 
 
 @cp.fuse()
 def equivalent_diameter_area_3d(area):
+    """3d specialization of equivalent_diameter_area."""
     return cp.cbrt(6.0 * area / cp.pi)
 
 
@@ -445,22 +471,27 @@ def equivalent_diameter_area(area, ndim):
     """The formula is equivalent to ITK's HyperSphereRadiusFromVolume.
 
     This will be equal to 2 * GetEquivalentSphericalRadius() from ITK.
+
+    Can be used to compute the "equivalent_diameter_area" property from
+    the "area" property.
     """
+    if ndim < 2:
+        raise ValueError("ndim must be at least 2")
+    if ndim == 2:
+        return equivalent_diameter_area_2d(area)
+    elif ndim == 3:
+        return equivalent_diameter_area_3d(area)
     return cp.pow(2.0 * ndim * area / cp.pi, 1.0 / ndim)
 
 
 @cp.fuse()
 def equivalent_spherical_perimeter(area, ndim, diameter):
-    """Equivalent of ITK's GetEquivalentSphericalPerimeter"""
+    """Equivalent of ITK's GetEquivalentSphericalPerimeter
+
+    Can be used to compute the "equivalent_spherical_perimeter" property from
+    the "area" property.
+    """
     return ndim * area / (0.5 * diameter)
-
-
-@cp.fuse()
-def hypersphere_radius_from_volume(ndim, volume):
-    return cp.pow(
-        volume * math.gamma(ndim / 2 + 1) / math.pow(math.pi, ndim * 0.5),
-        1.0 / ndim,
-    )
 
 
 def regionprops_bbox_coords(
@@ -471,7 +502,13 @@ def regionprops_bbox_coords(
     max_labels_per_thread=None,
     props_dict=None,
 ):
-    """
+    """Determine bounding box coordinates (and slices) of each labeled region.
+
+    Writes "bbox" to `props_dict`
+
+    if return_slices is True:
+        - writes "slice" to `props_dict`
+
     Parameters
     ----------
     label_image : cp.ndarray
@@ -592,6 +629,12 @@ def get_area_bbox_kernel(
 def regionprops_area_bbox(
     bbox, area_dtype=cp.float32, spacing=None, props_dict=None
 ):
+    """Determine the area of the bounding box of each labeled region.
+
+    Takes the "bbox" property as input.
+
+    writes "area_bbox" to props_dict.
+    """
     num_label = bbox.shape[0]
     ndim = bbox.shape[1] // 2
 
@@ -616,6 +659,12 @@ def regionprops_area_bbox(
 
 
 def regionprops_extent(area, area_bbox, props_dict=None):
+    """Compute extent as the ratio of area / area_bbox for each labeled region.
+
+    Takes the "area" and "area_bbox" properties as input.
+
+    writes "extent" to props_dict.
+    """
     extent = area / area_bbox
     if props_dict is not None:
         props_dict["extent"] = extent
@@ -634,16 +683,28 @@ def regionprops_image(
     props_dict=None,
     on_cpu=False,
 ):
-    """Return tuples of images of isolated label and/or intensities.
+    """Return tuples of images of isolated label and/or intensity images.
 
     Each image incorporates only the bounding box region for a given label.
 
+    This function can also optionally return the convex images and convex hull
+    objects.
+
     Length of the tuple(s) is equal to `max_label`.
 
-    Notes
-    -----
-    This is provided only for completeness, but unlike for the RegionProps
-    class, these are not used to compute any of the other properties.
+    reuses "slice" from `props_dict` if it is present
+
+    if compute_image:
+        - writes "image" to `props_dict`
+
+    if compute_convex:
+        - writes "image_convex" to `props_dict`
+
+    if compute_convex and store_convex_hull_objects:
+        - writes "convex_hull_objects" to `props_dict`
+
+    if intensity_image is not None:
+        - writes "image_intensity" to `props_dict`
     """
     if max_label is None:
         max_label = int(label_image.max())
@@ -725,15 +786,16 @@ def regionprops_image(
     return masks, intensity_images, image_convex
 
 
-def get_compressed_labels(
+def _get_compressed_labels(
     labels, max_label, intensity_image=None, sort_labels=True
 ):
     """Produce raveled list of coordinates and label values, excluding any
     background pixels.
 
     Some region properties can be applied to this data format more efficiently,
-    than for the original labels image. I have not yet benchmarked when it may
-    be worth doing this initial step, though.
+    than for the original labels image.
+
+    Currently being used to compute "coords" and "coords_scaled" properties.
     """
     label_dtype = _get_min_integer_dtype(max_label, signed=False)
     if labels.dtype != label_dtype:
@@ -766,17 +828,23 @@ def regionprops_coords(
 
     Length of the tuple(s) is equal to `max_label`.
 
+    reuses "num_pixels" from `props_dict` if it is present
+
+    writes "coords" to `props_dict` if compute_coords is True
+
+    writes "coords_scaled" to `props_dict` if compute_coords_scaled is True
+
     Notes
     -----
     This is provided only for completeness, but unlike for the RegionProps
-    class, these are not used to compute any of the other properties.
+    class, these are not needed in order to compute any of the other properties.
     """
     if max_label is None:
         max_label = int(label_image.max())
     if props_dict is None:
         props_dict = dict()
 
-    coords_concat, _ = get_compressed_labels(
+    coords_concat, _ = _get_compressed_labels(
         label_image, max_label=max_label, sort_labels=True
     )
 
@@ -831,7 +899,7 @@ def regionprops_coords(
     return coords, coords_scaled
 
 
-def regionprops_boundary_mask(labels):
+def _boundary_mask(labels):
     """Generate a binary mask corresponding to the pixels touching the image
     boundary.
     """
@@ -854,12 +922,14 @@ def regionprops_boundary_mask(labels):
 def regionprops_num_boundary_pixels(labels, max_label=None, props_dict=None):
     """Determine the number of pixels touching the image boundary for each
     labeled region.
+
+    writes "num_boundary_pixels" to props_dict.
     """
     if max_label is None:
         max_label = int(labels.max())
 
     # get mask of edge pixels
-    boundary_mask = regionprops_boundary_mask(labels)
+    boundary_mask = _boundary_mask(labels)
 
     # include a bin for the background
     nbins = max_label + 1
@@ -875,7 +945,9 @@ def regionprops_label_filled(
     max_label=None,
     props_dict=None,
 ):
-    """
+    """Fill holes in each labeled region.
+
+    writes "label_filled" to props_dict
 
     Parameters
     ----------
@@ -886,9 +958,10 @@ def regionprops_label_filled(
     props_dict : dict or None
         Dictionary to store any measured properties.
 
-    Notes
-    -----
-
+    Returns
+    -------
+    label_filled : cupy.ndarray
+        The label image, but with the holes in each region filled.
     """
     if max_label is None:
         max_label = int(labels.max())

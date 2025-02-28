@@ -20,7 +20,6 @@ from ._regionprops_gpu_basic_kernels import (
     regionprops_area,
     regionprops_area_bbox,
     regionprops_bbox_coords,
-    regionprops_boundary_mask,
     regionprops_coords,
     regionprops_extent,
     regionprops_image,
@@ -91,7 +90,6 @@ __all__ = [
     "regionprops_perimeter_crofton",
     # extra functions for cuCIM not currently in scikit-image
     "equivalent_spherical_perimeter",  # as in ITK
-    "regionprops_boundary_mask",
     "regionprops_num_boundary_pixels",
     "regionprops_num_perimeter_pixels",
     "regionprops_label_filled",
@@ -314,12 +312,7 @@ def regionprops_dict(
         )
 
         if "equivalent_diameter_area" in required_props:
-            if ndim == 2:
-                ed = equivalent_diameter_area_2d(out["area"])
-            elif ndim == 3:
-                ed = equivalent_diameter_area_3d(out["area"])
-            else:
-                ed = equivalent_diameter_area(out["area"], float(ndim))
+            ed = equivalent_diameter_area(out["area"], ndim)
             out["equivalent_diameter_area"] = ed
             if "equivalent_spherical_perimeter" in required_props:
                 out[
