@@ -226,7 +226,6 @@ def _get_intensity_range(image_dtype):
 @cp.memoize(for_each_device=True)
 def get_intensity_measure_kernel(
     image_dtype=None,
-    int32_coords=True,
     int32_count=True,
     num_channels=1,
     compute_num_pixels=True,
