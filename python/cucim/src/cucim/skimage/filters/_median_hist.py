@@ -194,14 +194,16 @@ def _get_median_rawkernel(
 
     return cp.RawKernel(
         code=preamble + rank_filter_kernel,
-        name="cuRankFilterMultiBlock",
+        name="cucim_rank_filter_multi_block",
     )
 
 
 def _check_shared_memory_requirement_bytes(
     hist_dtype, hist_size_coarse, hist_size_fine
 ):
-    """computes amount of shared memory required by cuRankFilterMultiBlock"""
+    """computes amount of shared memory required by
+    cucim_rank_filter_multi_block
+    """
     s = np.dtype(hist_dtype).itemsize
     shared_size = hist_size_coarse * s  # for HCoarse
     shared_size += hist_size_fine * s  # for HCoarseScane

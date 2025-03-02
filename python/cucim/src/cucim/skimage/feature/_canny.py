@@ -208,7 +208,7 @@ def _get_nonmax_kernel(large_int=False):
         "raw uint8 eroded_mask, float64 low_threshold"
     )
     out_params = "T out"
-    name = "cupyx_skimage_canny_nonmaximum_suppression_bilinear"
+    name = "cucim_skimage_canny_nonmaximum_suppression_bilinear"
     if large_int:
         name += "_large"
     return cp.ElementwiseKernel(

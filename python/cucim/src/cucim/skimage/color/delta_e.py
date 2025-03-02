@@ -47,7 +47,7 @@ tmp += (a2 - a1) * (a2 - a1);
 tmp += (b2 - b1) * (b2 - b1);
 out = sqrt(tmp);
 """,
-    name="cie76_internal",
+    name="cucim_cie76_internal",
 )
 
 
@@ -101,7 +101,7 @@ tmp *= tmp;
 dE2 += dH2 / tmp;
 dE2 = sqrt(max(dE2, 0.0));
 """,
-    name="ciede94_internal",
+    name="cucim_ciede94_internal",
 )
 
 
@@ -273,7 +273,7 @@ dE2 += H_term * H_term;
 dE2 += R_term;
 dE2 = sqrt(max(dE2, 0.0));
 """,  # noqa: E501
-    name="deltaE_ciede2000_internal",
+    name="cucim_deltaE_ciede2000_internal",
 )
 
 
@@ -369,7 +369,7 @@ dE2 += tmp;
 dE2 += dH2 / (SH * SH);
 dE2 = sqrt(max(dE2, 0.0));
 """,
-    name="deltaE_cmc_internal",
+    name="cucim_deltaE_cmc_internal",
 )
 
 
@@ -434,7 +434,7 @@ double C1 = hypot(a1, b1);
 double C2 = hypot(a2, b2);
 out = 2.0 * ((C1 * C2) - (a1 * a2 + b1 * b2));
 """,
-    name="dH2_internal",
+    name="cucim_dH2_internal",
 )
 
 

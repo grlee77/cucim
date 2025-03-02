@@ -139,7 +139,7 @@ alpha_scale_and_offset_ = cp.ElementwiseKernel(
     """
     img1 = img1 * alpha + (1 - alpha);
 """,
-    name="alpha_scale_and_offset_",
+    name="cucim_alpha_scale_and_offset_",
 )
 
 
@@ -469,7 +469,7 @@ roi_assign_averages_ = cp.ElementwiseKernel(
         out[3*i + 1] = bg_color[1];
         out[3*i + 2] = bg_color[2];
     }\n""",
-    name="roi_assign_averages",
+    name="cucim_roi_assign_averages",
 )
 
 
