@@ -334,7 +334,6 @@ def map_coordinates(
     kern = _interp_kernels._get_map_kernel(
         input.ndim,
         large_int,
-        yshape=coordinates.shape,
         mode=mode,
         cval=cval,
         order=order,
