@@ -5,6 +5,7 @@ This module contains a number of utility functions to work with images in genera
 
 from ._invert import invert
 from ._map_array import map_array
+from ._regular_grid import regular_grid
 from .arraycrop import crop
 from .dtype import (
     dtype_limits,
@@ -30,6 +31,7 @@ __all__ = [
     "dtype_limits",
     "view_as_blocks",
     "view_as_windows",
+    "regular_grid",
     "crop",
     "map_array",
     "random_noise",
