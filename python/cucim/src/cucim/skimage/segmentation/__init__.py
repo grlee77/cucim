@@ -13,6 +13,7 @@ from .morphsnakes import (
     morphological_geodesic_active_contour,
 )
 from .random_walker_segmentation import random_walker
+from .slic_superpixels import slic
 
 __all__ = [
     "expand_labels",
@@ -28,4 +29,5 @@ __all__ = [
     "inverse_gaussian_gradient",
     "disk_level_set",
     "checkerboard_level_set",
+    "slic",
 ]
