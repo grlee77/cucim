@@ -8,6 +8,7 @@ from ._chan_vese import chan_vese
 from ._clear_border import clear_border
 from ._expand_labels import expand_labels
 from ._join import join_segmentations, relabel_sequential
+from ._watershed import watershed
 from .boundaries import find_boundaries, mark_boundaries
 from .morphsnakes import (
     checkerboard_level_set,
@@ -21,6 +22,7 @@ from .random_walker_segmentation import random_walker
 __all__ = [
     "expand_labels",
     "random_walker",
+    "watershed",
     "find_boundaries",
     "mark_boundaries",
     "clear_border",
