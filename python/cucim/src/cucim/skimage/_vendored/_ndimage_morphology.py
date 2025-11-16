@@ -957,6 +957,83 @@ def binary_fill_holes(
         return output
 
 
+def _prepare_composite_mask(mask, size, footprint, structure, axes, input):
+    """Prepare a dilated mask for composite grey morphology operations.
+
+    For operations like closing (dilation->erosion) and opening (erosion->dilation),
+    we need to dilate the mask to cover both operations without restoring values
+    between them.
+
+    Args:
+        mask: Original boolean mask
+        size: Size parameter from the morphology operation
+        footprint: Footprint parameter from the morphology operation
+        structure: Structure parameter from the morphology operation
+        axes: Axes to operate on
+        input: Input array (used to determine dimensionality)
+
+    Returns:
+        tuple: (original_mask, dilated_mask)
+    """
+    import cupy
+    from cucim.skimage._vendored._ndimage_filters import _dilate_mask
+
+    original_mask = cupy.asarray(mask, dtype=bool)
+
+    # Determine structure size for dilation (need to dilate by 2x for both operations)
+    if size is not None:
+        if isinstance(size, int):
+            axes_to_use = _util._check_axes(axes, input.ndim)
+            dilate_size = tuple(2 * size - 1 for _ in axes_to_use)
+        else:
+            dilate_size = tuple(2 * s - 1 for s in size)
+    elif footprint is not None:
+        fp_shape = footprint.shape if hasattr(footprint, "shape") else footprint
+        dilate_size = tuple(2 * s - 1 for s in fp_shape)
+    elif structure is not None:
+        struct_shape = (
+            structure.shape if hasattr(structure, "shape") else structure
+        )
+        dilate_size = tuple(2 * s - 1 for s in struct_shape)
+    else:
+        dilate_size = tuple(5 for _ in range(input.ndim))  # Default: 2*3-1=5
+
+    # Dilate the mask to cover both operations
+    dilated_mask = _dilate_mask(original_mask, dilate_size, axes=axes)
+
+    return original_mask, dilated_mask
+
+
+def _grey_erosion_impl(
+    input,
+    size,
+    footprint,
+    structure,
+    output,
+    mode,
+    cval,
+    origin,
+    axes,
+    mask,
+    skip_mask_dilation_and_restoration,
+):
+    """Internal implementation of grey_erosion with mask handling control."""
+    return _filters._min_or_max_filter(
+        input,
+        size,
+        footprint,
+        structure,
+        output,
+        mode,
+        cval,
+        origin,
+        "min",
+        axes=axes,
+        mask=mask,
+        skip_mask_dilation_and_restoration=skip_mask_dilation_and_restoration,
+    )
+
+
 def grey_erosion(
     input,
     size=None,
@@ -969,7 +1046,6 @@ def grey_erosion(
     *,
     axes=None,
     mask=None,
-    _skip_mask_dilation_and_restoration=False,
 ):
     """Calculates a greyscale erosion.
 
@@ -1010,6 +1086,57 @@ def grey_erosion(
     if size is None and footprint is None and structure is None:
         raise ValueError("size, footprint or structure must be specified")
 
+    return _grey_erosion_impl(
+        input,
+        size,
+        footprint,
+        structure,
+        output,
+        mode,
+        cval,
+        origin,
+        axes,
+        mask,
+        skip_mask_dilation_and_restoration=False,
+    )
+
+
+def _grey_dilation_impl(
+    input,
+    size,
+    footprint,
+    structure,
+    output,
+    mode,
+    cval,
+    origin,
+    axes,
+    mask,
+    skip_mask_dilation_and_restoration,
+):
+    """Internal implementation of grey_dilation with mask handling control."""
+    if structure is not None:
+        structure = cupy.array(structure)
+        structure = structure[tuple([slice(None, None, -1)] * structure.ndim)]
+    if footprint is not None:
+        footprint = cupy.array(footprint)
+        footprint = footprint[tuple([slice(None, None, -1)] * footprint.ndim)]
+
+    axes = _util._check_axes(axes, input.ndim)
+    origin = _util._fix_sequence_arg(origin, len(axes), "origin", int)
+    for i in range(len(origin)):
+        origin[i] = -origin[i]
+        if footprint is not None:
+            sz = footprint.shape[i]
+        elif structure is not None:
+            sz = structure.shape[i]
+        elif numpy.isscalar(size):
+            sz = size
+        else:
+            sz = size[i]
+        if sz % 2 == 0:
+            origin[i] -= 1
+
     return _filters._min_or_max_filter(
         input,
         size,
@@ -1019,10 +1146,10 @@ def grey_erosion(
         mode,
         cval,
         origin,
-        "min",
+        "max",
         axes=axes,
         mask=mask,
-        _skip_mask_dilation_and_restoration=_skip_mask_dilation_and_restoration,
+        skip_mask_dilation_and_restoration=skip_mask_dilation_and_restoration,
     )
 
 
@@ -1038,7 +1165,6 @@ def grey_dilation(
     *,
     axes=None,
     mask=None,
-    _skip_mask_dilation_and_restoration=False,
 ):
     """Calculates a greyscale dilation.
 
@@ -1078,29 +1204,8 @@ def grey_dilation(
 
     if size is None and footprint is None and structure is None:
         raise ValueError("size, footprint or structure must be specified")
-    if structure is not None:
-        structure = cupy.array(structure)
-        structure = structure[tuple([slice(None, None, -1)] * structure.ndim)]
-    if footprint is not None:
-        footprint = cupy.array(footprint)
-        footprint = footprint[tuple([slice(None, None, -1)] * footprint.ndim)]
 
-    axes = _util._check_axes(axes, input.ndim)
-    origin = _util._fix_sequence_arg(origin, len(axes), "origin", int)
-    for i in range(len(origin)):
-        origin[i] = -origin[i]
-        if footprint is not None:
-            sz = footprint.shape[i]
-        elif structure is not None:
-            sz = structure.shape[i]
-        elif numpy.isscalar(size):
-            sz = size
-        else:
-            sz = size[i]
-        if sz % 2 == 0:
-            origin[i] -= 1
-
-    return _filters._min_or_max_filter(
+    return _grey_dilation_impl(
         input,
         size,
         footprint,
@@ -1109,10 +1214,9 @@ def grey_dilation(
         mode,
         cval,
         origin,
-        "max",
-        axes=axes,
-        mask=mask,
-        _skip_mask_dilation_and_restoration=_skip_mask_dilation_and_restoration,
+        axes,
+        mask,
+        skip_mask_dilation_and_restoration=False,
     )
 
 
@@ -1170,53 +1274,42 @@ def grey_closing(
         )
 
     # For composite operations with mask, dilate the mask once upfront
-    # to cover both operations, then pass it with _skip_mask_dilation_and_restoration
+    # to cover both operations, then pass it to internal implementations
     # to avoid double dilation and intermediate restoration
     if mask is not None:
-        import cupy
-        from cucim.skimage._vendored._ndimage_filters import _dilate_mask
-
-        original_mask = cupy.asarray(mask, dtype=bool)
-
-        # Determine structure size for dilation (need to dilate by 2x for both operations)
-        if size is not None:
-            if isinstance(size, int):
-                axes_to_use = _util._check_axes(axes, input.ndim)
-                dilate_size = tuple(2 * size - 1 for _ in axes_to_use)
-            else:
-                dilate_size = tuple(2 * s - 1 for s in size)
-        elif footprint is not None:
-            fp_shape = (
-                footprint.shape if hasattr(footprint, "shape") else footprint
-            )
-            dilate_size = tuple(2 * s - 1 for s in fp_shape)
-        elif structure is not None:
-            struct_shape = (
-                structure.shape if hasattr(structure, "shape") else structure
-            )
-            dilate_size = tuple(2 * s - 1 for s in struct_shape)
-        else:
-            dilate_size = tuple(
-                5 for _ in range(input.ndim)
-            )  # Default: 2*3-1=5
-
-        # Dilate the mask to cover both operations
-        dilated_mask = _dilate_mask(original_mask, dilate_size, axes=axes)
-        kwargs = dict(
-            mode=mode,
-            cval=cval,
-            origin=origin,
-            axes=axes,
-            mask=dilated_mask,
-            _skip_mask_dilation_and_restoration=True,
+        original_mask, dilated_mask = _prepare_composite_mask(
+            mask, size, footprint, structure, axes, input
         )
     else:
         original_mask = None
-        kwargs = dict(mode=mode, cval=cval, origin=origin, axes=axes)
+        dilated_mask = None
 
-    # Perform dilation then erosion
-    tmp = grey_dilation(input, size, footprint, structure, None, **kwargs)
-    result = grey_erosion(tmp, size, footprint, structure, output, **kwargs)
+    common_kwargs = dict(
+        mode=mode,
+        cval=cval,
+        origin=origin,
+        axes=axes,
+        mask=dilated_mask,
+        skip_mask_dilation_and_restoration=True if mask is not None else False,
+    )
+
+    # Perform dilation then erosion using internal implementations
+    tmp = _grey_dilation_impl(
+        input,
+        size,
+        footprint,
+        structure,
+        None,
+        **common_kwargs,
+    )
+    result = _grey_erosion_impl(
+        tmp,
+        size,
+        footprint,
+        structure,
+        output,
+        **common_kwargs,
+    )
 
     # Restore original values in unmasked regions
     if original_mask is not None:
@@ -1279,53 +1372,42 @@ def grey_opening(
         )
 
     # For composite operations with mask, dilate the mask once upfront
-    # to cover both operations, then pass it with _skip_mask_dilation_and_restoration
+    # to cover both operations, then pass it to internal implementations
     # to avoid double dilation and intermediate restoration
     if mask is not None:
-        import cupy
-        from cucim.skimage._vendored._ndimage_filters import _dilate_mask
-
-        original_mask = cupy.asarray(mask, dtype=bool)
-
-        # Determine structure size for dilation (need to dilate by 2x for both operations)
-        if size is not None:
-            if isinstance(size, int):
-                axes_to_use = _util._check_axes(axes, input.ndim)
-                dilate_size = tuple(2 * size - 1 for _ in axes_to_use)
-            else:
-                dilate_size = tuple(2 * s - 1 for s in size)
-        elif footprint is not None:
-            fp_shape = (
-                footprint.shape if hasattr(footprint, "shape") else footprint
-            )
-            dilate_size = tuple(2 * s - 1 for s in fp_shape)
-        elif structure is not None:
-            struct_shape = (
-                structure.shape if hasattr(structure, "shape") else structure
-            )
-            dilate_size = tuple(2 * s - 1 for s in struct_shape)
-        else:
-            dilate_size = tuple(
-                5 for _ in range(input.ndim)
-            )  # Default: 2*3-1=5
-
-        # Dilate the mask to cover both operations
-        dilated_mask = _dilate_mask(original_mask, dilate_size, axes=axes)
-        kwargs = dict(
-            mode=mode,
-            cval=cval,
-            origin=origin,
-            axes=axes,
-            mask=dilated_mask,
-            _skip_mask_dilation_and_restoration=True,
+        original_mask, dilated_mask = _prepare_composite_mask(
+            mask, size, footprint, structure, axes, input
         )
     else:
         original_mask = None
-        kwargs = dict(mode=mode, cval=cval, origin=origin, axes=axes)
+        dilated_mask = None
 
-    # Perform erosion then dilation
-    tmp = grey_erosion(input, size, footprint, structure, None, **kwargs)
-    result = grey_dilation(tmp, size, footprint, structure, output, **kwargs)
+    common_kwargs = dict(
+        mode=mode,
+        cval=cval,
+        origin=origin,
+        axes=axes,
+        mask=dilated_mask,
+        skip_mask_dilation_and_restoration=True if mask is not None else False,
+    )
+
+    # Perform erosion then dilation using internal implementations
+    tmp = _grey_erosion_impl(
+        input,
+        size,
+        footprint,
+        structure,
+        None,
+        **common_kwargs,
+    )
+    result = _grey_dilation_impl(
+        tmp,
+        size,
+        footprint,
+        structure,
+        output,
+        **common_kwargs,
+    )
 
     # Restore original values in unmasked regions
     if original_mask is not None:

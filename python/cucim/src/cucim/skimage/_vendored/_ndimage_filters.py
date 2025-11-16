@@ -1564,7 +1564,7 @@ def _min_or_max_filter(
     axes,
     *,
     mask=None,
-    _skip_mask_dilation_and_restoration=False,
+    skip_mask_dilation_and_restoration=False,
 ):
     # structure is used by morphology.grey_erosion() and grey_dilation()
     # and not by the regular min/max filters
@@ -1591,10 +1591,10 @@ def _min_or_max_filter(
         raise NotImplementedError("NaN cval is unsupported")
 
     # Dilate mask if provided to ensure correct computation
-    # (unless caller has already done this via _skip_mask_dilation_and_restoration)
+    # (unless caller has already done this via skip_mask_dilation_and_restoration)
     dilated_mask = None
     original_mask = None
-    if mask is not None and not _skip_mask_dilation_and_restoration:
+    if mask is not None and not skip_mask_dilation_and_restoration:
         original_mask = cupy.asarray(mask, dtype=bool)
         # Determine structure for dilation based on filter size
         if sizes is not None:
@@ -1604,7 +1604,7 @@ def _min_or_max_filter(
             # Non-separable filter: use footprint shape
             structure = ftprnt.shape
         dilated_mask = _dilate_mask(original_mask, structure, axes=axes)
-    elif mask is not None and _skip_mask_dilation_and_restoration:
+    elif mask is not None and skip_mask_dilation_and_restoration:
         # Use the mask as-is (assume it's already dilated)
         dilated_mask = cupy.asarray(mask, dtype=bool)
 
