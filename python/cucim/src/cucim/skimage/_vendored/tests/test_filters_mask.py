@@ -462,6 +462,37 @@ def test_grey_morphology_with_mask(filter_func, size):
     )
 
 
+@pytest.mark.parametrize(
+    "filter_func",
+    ["binary_erosion", "binary_dilation", "binary_opening", "binary_closing"],
+)
+@pytest.mark.parametrize("structure", [None, cp.ones((3, 3))])
+def test_binary_morphology_with_mask(filter_func, structure):
+    """Test binary morphology operations with mask parameter."""
+    filter_fn = getattr(ndi, filter_func)
+    # Create test data
+    input_data = cp.zeros((64, 32), dtype=bool)
+    input_data[16:48, 8:2:] = True
+    input_data[:16, :16] = True
+
+    # Create a checkerboard mask
+    mask = create_checkerboard_mask(input_data.shape)
+
+    # Apply filter without mask
+    filtered_no_mask = filter_fn(input_data, structure=structure)
+
+    # Apply filter with mask
+    filtered_with_mask = filter_fn(input_data, structure=structure, mask=mask)
+
+    # regions outside the mask should preserve original values
+    cp.testing.assert_array_equal(filtered_with_mask[~mask], input_data[~mask])
+
+    # within the mask, should match filtering without a mask
+    cp.testing.assert_array_equal(
+        filtered_with_mask[mask], filtered_no_mask[mask]
+    )
+
+
 def test_mask_all_false():
     """Test that when mask is all False, original data is preserved."""
     input_data = cp.arange(25, dtype=cp.float32).reshape(5, 5)

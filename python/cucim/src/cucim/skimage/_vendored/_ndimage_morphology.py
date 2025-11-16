@@ -576,29 +576,66 @@ def binary_opening(
     .. seealso:: :func:`scipy.ndimage.binary_opening`
     """
     axes = _util._check_axes(axes, input.ndim)
-    structure, _, _ = _prep_structure(structure, len(axes))
+    structure, structure_shape, _ = _prep_structure(structure, len(axes))
+
+    # For composite operations with mask, dilate the mask once upfront
+    # to cover both operations
+    if mask is not None:
+        # Prepare dilated mask accounting for iterations
+        # For binary operations, structure_shape could be a tuple of sizes
+        if isinstance(structure_shape, tuple) and isinstance(
+            structure_shape[0], int
+        ):
+            # structure_shape is a tuple of integers (sizes per axis)
+            size = structure_shape
+        elif hasattr(structure, "shape"):
+            # structure is an array
+            size = structure.shape
+        else:
+            size = structure_shape
+
+        # Adjust for iterations: each iteration expands by structure size
+        # For composite ops (2 operations), we need 2*iterations worth of dilation
+        adjusted_size = tuple(
+            s * 2 * iterations if iterations > 0 else s * 2
+            for s in (size if isinstance(size, tuple) else (size,) * len(axes))
+        )
+
+        original_mask, dilated_mask = _prepare_composite_mask(
+            mask, adjusted_size, None, None, axes, input
+        )
+    else:
+        original_mask = None
+        dilated_mask = None
+
     tmp = binary_erosion(
         input,
         structure,
         iterations,
-        mask,
+        dilated_mask,
         None,
         border_value,
         origin,
         brute_force,
         axes=axes,
     )
-    return binary_dilation(
+    result = binary_dilation(
         tmp,
         structure,
         iterations,
-        mask,
+        dilated_mask,
         output,
         border_value,
         origin,
         brute_force,
         axes=axes,
     )
+
+    # Restore original values in unmasked regions
+    if original_mask is not None:
+        result[~original_mask] = input[~original_mask]
+
+    return result
 
 
 def binary_closing(
@@ -662,29 +699,66 @@ def binary_closing(
     .. seealso:: :func:`scipy.ndimage.binary_closing`
     """
     axes = _util._check_axes(axes, input.ndim)
-    structure, _, _ = _prep_structure(structure, len(axes))
+    structure, structure_shape, _ = _prep_structure(structure, len(axes))
+
+    # For composite operations with mask, dilate the mask once upfront
+    # to cover both operations
+    if mask is not None:
+        # Prepare dilated mask accounting for iterations
+        # For binary operations, structure_shape could be a tuple of sizes
+        if isinstance(structure_shape, tuple) and isinstance(
+            structure_shape[0], int
+        ):
+            # structure_shape is a tuple of integers (sizes per axis)
+            size = structure_shape
+        elif hasattr(structure, "shape"):
+            # structure is an array
+            size = structure.shape
+        else:
+            size = structure_shape
+
+        # Adjust for iterations: each iteration expands by structure size
+        # For composite ops (2 operations), we need 2*iterations worth of dilation
+        adjusted_size = tuple(
+            s * 2 * iterations if iterations > 0 else s * 2
+            for s in (size if isinstance(size, tuple) else (size,) * len(axes))
+        )
+
+        original_mask, dilated_mask = _prepare_composite_mask(
+            mask, adjusted_size, None, None, axes, input
+        )
+    else:
+        original_mask = None
+        dilated_mask = None
+
     tmp = binary_dilation(
         input,
         structure,
         iterations,
-        mask,
+        dilated_mask,
         None,
         border_value,
         origin,
         brute_force,
         axes=axes,
     )
-    return binary_erosion(
+    result = binary_erosion(
         tmp,
         structure,
         iterations,
-        mask,
+        dilated_mask,
         output,
         border_value,
         origin,
         brute_force,
         axes=axes,
     )
+
+    # Restore original values in unmasked regions
+    if original_mask is not None:
+        result[~original_mask] = input[~original_mask]
+
+    return result
 
 
 def binary_hit_or_miss(
