@@ -447,7 +447,18 @@ def _run_1d_correlates(
         if param not in wghts:
             wghts[param] = get_weights(param)
     wghts = [wghts[param] for param in params]
-    return _filters_core._run_1d_filters(
+
+    # Handle mask dilation if mask is provided
+    mask = filter_kwargs.get("mask")
+    if mask is not None:
+        original_mask = cupy.asarray(mask, dtype=bool)
+        # Calculate kernel sizes from weights
+        kernel_sizes = tuple(w.size if w is not None else 1 for w in wghts)
+        # Dilate mask by kernel sizes
+        dilated_mask = _dilate_mask(original_mask, kernel_sizes, axes=axes)
+        filter_kwargs["mask"] = dilated_mask
+
+    output = _filters_core._run_1d_filters(
         [None if w is None else correlate1d for w in wghts],
         input,
         axes,
@@ -458,6 +469,12 @@ def _run_1d_correlates(
         origin,
         **filter_kwargs,
     )
+
+    # Restore original values in unmasked regions
+    if mask is not None:
+        output[~original_mask] = input[~original_mask]
+
+    return output
 
 
 def uniform_filter1d(
@@ -921,6 +938,25 @@ def _prewitt_or_sobel(
     )
 
 
+def _dilate_mask(mask, structure, axes=None):
+    """Dilate a binary mask using the given structure.
+
+    Args:
+        mask (cupy.ndarray): Binary mask to dilate.
+        structure (cp.ndarray or int or tuple of int): Structure for dilation.
+            If an integer, the same size is used for all axes.
+            If a tuple, it should match the length of axes.
+        axes (tuple of int or None): Axes along which to dilate.
+            If None, dilates along all axes.
+
+    Returns:
+        cupy.ndarray: Dilated mask.
+    """
+    from cucim.skimage._vendored._ndimage_morphology import binary_dilation
+
+    return binary_dilation(mask, structure=structure, axes=axes)
+
+
 def generic_laplace(
     input,
     derivative2,
@@ -931,6 +967,8 @@ def generic_laplace(
     extra_keywords=None,
     *,
     axes=None,
+    mask=None,
+    kernel_size=3,
 ):
     """Multi-dimensional Laplace filter using a provided second derivative
     function.
@@ -961,6 +999,10 @@ def generic_laplace(
         axes (tuple of int or None): The axes over which to apply the filter.
             If a `mode` tuple is provided, its length must match the number of
             axes.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True. The mask is dilated by
+            the kernel radius to ensure correct results.
+        kernel_size (int): Size of the derivative kernel for mask dilation.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -977,10 +1019,22 @@ def generic_laplace(
     axes = _util._check_axes(axes, input.ndim)
     num_axes = len(axes)
     output = _util._get_output(output, input)
+
+    # Dilate mask if provided to ensure correct computation
+    dilated_mask = None
+    if mask is not None:
+        mask = cupy.asarray(mask, dtype=bool)
+        # Dilate by kernel size to include all pixels needed for computation
+        dilated_mask = _dilate_mask(mask, kernel_size, axes=axes)
+
     if num_axes > 0:
         modes = _util._fix_sequence_arg(
             mode, num_axes, "mode", _util._check_mode
         )
+        # Compute all derivatives with dilated mask
+        kwargs_first = extra_keywords.copy()
+        if dilated_mask is not None:
+            kwargs_first["mask"] = dilated_mask
         derivative2(
             input,
             axes[0],
@@ -988,11 +1042,14 @@ def generic_laplace(
             modes[0],
             cval,
             *extra_arguments,
-            **extra_keywords,
+            **kwargs_first,
         )
         if num_axes > 1:
             tmp = _util._get_output(output.dtype, input)
             for i in range(1, num_axes):
+                kwargs_i = extra_keywords.copy()
+                if dilated_mask is not None:
+                    kwargs_i["mask"] = dilated_mask
                 derivative2(
                     input,
                     axes[i],
@@ -1000,11 +1057,16 @@ def generic_laplace(
                     modes[i],
                     cval,
                     *extra_arguments,
-                    **extra_keywords,
+                    **kwargs_i,
                 )
                 output += tmp
     else:
         _core.elementwise_copy(input, output)
+
+    # Restore original values in unmasked regions
+    if mask is not None:
+        output[~mask] = input[~mask]
+
     return output
 
 
@@ -1049,7 +1111,7 @@ def laplace(
     weights_dtype = cupy.promote_types(input.dtype, cupy.float32)
     weights = cupy.array([1, -2, 1], dtype=weights_dtype)
 
-    def derivative2(input, axis, output, mode, cval):
+    def derivative2(input, axis, output, mode, cval, mask=None):
         return correlate1d(
             input,
             weights,
@@ -1061,7 +1123,16 @@ def laplace(
             mask=mask,
         )
 
-    return generic_laplace(input, derivative2, output, mode, cval, axes=axes)
+    return generic_laplace(
+        input,
+        derivative2,
+        output,
+        mode,
+        cval,
+        axes=axes,
+        mask=mask,
+        kernel_size=3,
+    )
 
 
 def gaussian_laplace(
@@ -1108,7 +1179,9 @@ def gaussian_laplace(
         from SciPy due to floating-point rounding of intermediate results.
     """
 
-    def derivative2(input, axis, output, mode, cval, sigma, **kwargs):
+    def derivative2(
+        input, axis, output, mode, cval, sigma, mask=None, **kwargs
+    ):
         order = [0] * input.ndim
         order[axis] = 2
         return gaussian_filter(
@@ -1135,6 +1208,11 @@ def gaussian_laplace(
             sigma_temp[ax] = s
         sigma = sigma_temp
 
+    # Determine kernel size from sigma for mask dilation
+    # Gaussian kernels typically extend to 4*sigma
+    max_sigma = max(sigma) if isinstance(sigma, (list, tuple)) else sigma
+    kernel_size = int(cupy.ceil(4 * max_sigma)) * 2 + 1
+
     return generic_laplace(
         input,
         derivative2,
@@ -1144,6 +1222,8 @@ def gaussian_laplace(
         extra_arguments=(sigma,),
         extra_keywords=kwargs,
         axes=axes,
+        mask=mask,
+        kernel_size=kernel_size,
     )
 
 
@@ -1157,6 +1237,8 @@ def generic_gradient_magnitude(
     extra_keywords=None,
     *,
     axes=None,
+    mask=None,
+    kernel_size=3,
 ):
     """Multi-dimensional gradient magnitude filter using a provided derivative
     function.
@@ -1187,6 +1269,10 @@ def generic_gradient_magnitude(
         axes (tuple of int or None): The axes over which to apply the filter.
             If a `mode` tuple is provided, its length must match the number of
             axes.
+        mask (cupy.ndarray or None, optional): If provided, filtering will only
+            apply to the regions where the mask is True. The mask is dilated to
+            ensure correct computation.
+        kernel_size (int): Size of the derivative kernel for mask dilation.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1208,6 +1294,18 @@ def generic_gradient_magnitude(
     if ndim == 0:
         output[:] = input
         return output
+
+    # Dilate mask if provided to ensure correct computation
+    dilated_mask = None
+    if mask is not None:
+        mask = cupy.asarray(mask, dtype=bool)
+        # Dilate by kernel size to include all pixels needed for computation
+        dilated_mask = _dilate_mask(mask, kernel_size, axes=axes)
+
+    # Compute all derivatives with dilated mask
+    kwargs_first = extra_keywords.copy()
+    if dilated_mask is not None:
+        kwargs_first["mask"] = dilated_mask
     derivative(
         input,
         axes[0],
@@ -1215,12 +1313,15 @@ def generic_gradient_magnitude(
         modes[0],
         cval,
         *extra_arguments,
-        **extra_keywords,
+        **kwargs_first,
     )
     output *= output
     if ndim > 1:
         tmp = _util._get_output(output.dtype, input)
         for i in range(1, num_axes):
+            kwargs_i = extra_keywords.copy()
+            if dilated_mask is not None:
+                kwargs_i["mask"] = dilated_mask
             derivative(
                 input,
                 axes[i],
@@ -1228,11 +1329,17 @@ def generic_gradient_magnitude(
                 modes[i],
                 cval,
                 *extra_arguments,
-                **extra_keywords,
+                **kwargs_i,
             )
             tmp *= tmp
             output += tmp
-    return cupy.sqrt(output, output, casting="unsafe")
+    result = cupy.sqrt(output, output, casting="unsafe")
+
+    # Restore original values in unmasked regions
+    if mask is not None:
+        result[~mask] = input[~mask]
+
+    return result
 
 
 def gaussian_gradient_magnitude(
@@ -1266,7 +1373,8 @@ def gaussian_gradient_magnitude(
             If a `mode` tuple is provided, its length must match the number of
             axes.
         mask (cupy.ndarray or None, optional): If provided, filtering will only
-            apply to the regions where the mask is True.
+            apply to the regions where the mask is True. For gradient magnitude,
+            the mask is applied after computing the full gradient magnitude.
 
     Returns:
         cupy.ndarray: The result of the filtering.
@@ -1279,7 +1387,7 @@ def gaussian_gradient_magnitude(
         from SciPy due to floating-point rounding of intermediate results.
     """
 
-    def derivative(input, axis, output, mode, cval):
+    def derivative(input, axis, output, mode, cval, mask=None):
         order = [0] * input.ndim
         order[axis] = 1
         return gaussian_filter(
@@ -1294,8 +1402,20 @@ def gaussian_gradient_magnitude(
             **kwargs,
         )
 
+    # Determine kernel size from sigma for mask dilation
+    # Gaussian kernels typically extend to 4*sigma
+    max_sigma = max(sigma) if isinstance(sigma, (list, tuple)) else sigma
+    kernel_size = int(cupy.ceil(4 * max_sigma)) * 2 + 1
+
     return generic_gradient_magnitude(
-        input, derivative, output, mode, cval, axes=axes
+        input,
+        derivative,
+        output,
+        mode,
+        cval,
+        axes=axes,
+        mask=mask,
+        kernel_size=kernel_size,
     )
 
 
@@ -1469,10 +1589,24 @@ def _min_or_max_filter(
     if cval is cupy.nan:
         raise NotImplementedError("NaN cval is unsupported")
 
+    # Dilate mask if provided to ensure correct computation
+    dilated_mask = None
+    original_mask = None
+    if mask is not None:
+        original_mask = cupy.asarray(mask, dtype=bool)
+        # Determine structure for dilation based on filter size
+        if sizes is not None:
+            # Separable filter: use sizes directly
+            structure = sizes
+        else:
+            # Non-separable filter: use footprint shape
+            structure = ftprnt.shape
+        dilated_mask = _dilate_mask(original_mask, structure, axes=axes)
+
     if sizes is not None:
         # Separable filter, run as a series of 1D filters
         fltr = minimum_filter1d if func == "min" else maximum_filter1d
-        return _filters_core._run_1d_filters(
+        output = _filters_core._run_1d_filters(
             [fltr if size > 1 else None for size in sizes],
             input,
             axes,
@@ -1481,8 +1615,12 @@ def _min_or_max_filter(
             modes,
             cval,
             origins,
-            mask=mask,
+            mask=dilated_mask,
         )
+        # Restore original values in unmasked regions
+        if original_mask is not None:
+            output[~original_mask] = input[~original_mask]
+        return output
 
     if ftprnt.size == 0:
         return cupy.zeros_like(input)
@@ -1499,7 +1637,7 @@ def _min_or_max_filter(
         )
 
     offsets = _filters_core._origins_to_offsets(origins, ftprnt.shape)
-    has_mask = mask is not None
+    has_mask = dilated_mask is not None
     kernel = _get_min_or_max_kernel(
         modes,
         ftprnt.shape,
@@ -1513,10 +1651,14 @@ def _min_or_max_filter(
     )
     kwargs = dict(weights_dtype=bool)
     if has_mask:
-        kwargs["mask"] = mask
-    return _filters_core._call_kernel(
+        kwargs["mask"] = dilated_mask
+    output = _filters_core._call_kernel(
         kernel, input, ftprnt, output, structure, **kwargs
     )
+    # Restore original values in unmasked regions
+    if original_mask is not None:
+        output[~original_mask] = input[~original_mask]
+    return output
 
 
 def minimum_filter1d(
@@ -2015,10 +2157,7 @@ def _rank_filter(
                 axes,
                 mask=mask,
             )
-    elif mask is not None:
-        raise NotImplementedError(
-            "mask support not yet implemented in this case"
-        )
+
     offsets = _filters_core._origins_to_offsets(origins, footprint_shape)
     if num_axes < ndim and not has_weights:
         offsets = tuple(_util._expand_origin(ndim, axes, offsets))
