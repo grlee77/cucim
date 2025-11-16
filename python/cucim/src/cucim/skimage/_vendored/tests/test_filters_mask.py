@@ -141,63 +141,32 @@ def test_correlate1d_convolve1d_with_mask(filter_func, axis):
     )
 
 
+@pytest.mark.parametrize(
+    "filter_func", ["uniform_filter1d", "minimum_filter1d", "maximum_filter1d"]
+)
+@pytest.mark.parametrize("axis", [0, -1])
 @pytest.mark.parametrize("size", [3, 5])
-@pytest.mark.parametrize("ndim", [1, 2, 3])
-def test_uniform_filter_with_mask(size, ndim):
-    """Test uniform_filter with mask parameter."""
-    # Create test data
-    shape = (32,) * ndim
-    rng = cp.random.default_rng(123)
-    input_data = rng.random(shape, dtype=cp.float32) * 100
-
-    # Create mask region
-    mask = create_checkerboard_mask(shape)
-
-    # Apply filter without mask
-    filtered_no_mask = ndi.uniform_filter(input_data, size=size, mode="reflect")
-
-    # Apply filter with mask
-    filtered_with_mask = ndi.uniform_filter(
-        input_data, size=size, mode="reflect", mask=mask
-    )
-
-    # regions outside the mask should preserve original values
-    cp.testing.assert_array_almost_equal(
-        filtered_with_mask[~mask], input_data[~mask]
-    )
-
-    # within the mask, should match filtering without a mask
-    cp.testing.assert_array_almost_equal(
-        filtered_with_mask[mask], filtered_no_mask[mask]
-    )
-
-
-@pytest.mark.parametrize("axis", [0, 1])
-def test_uniform_filter1d_with_mask(axis):
-    """Test uniform_filter1d with mask parameter."""
+def test_separable_filter1d_with_mask(filter_func, axis, size):
+    """Test separable 1D filters (uniform_filter1d, minimum_filter1d, maximum_filter1d) with mask parameter."""
+    filter_fn = getattr(ndi, filter_func)
     # Create test data
     input_data = cp.array(
-        [
-            [1.0, 2.0, 3.0, 4.0, 5.0],
-            [6.0, 7.0, 8.0, 9.0, 10.0],
-            [11.0, 12.0, 13.0, 14.0, 15.0],
-        ],
+        [[10, 20, 30, 40, 50], [15, 25, 35, 45, 55], [12, 22, 32, 42, 52]],
         dtype=cp.float32,
     )
 
-    # Create a mask - every other element
-    mask = cp.zeros_like(input_data, dtype=bool)
-    mask[::2, ::2] = True
-    mask[1::2, 1::2] = True
+    # Create a mask
+    mask = cp.ones_like(input_data, dtype=bool)
+    mask[0, :] = False  # Don't filter first row
 
     # Apply filter without mask
-    filtered_no_mask = ndi.uniform_filter1d(
-        input_data, size=3, axis=axis, mode="reflect"
+    filtered_no_mask = filter_fn(
+        input_data, size=size, axis=axis, mode="reflect"
     )
 
     # Apply filter with mask
-    filtered_with_mask = ndi.uniform_filter1d(
-        input_data, size=3, axis=axis, mode="reflect", mask=mask
+    filtered_with_mask = filter_fn(
+        input_data, size=size, axis=axis, mode="reflect", mask=mask
     )
 
     # regions outside the mask should preserve original values
@@ -296,18 +265,20 @@ def test_gaussian_filter1d_with_mask(axis):
 @pytest.mark.parametrize(
     "filter_func,filter_kwargs",
     [
+        ("uniform_filter", {}),
         ("minimum_filter", {}),
         ("maximum_filter", {}),
         ("median_filter", {}),
-        ("rank_filter", {"rank": 0}),
+        ("rank_filter", {"rank": 1}),
         ("rank_filter", {"rank": 4}),
-        ("percentile_filter", {"percentile": 0}),
+        ("percentile_filter", {"percentile": 10}),
         ("percentile_filter", {"percentile": 50}),
+        ("percentile_filter", {"percentile": 90}),
     ],
 )
 @pytest.mark.parametrize("size", [3, 5])
-def test_rank_filters_with_mask(filter_func, filter_kwargs, size):
-    """Test rank-based filters (minimum, maximum, rank, percentile) with mask parameter."""
+def test_separable_filters_with_mask(filter_func, filter_kwargs, size):
+    """Test separable filters (uniform, minimum, maximum, median, rank, percentile) with mask parameter."""
     filter_fn = getattr(ndi, filter_func)
     # Create test data with a larger array
     rng = cp.random.default_rng(999)
@@ -337,72 +308,8 @@ def test_rank_filters_with_mask(filter_func, filter_kwargs, size):
     )
 
 
-@pytest.mark.parametrize("axis", [0, 1])
-def test_minimum_filter1d_with_mask(axis):
-    """Test minimum_filter1d with mask parameter."""
-    # Create test data
-    input_data = cp.array(
-        [[10, 20, 30, 40, 50], [15, 25, 35, 45, 55], [12, 22, 32, 42, 52]],
-        dtype=cp.float32,
-    )
-
-    # Create a mask
-    mask = cp.ones_like(input_data, dtype=bool)
-    mask[0, :] = False  # Don't filter first row
-
-    # Apply filter without mask
-    filtered_no_mask = ndi.minimum_filter1d(
-        input_data, size=3, axis=axis, mode="reflect"
-    )
-
-    # Apply filter with mask
-    filtered_with_mask = ndi.minimum_filter1d(
-        input_data, size=3, axis=axis, mode="reflect", mask=mask
-    )
-
-    # regions outside the mask should preserve original values
-    cp.testing.assert_array_equal(filtered_with_mask[~mask], input_data[~mask])
-
-    # within the mask, should match filtering without a mask
-    cp.testing.assert_array_equal(
-        filtered_with_mask[mask], filtered_no_mask[mask]
-    )
-
-
-@pytest.mark.parametrize("axis", [0, 1])
-def test_maximum_filter1d_with_mask(axis):
-    """Test maximum_filter1d with mask parameter."""
-    # Create test data
-    input_data = cp.array(
-        [[10, 20, 30, 40, 50], [15, 25, 35, 45, 55], [12, 22, 32, 42, 52]],
-        dtype=cp.float32,
-    )
-
-    # Create a mask
-    mask = cp.ones_like(input_data, dtype=bool)
-    mask[:, 0] = False  # Don't filter first column
-
-    # Apply filter without mask
-    filtered_no_mask = ndi.maximum_filter1d(
-        input_data, size=3, axis=axis, mode="reflect"
-    )
-
-    # Apply filter with mask
-    filtered_with_mask = ndi.maximum_filter1d(
-        input_data, size=3, axis=axis, mode="reflect", mask=mask
-    )
-
-    # regions outside the mask should preserve original values
-    cp.testing.assert_array_equal(filtered_with_mask[~mask], input_data[~mask])
-
-    # within the mask, should match filtering without a mask
-    cp.testing.assert_array_equal(
-        filtered_with_mask[mask], filtered_no_mask[mask]
-    )
-
-
 @pytest.mark.parametrize("filter_func", ["prewitt", "sobel"])
-@pytest.mark.parametrize("axis", [0, 1, -1])
+@pytest.mark.parametrize("axis", [0, -1])
 def test_edge_filters_with_mask(filter_func, axis):
     """Test prewitt/sobel edge filters with mask parameter."""
     filter_fn = getattr(ndi, filter_func)
@@ -519,10 +426,13 @@ def test_gaussian_gradient_magnitude_with_mask(sigma):
     )
 
 
-@pytest.mark.parametrize("filter_func", ["grey_erosion", "grey_dilation"])
+@pytest.mark.parametrize(
+    "filter_func",
+    ["grey_erosion", "grey_dilation", "grey_opening", "grey_closing"],
+)
 @pytest.mark.parametrize("size", [3, 5])
 def test_grey_morphology_with_mask(filter_func, size):
-    """Test grey_erosion/grey_dilation with mask parameter."""
+    """Test grey morphology operations with mask parameter."""
     filter_fn = getattr(ndi, filter_func)
     # Create test data
     input_data = cp.array(
