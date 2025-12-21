@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Watershed segmentation using cellular automaton algorithm.
 
 This module implements the CA-watershed algorithm based on:
@@ -200,7 +203,7 @@ def _footprint_to_connectivity(footprint):
     # Check for 2D
     if footprint.ndim != 2:
         raise ValueError(
-            "Only 2D footprints are supported, " f"got {footprint.ndim}D"
+            f"Only 2D footprints are supported, got {footprint.ndim}D"
         )
 
     # Check for standard 3x3 footprints
@@ -301,8 +304,7 @@ def _validate_inputs(image, markers, mask, connectivity):
 
         if mask.shape != image.shape:
             raise ValueError(
-                f"mask shape {mask.shape} must match "
-                f"image shape {image.shape}"
+                f"mask shape {mask.shape} must match image shape {image.shape}"
             )
 
         # Convert mask to uint8

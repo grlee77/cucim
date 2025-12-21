@@ -2,6 +2,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+from ._percentile import (
+    autolevel_percentile,
+    gradient_percentile,
+    mean_percentile,
+    subtract_mean_percentile,
+    enhance_contrast_percentile,
+    percentile,
+    pop_percentile,
+    sum_percentile,
+    threshold_percentile,
+)
+# from .bilateral import mean_bilateral, pop_bilateral, sum_bilateral
+
 # from .generic import (
 #     autolevel,
 #     equalize,
@@ -23,19 +36,6 @@
 #     sum,
 #     windowed_histogram,
 # )
-from ._percentile import (
-    autolevel_percentile,
-    gradient_percentile,
-    mean_percentile,
-    subtract_mean_percentile,
-    enhance_contrast_percentile,
-    percentile,
-    pop_percentile,
-    sum_percentile,
-    threshold_percentile,
-)
-# from .bilateral import mean_bilateral, pop_bilateral, sum_bilateral
-
 
 __all__ = [
     #  'autolevel',
