@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 """Inferior and superior ranks, provided by the user, are passed to the kernel
 function to provide a softer version of the rank filters. E.g.
@@ -34,7 +34,7 @@ __all__ = [
     "autolevel_percentile",
     "gradient_percentile",
     "mean_percentile",
-    "sum_percentile",
+    # "sum_percentile",
     "subtract_mean_percentile",
     "enhance_contrast_percentile",
     "percentile",
