@@ -148,6 +148,7 @@ repos:
             ^python/cucim/src/cucim/skimage/filters/_window[.]py$|
             ^python/cucim/src/cucim/skimage/filters/cuda/histogram_median[.]cu$|
             ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_common[.]cuh$|
+            ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_construct[.]cu$|
             ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_median[.]cu$|
             ^python/cucim/src/cucim/skimage/filters/lpi_filter[.]py$|
             ^python/cucim/src/cucim/skimage/filters/ridges[.]py$|
@@ -561,6 +562,7 @@ repos:
           (?x)^(
             python/cucim/src/cucim/skimage/filters/cuda/histogram_median[.]cu$|
             python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_common[.]cuh$|
+            python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_construct[.]cu$|
             python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_median[.]cu$
           )
       - id: verify-copyright
