@@ -522,9 +522,30 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
             "Unsupported dtype. Supported: uint8/16/32/64, int8/16/32/64, float16/32/64",
         )
 
-    # Check image width (must fit in uint16)
+    # Check image width (must fit in uint16 for column indices)
     if image.shape[1] >= 65535:
         return False, "Image width must be less than 65535"
+
+    # For rank-based dtypes, check total pixels (ranks stored as uint32)
+    if _uses_rank_mode(image.dtype):
+        # Account for padding (radius added on each side)
+        if radius is not None:
+            padded_h = image.shape[0] + 2 * radius
+            padded_w = image.shape[1] + 2 * radius
+        elif footprint_shape is not None:
+            padded_h = image.shape[0] + 2 * footprint_shape[0] // 2
+            padded_w = image.shape[1] + 2 * footprint_shape[1] // 2
+        else:
+            padded_h = image.shape[0]
+            padded_w = image.shape[1]
+
+        total_pixels = padded_h * padded_w
+        if total_pixels > 2**32 - 1:
+            return (
+                False,
+                f"Image too large for rank-based dtype ({image.dtype}). "
+                f"Total pixels ({total_pixels:,}) exceeds uint32 max ({2**32 - 1:,})",
+            )
 
     # Check footprint
     if footprint_shape is not None:
