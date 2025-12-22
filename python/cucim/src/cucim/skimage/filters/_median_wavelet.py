@@ -487,15 +487,15 @@ def _can_use_wavelet_matrix(
     Parameters
     ----------
     image : cupy.ndarray
-        The input image
+        The input image (2D, C-contiguous assumed)
     footprint_shape : tuple of int, optional
-        The filter footprint shape (height, width). Both must be odd.
+        The filter footprint shape (size_axis0, size_axis1). Both must be odd.
     radius : int, optional
         The filter radius for square footprints (alternative to footprint_shape)
     radius_y : int, optional
-        The filter radius in Y direction (alternative to footprint_shape)
+        The filter radius along axis 0 (rows). Alternative to footprint_shape.
     radius_x : int, optional
-        The filter radius in X direction (alternative to footprint_shape)
+        The filter radius along axis 1 (columns). Alternative to footprint_shape.
 
     Returns
     -------
@@ -599,17 +599,17 @@ class WaveletMatrixMedianParams:
         Parameters
         ----------
         height : int
-            Original image height (before padding)
+            Original image height (before padding), i.e., image.shape[0]
         width : int
-            Original image width (before padding)
+            Original image width (before padding), i.e., image.shape[1]
         dtype : numpy dtype
             Image data type
         radius : int, optional
             Filter radius for square footprints
         radius_y : int, optional
-            Filter radius in Y direction (height)
+            Filter radius along axis 0 (rows/height)
         radius_x : int, optional
-            Filter radius in X direction (width)
+            Filter radius along axis 1 (columns/width)
         """
         self.height = height
         self.width = width
@@ -1379,13 +1379,14 @@ def _median_wavelet_filter(
     Parameters
     ----------
     image : cupy.ndarray
-        Input 2D image (uint8, uint16, or float32)
+        Input 2D image (uint8, uint16, or float32). Must be C-contiguous or
+        will be copied to a contiguous array.
     radius : int, optional
         Filter radius for square footprints (kernel size = 2*radius + 1)
     radius_y : int, optional
-        Filter radius in Y direction (kernel height = 2*radius_y + 1)
+        Filter radius along axis 0 (rows/height). Kernel height = 2*radius_y + 1.
     radius_x : int, optional
-        Filter radius in X direction (kernel width = 2*radius_x + 1)
+        Filter radius along axis 1 (columns/width). Kernel width = 2*radius_x + 1.
     mode : str
         Padding mode for boundary handling. Options:
         - 'reflect': Symmetric reflection (d c b a | a b c d | d c b a)
@@ -1397,6 +1398,12 @@ def _median_wavelet_filter(
     -------
     result : cupy.ndarray
         Median-filtered image with same shape and dtype as input
+
+    Notes
+    -----
+    The CUDA kernels assume C-contiguous (row-major) memory layout where
+    axis 0 corresponds to rows (Y direction) and axis 1 corresponds to
+    columns (X direction).
     """
     # Normalize radius parameters
     if radius is not None:
@@ -1412,6 +1419,9 @@ def _median_wavelet_filter(
     ok, reason = _can_use_wavelet_matrix(image, radius_y=ry, radius_x=rx)
     if not ok:
         raise ValueError(f"Cannot use wavelet matrix filter: {reason}")
+
+    # Ensure C-contiguous layout (kernels assume row-major order)
+    image = cp.ascontiguousarray(image)
 
     height, width = image.shape
     dtype = image.dtype
