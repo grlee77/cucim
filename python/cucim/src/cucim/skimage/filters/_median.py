@@ -173,21 +173,13 @@ def median(
     hist_reason = None
 
     if algorithm in ["auto", "wavelet_matrix"]:
-        # Wavelet matrix requires rectangular footprint (currently square only)
-        # TODO: extend to support rectangular footprints with different radii
+        # Wavelet matrix supports rectangular footprints with odd dimensions
         if image.ndim != 2:
             can_use_wavelet = False
             wm_reason = "Only 2D images are supported"
-        elif len(set(footprint_shape)) != 1:
-            can_use_wavelet = False
-            wm_reason = (
-                "Non-square footprint; wavelet matrix currently requires "
-                "square footprints (rectangular support is a future enhancement)"
-            )
         else:
-            radius = footprint_shape[0] // 2
             can_use_wavelet, wm_reason = _can_use_wavelet_matrix(
-                image, radius=radius
+                image, footprint_shape=footprint_shape
             )
 
     if algorithm in ["auto", "histogram"]:
@@ -248,8 +240,12 @@ def median(
                             "to cupy.dtype"
                         )
 
-            radius = footprint_shape[0] // 2
-            temp = _median_wavelet_filter(image, radius=radius, mode=mode)
+            # Support rectangular footprints
+            radius_y = footprint_shape[0] // 2
+            radius_x = footprint_shape[1] // 2
+            temp = _median_wavelet_filter(
+                image, radius_y=radius_y, radius_x=radius_x, mode=mode
+            )
 
             if output_array_provided:
                 out[:] = temp
