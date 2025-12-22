@@ -11,6 +11,7 @@ import numpy as np
 import cucim.skimage._vendored.ndimage as ndi
 
 from ._median_hist import KernelResourceError, _can_use_histogram, _median_hist
+from ._median_wavelet import _can_use_wavelet_matrix, _median_wavelet_filter
 
 
 def median(
@@ -67,12 +68,23 @@ def median(
 
     Other Parameters
     ----------------
-    algorithm : {'auto', 'histogram', 'sorting'}
+    algorithm : {'auto', 'wavelet_matrix', 'histogram', 'sorting'}
         Determines which algorithm is used to compute the median. The default
-        of 'auto' will attempt to use a histogram-based algorithm for 2D
-        images with 8 or 16-bit integer data types. Otherwise a sorting-based
-        algorithm will be used. Note: this parameter is cuCIM-specific and does
-        not exist in upstream scikit-image.
+        of 'auto' will attempt to use a wavelet matrix-based algorithm for 2D
+        images with 8 or 16-bit unsigned integer data types and sufficiently
+        large footprints. Falls back to histogram-based or sorting-based
+        algorithms when wavelet matrix is not suitable.
+
+        - 'wavelet_matrix': Fast wavelet matrix algorithm [2]_. Best for larger
+          footprints on 2D uint8/uint16 images.
+        - 'histogram': Histogram-based algorithm [1]_. Works for 2D integer
+          images.
+        - 'sorting': Sorting-based algorithm via scipy.ndimage. Works for any
+          dtype and dimensionality.
+        - 'auto': Automatically selects the best algorithm.
+
+        Note: this parameter is cuCIM-specific and does not exist in upstream
+        scikit-image.
     algorithm_kwargs : dict
         Any additional algorithm-specific keywords. Currently can only be used
         to set the number of parallel partitions for the 'histogram' algorithm.
@@ -92,19 +104,27 @@ def median(
 
     Notes
     -----
-    An efficient, histogram-based median filter as described in [1]_ is faster
-    than the sorting based approach for larger kernel sizes (e.g. greater than
-    13x13 or so in 2D). It has near-constant run time regardless of the kernel
-    size. The algorithm presented in [1]_ has been adapted to additional bit
-    depths here. When algorithm='auto', the histogram-based algorithm will be
-    chosen for integer-valued images with sufficiently large footprint size.
-    Otherwise, the sorting-based approach is used.
+    For 2D images with uint8 or uint16 dtypes, a wavelet matrix-based median
+    filter [2]_ provides the fastest performance for larger kernel sizes. This
+    algorithm builds a succinct data structure enabling efficient range median
+    queries with O(log(max_value)) complexity.
+
+    For cases where the wavelet matrix approach is not applicable, a histogram-
+    based median filter [1]_ may be used. It is faster than sorting for larger
+    kernels (e.g., greater than 13x13) and has near-constant run time regardless
+    of kernel size.
+
+    When algorithm='auto', the best available algorithm is selected based on
+    image dtype, dimensionality, and footprint size.
 
     References
     ----------
     .. [1] O. Green, "Efficient Scalable Median Filtering Using Histogram-Based
        Operations," in IEEE Transactions on Image Processing, vol. 27, no. 5,
        pp. 2217-2228, May 2018, https://doi.org/10.1109/TIP.2017.2781375.
+    .. [2] Y. Sumida et al., "High-Performance 2D Median Filter Using Wavelet
+       Matrix," in ACM SIGGRAPH Asia 2022 Technical Communications,
+       https://doi.org/10.1145/3550454.3555512.
 
     Examples
     --------
@@ -138,29 +158,119 @@ def median(
     else:
         footprint_shape = footprint.shape
 
-    if algorithm == "sorting":
-        can_use_histogram = False
-    elif algorithm in ["auto", "histogram"]:
-        can_use_histogram, reason = _can_use_histogram(
+    # Validate algorithm parameter
+    valid_algorithms = {"auto", "wavelet_matrix", "histogram", "sorting"}
+    if algorithm not in valid_algorithms:
+        raise ValueError(
+            f"unknown algorithm: {algorithm}. "
+            f"Valid options are: {sorted(valid_algorithms)}"
+        )
+
+    # Check algorithm compatibility
+    can_use_wavelet = False
+    can_use_histogram = False
+    wm_reason = None
+    hist_reason = None
+
+    if algorithm in ["auto", "wavelet_matrix"]:
+        # Wavelet matrix requires rectangular footprint (currently square only)
+        # TODO: extend to support rectangular footprints with different radii
+        if image.ndim != 2:
+            can_use_wavelet = False
+            wm_reason = "Only 2D images are supported"
+        elif len(set(footprint_shape)) != 1:
+            can_use_wavelet = False
+            wm_reason = (
+                "Non-square footprint; wavelet matrix currently requires "
+                "square footprints (rectangular support is a future enhancement)"
+            )
+        else:
+            radius = footprint_shape[0] // 2
+            can_use_wavelet, wm_reason = _can_use_wavelet_matrix(
+                image, radius=radius
+            )
+
+    if algorithm in ["auto", "histogram"]:
+        can_use_histogram, hist_reason = _can_use_histogram(
             image, footprint, footprint_shape
         )
-    else:
-        raise ValueError(f"unknown algorithm: {algorithm}")
+
+    # Explicit algorithm requests with validation
+    if algorithm == "wavelet_matrix" and not can_use_wavelet:
+        raise ValueError(
+            "The wavelet_matrix algorithm was requested, but it cannot "
+            f"be used for this image and footprint (reason: {wm_reason})."
+        )
 
     if algorithm == "histogram" and not can_use_histogram:
         raise ValueError(
             "The histogram-based algorithm was requested, but it cannot "
-            f"be used for this image and footprint (reason: {reason})."
+            f"be used for this image and footprint (reason: {hist_reason})."
         )
 
-    # The sorting-based implementation in CuPy is faster for small footprints.
-    # Empirically, shapes above (13, 13) and above on RTX A6000 have faster
-    # execution for the histogram-based approach.
-    use_histogram = can_use_histogram
-    if algorithm == "auto":
-        # prefer sorting-based algorithm if footprint shape is small
-        use_histogram = use_histogram and math.prod(footprint_shape) > 150
+    # Algorithm selection for 'auto' mode
+    # Priority: wavelet_matrix > histogram > sorting
+    # Use sorting for small footprints (< ~150 elements)
+    footprint_size = math.prod(footprint_shape)
+    use_wavelet = False
+    use_histogram = False
 
+    if algorithm == "auto":
+        # For small footprints, sorting is often fastest
+        if (
+            footprint_size <= 150
+        ):  # TODO: check appropriate value for this threshold
+            use_wavelet = False
+            use_histogram = False
+        elif can_use_wavelet:
+            use_wavelet = True
+        elif can_use_histogram:
+            use_histogram = True
+    elif algorithm == "wavelet_matrix":
+        use_wavelet = True
+    elif algorithm == "histogram":
+        use_histogram = True
+
+    # Try wavelet matrix first
+    if use_wavelet:
+        try:
+            # as in SciPy, a user-provided `out` can be an array or a dtype
+            output_array_provided = False
+            out_dtype = None
+            if out is not None:
+                output_array_provided = isinstance(out, cp.ndarray)
+                if not output_array_provided:
+                    try:
+                        out_dtype = cp.dtype(out)
+                    except TypeError:
+                        raise TypeError(
+                            "out must be either a cupy.array or a valid input "
+                            "to cupy.dtype"
+                        )
+
+            radius = footprint_shape[0] // 2
+            temp = _median_wavelet_filter(image, radius=radius, mode=mode)
+
+            if output_array_provided:
+                out[:] = temp
+            else:
+                if out_dtype is not None:
+                    temp = temp.astype(out_dtype, copy=False)
+                out = temp
+            return out
+        except Exception as e:
+            # Fall back to histogram or sorting if wavelet matrix fails
+            if algorithm == "wavelet_matrix":
+                raise  # Re-raise if explicitly requested
+            warn(
+                f"Wavelet matrix median failed: {e}\n"
+                "Falling back to histogram or sorting-based median."
+            )
+            # Try histogram as fallback
+            if can_use_histogram:
+                use_histogram = True
+
+    # Try histogram-based approach
     if use_histogram:
         try:
             # as in SciPy, a user-provided `out` can be an array or a dtype
