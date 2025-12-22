@@ -776,6 +776,11 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     # Flatten source if needed
     src_flat = src_padded.ravel()
 
+    # Fill buffer with max value as sentinel (so padding has all bits = 1)
+    # This ensures padding elements don't affect the wavelet matrix construction
+    max_val = np.iinfo(params.dtype).max
+    buffers.val_buf1.fill(max_val)
+
     # Copy source to value buffer 1
     buffers.val_buf1[: src_flat.size] = src_flat
 
@@ -812,10 +817,12 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     )
 
     # -------------------------------------------------------------------------
-    # Step 2: Exclusive sum for first level
+    # Step 2: Exclusive sum for first level (MSB = level val_bit_len - 1)
     # -------------------------------------------------------------------------
-    # Get pointer to first bitvector level
-    bv_ptr = buffers.bv_blocks
+    # Get pointer to MSB level (highest offset in OpenCV convention)
+    bv_block_h_bytes = params.bv_block_len * buf.block_t_size
+    msb_bv_offset = (val_bit_len - 1) * bv_block_h_bytes
+    bv_ptr = buffers.bv_blocks[msb_bv_offset:]
 
     kernels["wavelet_exclusive_sum"](
         exsum_grid,
@@ -826,6 +833,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             bv_ptr,  # nsum_p (stores total at nsum_pos)
             np.uint32(buf.buf_bytes_div32),  # buf_byte_div32
             np.uint32(buf.bv_block_bytes_div32),  # bv_block_byte_div32
+            np.uint32(buf.nsum_pos),  # nsum_pos
         ),
     )
 
@@ -851,10 +859,10 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         mask = (1 << (val_bit_len - bit_pos - 1)) - 1
 
         # Get bitvector pointers for current and previous levels
-        bv_curr_offset = (val_bit_len - 1 - h) * bv_block_h_bytes
-        bv_prev_offset = max(0, val_bit_len - 2 - h) * bv_block_h_bytes
-        if h == val_bit_len - 1:
-            bv_prev_offset = bv_curr_offset
+        # OpenCV convention: level h is stored at offset h * bv_block_h_bytes
+        # So MSB (level val_bit_len-1) is at the highest offset
+        bv_curr_offset = h * bv_block_h_bytes
+        bv_prev_offset = min(val_bit_len - 1, h + 1) * bv_block_h_bytes
 
         kernels["wavelet_upsweep"](
             grid,
@@ -897,7 +905,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 buffers.nsum_scan_buf,
             )
 
-            next_bv_offset = (val_bit_len - h) * bv_block_h_bytes
+            next_bv_offset = (h - 1) * bv_block_h_bytes
             kernels["wavelet_exclusive_sum"](
                 exsum_grid,
                 exsum_block,
@@ -907,6 +915,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                     buffers.bv_blocks[next_bv_offset:],
                     np.uint32(buf.buf_bytes_div32),
                     np.uint32(buf.bv_block_bytes_div32),
+                    np.uint32(buf.nsum_pos),  # nsum_pos
                 ),
             )
 
@@ -961,7 +970,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         # Compute offset for this value level's column WM
         wm_base_offset = val_h * w_bit_len * wm_block_h_bytes
 
-        # Exclusive sum for first column WM level
+        # Exclusive sum for first column WM level (MSB = w_bit_len - 1)
         kernels["wavelet_exclusive_sum"](
             exsum_grid,
             exsum_block,
@@ -973,6 +982,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 ],
                 np.uint32(buf.buf_bytes_div32),
                 np.uint32(buf.wm_bv_block_bytes_div32),
+                np.uint32(buf.nsum_pos),  # nsum_pos
             ),
         )
 
@@ -989,12 +999,10 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             wm_mask = (1 << (w_bit_len - wm_bit_pos - 1)) - 1
 
             # Compute offsets for current and previous column WM levels
-            curr_level = w_bit_len - 1 - wm_h
-            prev_level = max(0, w_bit_len - 2 - wm_h)
-            wm_curr_offset = wm_base_offset + curr_level * wm_block_h_bytes
-            wm_prev_offset = wm_base_offset + prev_level * wm_block_h_bytes
-            if wm_h == w_bit_len - 1:
-                wm_prev_offset = wm_curr_offset
+            # OpenCV convention: level wm_h at offset wm_h * wm_block_h_bytes
+            wm_curr_offset = wm_base_offset + wm_h * wm_block_h_bytes
+            prev_wm_level = min(w_bit_len - 1, wm_h + 1)
+            wm_prev_offset = wm_base_offset + prev_wm_level * wm_block_h_bytes
 
             kernels["wavelet_wm_upsweep"](
                 grid,
@@ -1025,7 +1033,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                     buffers.wm_scan_buf,
                 )
 
-                next_level = w_bit_len - wm_h
+                next_level = wm_h - 1
                 next_wm_offset = wm_base_offset + next_level * wm_block_h_bytes
                 kernels["wavelet_exclusive_sum"](
                     exsum_grid,
@@ -1036,7 +1044,178 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                         buffers.wm_blocks[next_wm_offset:],
                         np.uint32(buf.buf_bytes_div32),
                         np.uint32(buf.wm_bv_block_bytes_div32),
+                        np.uint32(buf.nsum_pos),  # nsum_pos
                     ),
                 )
 
     return buffers
+
+
+# =============================================================================
+# Median Query Execution
+# =============================================================================
+
+
+def _run_median_query(params, buffers, output, use_padded_kernel=True):
+    """
+    Run the wavelet matrix median query kernel.
+
+    This function executes the median query kernel using the pre-constructed
+    wavelet matrices stored in buffers.
+
+    Parameters
+    ----------
+    params : WaveletMatrixMedianParams
+        Parameters object with image dimensions and configuration
+    buffers : WaveletMatrixBuffers
+        Buffers containing constructed wavelet matrices
+    output : cupy.ndarray
+        Output array for median values (shape: original image size)
+    use_padded_kernel : bool
+        If True, use the padded variant (assumes input was padded)
+
+    Returns
+    -------
+    output : cupy.ndarray
+        The median-filtered result
+    """
+    # Get the compiled kernel
+    kernel = _get_median_query_kernel(
+        params.val_type,
+        params.val_bit_len,
+        params.w_bit_len,
+        padded=use_padded_kernel,
+    )
+
+    # Compute grid and block dimensions
+    grid, block = params.get_median_grid_block()
+
+    # Get buffer sizes
+    buf = params.buf_sizes
+    block_t_size = buf.block_t_size
+    bv_block_h_bytes = params.bv_block_len * block_t_size
+
+    # Compute bv_block_h_byte_div32
+    bv_block_h_byte_div32 = bv_block_h_bytes // 32
+
+    # Get pointers to the MSB level of each wavelet matrix
+    # Value WM: Start at level (val_bit_len - 1)
+    bv_start_offset = (params.val_bit_len - 1) * bv_block_h_bytes
+
+    # Column WM: Start at level (w_bit_len - 1) of value level (val_bit_len - 1)
+    wm_start_offset = (
+        (params.val_bit_len - 1) * params.w_bit_len + (params.w_bit_len - 1)
+    ) * bv_block_h_bytes
+
+    if use_padded_kernel:
+        # Padded kernel: input is padded, output is original size
+        kernel(
+            grid,
+            block,
+            (
+                np.int32(params.height),  # H (output height)
+                np.int32(params.width),  # W (output width)
+                np.int32(params.padded_w),  # padded_W
+                np.int32(params.width),  # res_step_num
+                np.int32(params.radius),  # r
+                output,  # res_cu
+                buffers.wm_blocks[wm_start_offset:],  # wm_nbit_bp
+                np.uint32(buf.nsum_pos),  # nsum_pos
+                np.uint32(bv_block_h_byte_div32),  # bv_block_h_byte_div32
+                np.uint32(params.bv_block_len),  # bv_block_len
+                buffers.bv_blocks[bv_start_offset:],  # bv_nbit_bp
+                np.uint8(params.w_bit_len),  # w_bit_len
+                np.uint8(params.val_bit_len),  # val_bit_len
+            ),
+        )
+    else:
+        # Non-padded kernel: handles boundaries internally
+        kernel(
+            grid,
+            block,
+            (
+                np.int32(params.height),  # H
+                np.int32(params.width),  # W
+                np.int32(params.width),  # res_step_num
+                np.int32(params.radius),  # r
+                output,  # res_cu
+                buffers.wm_blocks[wm_start_offset:],  # wm_nbit_bp
+                np.uint32(buf.nsum_pos),  # nsum_pos
+                np.uint32(bv_block_h_byte_div32),  # bv_block_h_byte_div32
+                np.uint32(params.bv_block_len),  # bv_block_len
+                buffers.bv_blocks[bv_start_offset:],  # bv_nbit_bp
+                np.uint8(params.w_bit_len),  # w_bit_len
+                np.uint8(params.val_bit_len),  # val_bit_len
+            ),
+        )
+
+    return output
+
+
+# =============================================================================
+# Full Median Filter Pipeline
+# =============================================================================
+
+
+def _median_wavelet_filter(image, radius, mode="reflect"):
+    """
+    Apply wavelet matrix median filter to a 2D image.
+
+    This function performs the complete wavelet matrix median filtering:
+    1. Pad the input image
+    2. Construct wavelet matrices (value WM + column WMs)
+    3. Run median query kernel
+    4. Return the filtered result
+
+    Parameters
+    ----------
+    image : cupy.ndarray
+        Input 2D image (uint8 or uint16)
+    radius : int
+        Filter radius (kernel size = 2*radius + 1)
+    mode : str
+        Padding mode for boundary handling. Options:
+        - 'reflect': Symmetric reflection (d c b a | a b c d | d c b a)
+        - 'constant': Pad with constant value (zeros)
+        - 'nearest': Pad with nearest edge value
+        - 'wrap': Circular wrap around
+
+    Returns
+    -------
+    result : cupy.ndarray
+        Median-filtered image with same shape and dtype as input
+    """
+    # Validate input
+    ok, reason = _can_use_wavelet_matrix(image, radius=radius)
+    if not ok:
+        raise ValueError(f"Cannot use wavelet matrix filter: {reason}")
+
+    height, width = image.shape
+    dtype = image.dtype
+
+    # Create parameters
+    params = WaveletMatrixMedianParams(height, width, dtype, radius)
+
+    # Allocate buffers
+    buffers = WaveletMatrixBuffers(params)
+
+    # Get construction kernels
+    construction_kernels = _get_construction_kernels(
+        params.val_type, params.val_bit_len, params.w_bit_len
+    )
+
+    # Pad the input image
+    # Note: scipy's 'reflect' = cupy's 'symmetric' (edge is included)
+    pad_mode = "symmetric" if mode == "reflect" else mode
+    padded = cp.pad(image, radius, mode=pad_mode)
+
+    # Run construction
+    _run_wavelet_construction(padded, params, buffers, construction_kernels)
+
+    # Allocate output
+    output = cp.empty((height, width), dtype=dtype)
+
+    # Run median query
+    _run_median_query(params, buffers, output, use_padded_kernel=True)
+
+    return output

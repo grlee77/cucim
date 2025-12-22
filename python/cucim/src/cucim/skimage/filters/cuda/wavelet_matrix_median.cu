@@ -215,6 +215,11 @@ extern "C" __global__ void wavelet_median2d(
         // Move to next bit level in value wavelet matrix
         bv_ptr = (const BlockT*)((const char*)bv_ptr -
                                  bv_block_h_byte_div32 * 32ull);
+        // Move to previous value level's column WM
+        // Column WMs are stored contiguously for each value level
+        // w_bit_len column WM levels per value level
+        wm_ptr = (const BlockT*)((const char*)wm_ptr -
+                                 bv_block_h_byte_div32 * 32ull * w_bit_len);
     }
 
     // Write result
@@ -334,6 +339,9 @@ extern "C" __global__ void wavelet_median2d_padded(
 
         bv_ptr = (const BlockT*)((const char*)bv_ptr -
                                  bv_block_h_byte_div32 * 32ull);
+        // Move to previous value level's column WM
+        wm_ptr = (const BlockT*)((const char*)wm_ptr -
+                                 bv_block_h_byte_div32 * 32ull * w_bit_len);
     }
 
     // Write result
