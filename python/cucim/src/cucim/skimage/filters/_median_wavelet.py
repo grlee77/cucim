@@ -78,9 +78,14 @@ def _dtype_to_cuda_type(dtype):
         np.uint8: "unsigned char",
         np.uint16: "unsigned short",
         np.uint32: "unsigned int",
+        np.uint64: "unsigned long long",
         np.int8: "signed char",
         np.int16: "short",
         np.int32: "int",
+        np.int64: "long long",
+        np.float16: "half",
+        np.float32: "float",
+        np.float64: "double",
     }
     if dtype.type not in type_map:
         raise ValueError(f"Unsupported dtype: {dtype}")
@@ -91,16 +96,16 @@ def _get_val_bit_len(dtype, total_pixels=None):
     """
     Get the number of bits for a value type.
 
-    For integer types, this is simply the bit width.
-    For float32, we use ranks (0 to total_pixels-1), so we need
-    ceil(log2(total_pixels)) bits.
+    For small unsigned integer types (uint8, uint16, uint32), this is the bit width.
+    For types using rank mode (floats, signed ints, uint64), we use ranks
+    (0 to total_pixels-1), so we need ceil(log2(total_pixels)) bits.
 
     Parameters
     ----------
     dtype : numpy dtype
         The data type
     total_pixels : int, optional
-        Total number of pixels (required for float32)
+        Total number of pixels (required for rank-mode types)
 
     Returns
     -------
@@ -108,16 +113,31 @@ def _get_val_bit_len(dtype, total_pixels=None):
         Number of bits needed
     """
     dtype = np.dtype(dtype)
-    if dtype == np.float32:
+    # For rank-based types, use ceil(log2(total_pixels))
+    if _uses_rank_mode(dtype):
         if total_pixels is None:
-            raise ValueError("total_pixels required for float32")
+            raise ValueError(f"total_pixels required for {dtype}")
         return _get_bit_len(total_pixels)
     return dtype.itemsize * 8
 
 
-def _is_float_mode(dtype):
-    """Check if dtype requires float mode (sorting + rank lookup)."""
-    return np.dtype(dtype) == np.float32
+def _uses_rank_mode(dtype):
+    """Check if dtype requires rank mode (sorting + rank lookup).
+
+    This is used for dtypes where direct bit representation is impractical:
+    - float16/32/64: Can't use bitwise operations for median
+    - int8/16/32/64: Sign bit would cause incorrect ordering
+    - uint64: 64 bit levels would be too slow, use ranks instead
+    """
+    dtype = np.dtype(dtype)
+    # All floats need rank mode (bit patterns don't match value ordering)
+    # All signed ints need rank mode (sign bit causes incorrect ordering)
+    # uint64 needs rank mode (64 bit levels would be too slow)
+    return dtype.kind in ("f", "i") or dtype == np.uint64
+
+
+# Keep old name for backward compatibility
+_is_float_mode = _uses_rank_mode
 
 
 # =============================================================================
@@ -482,11 +502,24 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
     if image.ndim != 2:
         return False, "Only 2D images are supported"
 
-    # Check dtype
-    if image.dtype not in [cp.uint8, cp.uint16, cp.uint32, cp.float32]:
+    # Check dtype - support unsigned ints, signed ints, and floats
+    supported_dtypes = [
+        cp.uint8,
+        cp.uint16,
+        cp.uint32,
+        cp.uint64,
+        cp.int8,
+        cp.int16,
+        cp.int32,
+        cp.int64,
+        cp.float16,
+        cp.float32,
+        cp.float64,
+    ]
+    if image.dtype not in supported_dtypes:
         return (
             False,
-            "Only uint8, uint16, uint32, and float32 dtypes are supported",
+            "Unsupported dtype. Supported: uint8/16/32/64, int8/16/32/64, float16/32/64",
         )
 
     # Check image width (must fit in uint16)
@@ -742,12 +775,12 @@ class WaveletMatrixBuffers:
         self.idx_buf2 = cp.zeros(buf.size, dtype=cp.uint16)
 
         # Value buffers
-        # For float mode, we use uint32 ranks instead of float values
+        # For rank mode (float32, uint64), we use uint32 ranks instead of values
         if params.is_float_mode:
             self.val_buf1 = cp.zeros(buf.size, dtype=cp.uint32)
             self.val_buf2 = cp.zeros(buf.size, dtype=cp.uint32)
-            # Store sorted values for final lookup
-            self.sorted_values = cp.zeros(buf.size, dtype=cp.float32)
+            # Store sorted values for final lookup (use original dtype)
+            self.sorted_values = cp.zeros(buf.size, dtype=params.dtype)
         else:
             self.val_buf1 = cp.zeros(buf.size, dtype=params.dtype)
             self.val_buf2 = cp.zeros(buf.size, dtype=params.dtype)
