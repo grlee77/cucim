@@ -483,8 +483,11 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
         return False, "Only 2D images are supported"
 
     # Check dtype
-    if image.dtype not in [cp.uint8, cp.uint16, cp.float32]:
-        return False, "Only uint8, uint16, and float32 dtypes are supported"
+    if image.dtype not in [cp.uint8, cp.uint16, cp.uint32, cp.float32]:
+        return (
+            False,
+            "Only uint8, uint16, uint32, and float32 dtypes are supported",
+        )
 
     # Check image width (must fit in uint16)
     if image.shape[1] >= 65535:
