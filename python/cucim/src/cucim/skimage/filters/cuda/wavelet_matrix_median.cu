@@ -74,7 +74,7 @@ __device__ __forceinline__ XYIdxT median_rank0(
  * wavelet matrices. Each thread processes one output pixel.
  *
  * Algorithm overview:
- * For each output pixel (x, y) with filter radius r:
+ * For each output pixel (x, y) with filter radii ry, rx:
  * 1. Define the query rectangle [ya, yb) x [xa, xb) around the pixel
  * 2. For each bit level h (from MSB to LSB):
  *    a. Count 0-bits in the rectangle using rank queries on the value wavelet matrix
@@ -86,7 +86,8 @@ __device__ __forceinline__ XYIdxT median_rank0(
  * Parameters:
  *   H, W: Image dimensions (after padding if CUT_BORDER=true)
  *   res_step_num: Output row stride in elements
- *   r: Filter radius (kernel size = 2*r + 1)
+ *   ry: Filter radius in Y direction (kernel height = 2*ry + 1)
+ *   rx: Filter radius in X direction (kernel width = 2*rx + 1)
  *   res_cu: Output buffer
  *   wm_nbit_bp: Column wavelet matrix (for X dimension queries)
  *   nsum_pos: Position of the total count in the wavelet matrix
@@ -100,7 +101,8 @@ extern "C" __global__ void wavelet_median2d(
     const int H,
     const int W,
     const int res_step_num,
-    const int r,
+    const int ry,
+    const int rx,
     WM_VAL_T* __restrict__ res_cu,
     const BlockT* __restrict__ wm_nbit_bp,
     const unsigned int nsum_pos,
@@ -118,11 +120,12 @@ extern "C" __global__ void wavelet_median2d(
 
     // Define the query rectangle bounds
     // Using clamp-to-border mode (non-CUT_BORDER case)
-    XYIdxT ya = (y < r) ? 0 : (y - r);
-    XIdxT  xa = (x < r) ? 0 : (x - r);
-    XYIdxT yb = y + r + 1;
+    // ry = radius in Y direction, rx = radius in X direction
+    XYIdxT ya = (y < ry) ? 0 : (y - ry);
+    XIdxT  xa = (x < rx) ? 0 : (x - rx);
+    XYIdxT yb = y + ry + 1;
     if (yb > (XYIdxT)H) yb = H;
-    XIdxT  xb = x + r + 1;
+    XIdxT  xb = x + rx + 1;
     if (xb > (XIdxT)W) xb = W;
 
     // Median position: floor(count / 2)
@@ -233,18 +236,21 @@ extern "C" __global__ void wavelet_median2d(
 /*
  * Wavelet matrix 2D median filter kernel for pre-padded images.
  *
- * When the input image has already been padded by r pixels on each side,
+ * When the input image has already been padded by ry/rx pixels on each side,
  * we can skip boundary checking and use simpler index calculations.
  *
- * Input dimensions: (H + 2*r) x (W + 2*r)
+ * Input dimensions: (H + 2*ry) x (W + 2*rx)
  * Output dimensions: H x W
+ *
+ * Supports rectangular windows with different radii in Y and X directions.
  */
 extern "C" __global__ void wavelet_median2d_padded(
     const int H,
     const int W,
     const int padded_W,
     const int res_step_num,
-    const int r,
+    const int ry,
+    const int rx,
     WM_VAL_T* __restrict__ res_cu,
     const BlockT* __restrict__ wm_nbit_bp,
     const unsigned int nsum_pos,
@@ -262,13 +268,14 @@ extern "C" __global__ void wavelet_median2d_padded(
 
     // For padded input, the query rectangle is always full-sized
     // No boundary checking needed
+    // ry = radius in Y direction, rx = radius in X direction
     XYIdxT ya = y;
     XIdxT  xa = x;
-    XYIdxT yb = y + 2 * r + 1;
-    XIdxT  xb = x + 2 * r + 1;
+    XYIdxT yb = y + 2 * ry + 1;
+    XIdxT  xb = x + 2 * rx + 1;
 
-    // Median position for full kernel
-    const XYIdxT kernel_size = (2 * r + 1) * (2 * r + 1);
+    // Median position for rectangular kernel
+    const XYIdxT kernel_size = (XYIdxT)(2 * ry + 1) * (2 * rx + 1);
     XYIdxT k = kernel_size / 2;
 
     // Accumulator for the result value

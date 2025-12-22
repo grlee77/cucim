@@ -478,7 +478,9 @@ def _get_median_query_kernel(val_type, val_bit_len, w_bit_len, padded=False):
 # =============================================================================
 
 
-def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
+def _can_use_wavelet_matrix(
+    image, footprint_shape=None, radius=None, radius_y=None, radius_x=None
+):
     """
     Check if the wavelet matrix median filter can be used.
 
@@ -487,9 +489,13 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
     image : cupy.ndarray
         The input image
     footprint_shape : tuple of int, optional
-        The filter footprint shape
+        The filter footprint shape (height, width). Both must be odd.
     radius : int, optional
-        The filter radius (alternative to footprint_shape)
+        The filter radius for square footprints (alternative to footprint_shape)
+    radius_y : int, optional
+        The filter radius in Y direction (alternative to footprint_shape)
+    radius_x : int, optional
+        The filter radius in X direction (alternative to footprint_shape)
 
     Returns
     -------
@@ -526,15 +532,27 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
     if image.shape[1] >= 65535:
         return False, "Image width must be less than 65535"
 
+    # Normalize radius parameters
+    if radius is not None:
+        ry, rx = radius, radius
+    elif radius_y is not None and radius_x is not None:
+        ry, rx = radius_y, radius_x
+    elif footprint_shape is not None:
+        if len(footprint_shape) != 2:
+            return False, "Footprint must be 2D"
+        if footprint_shape[0] % 2 == 0 or footprint_shape[1] % 2 == 0:
+            return False, "Footprint dimensions must be odd"
+        ry = footprint_shape[0] // 2
+        rx = footprint_shape[1] // 2
+    else:
+        ry, rx = None, None
+
     # For rank-based dtypes, check total pixels (ranks stored as uint32)
     if _uses_rank_mode(image.dtype):
         # Account for padding (radius added on each side)
-        if radius is not None:
-            padded_h = image.shape[0] + 2 * radius
-            padded_w = image.shape[1] + 2 * radius
-        elif footprint_shape is not None:
-            padded_h = image.shape[0] + 2 * footprint_shape[0] // 2
-            padded_w = image.shape[1] + 2 * footprint_shape[1] // 2
+        if ry is not None and rx is not None:
+            padded_h = image.shape[0] + 2 * ry
+            padded_w = image.shape[1] + 2 * rx
         else:
             padded_h = image.shape[0]
             padded_w = image.shape[1]
@@ -547,21 +565,12 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
                 f"Total pixels ({total_pixels:,}) exceeds uint32 max ({2**32 - 1:,})",
             )
 
-    # Check footprint
-    if footprint_shape is not None:
-        if len(footprint_shape) != 2:
-            return False, "Footprint must be 2D"
-        if footprint_shape[0] != footprint_shape[1]:
-            return False, "Only square footprints are supported"
-        if footprint_shape[0] % 2 == 0:
-            return False, "Footprint size must be odd"
-        radius = footprint_shape[0] // 2
-
-    if radius is not None:
-        if radius < 1:
+    # Validate radius values
+    if ry is not None and rx is not None:
+        if ry < 1 or rx < 1:
             return False, "Radius must be at least 1"
         # Check padded dimensions
-        padded_w = image.shape[1] + 2 * radius
+        padded_w = image.shape[1] + 2 * rx
         if padded_w >= 65535:
             return False, "Padded width exceeds maximum (65535)"
 
@@ -581,7 +590,9 @@ class WaveletMatrixMedianParams:
     wavelet matrix construction and median queries.
     """
 
-    def __init__(self, height, width, dtype, radius):
+    def __init__(
+        self, height, width, dtype, radius=None, radius_y=None, radius_x=None
+    ):
         """
         Initialize parameters for wavelet matrix median filter.
 
@@ -593,17 +604,35 @@ class WaveletMatrixMedianParams:
             Original image width (before padding)
         dtype : numpy dtype
             Image data type
-        radius : int
-            Filter radius
+        radius : int, optional
+            Filter radius for square footprints
+        radius_y : int, optional
+            Filter radius in Y direction (height)
+        radius_x : int, optional
+            Filter radius in X direction (width)
         """
         self.height = height
         self.width = width
         self.dtype = np.dtype(dtype)
-        self.radius = radius
+
+        # Handle radius parameters
+        if radius is not None:
+            self.radius_y = radius
+            self.radius_x = radius
+        elif radius_y is not None and radius_x is not None:
+            self.radius_y = radius_y
+            self.radius_x = radius_x
+        else:
+            raise ValueError(
+                "Must provide either radius or both radius_y and radius_x"
+            )
+
+        # Keep single radius for backward compatibility (square case)
+        self.radius = self.radius_y if self.radius_y == self.radius_x else None
 
         # Padded dimensions
-        self.padded_h = height + 2 * radius
-        self.padded_w = width + 2 * radius
+        self.padded_h = height + 2 * self.radius_y
+        self.padded_w = width + 2 * self.radius_x
 
         # Float mode: use sorted ranks instead of direct values
         self.is_float_mode = _is_float_mode(self.dtype)
@@ -1233,7 +1262,8 @@ def _run_median_query(params, buffers, output, use_padded_kernel=True):
                 np.int32(params.width),  # W (output width)
                 np.int32(params.padded_w),  # padded_W
                 np.int32(params.width),  # res_step_num
-                np.int32(params.radius),  # r
+                np.int32(params.radius_y),  # ry
+                np.int32(params.radius_x),  # rx
                 output,  # res_cu
                 buffers.wm_blocks[wm_start_offset:],  # wm_nbit_bp
                 np.uint32(buf.nsum_pos),  # nsum_pos
@@ -1253,7 +1283,8 @@ def _run_median_query(params, buffers, output, use_padded_kernel=True):
                 np.int32(params.height),  # H
                 np.int32(params.width),  # W
                 np.int32(params.width),  # res_step_num
-                np.int32(params.radius),  # r
+                np.int32(params.radius_y),  # ry
+                np.int32(params.radius_x),  # rx
                 output,  # res_cu
                 buffers.wm_blocks[wm_start_offset:],  # wm_nbit_bp
                 np.uint32(buf.nsum_pos),  # nsum_pos
@@ -1331,7 +1362,9 @@ def _lookup_float_results(rank_output, buffers):
     return float_output.reshape(rank_output.shape)
 
 
-def _median_wavelet_filter(image, radius, mode="reflect"):
+def _median_wavelet_filter(
+    image, radius=None, radius_y=None, radius_x=None, mode="reflect"
+):
     """
     Apply wavelet matrix median filter to a 2D image.
 
@@ -1347,8 +1380,12 @@ def _median_wavelet_filter(image, radius, mode="reflect"):
     ----------
     image : cupy.ndarray
         Input 2D image (uint8, uint16, or float32)
-    radius : int
-        Filter radius (kernel size = 2*radius + 1)
+    radius : int, optional
+        Filter radius for square footprints (kernel size = 2*radius + 1)
+    radius_y : int, optional
+        Filter radius in Y direction (kernel height = 2*radius_y + 1)
+    radius_x : int, optional
+        Filter radius in X direction (kernel width = 2*radius_x + 1)
     mode : str
         Padding mode for boundary handling. Options:
         - 'reflect': Symmetric reflection (d c b a | a b c d | d c b a)
@@ -1361,8 +1398,18 @@ def _median_wavelet_filter(image, radius, mode="reflect"):
     result : cupy.ndarray
         Median-filtered image with same shape and dtype as input
     """
+    # Normalize radius parameters
+    if radius is not None:
+        ry, rx = radius, radius
+    elif radius_y is not None and radius_x is not None:
+        ry, rx = radius_y, radius_x
+    else:
+        raise ValueError(
+            "Must provide either radius or both radius_y and radius_x"
+        )
+
     # Validate input
-    ok, reason = _can_use_wavelet_matrix(image, radius=radius)
+    ok, reason = _can_use_wavelet_matrix(image, radius_y=ry, radius_x=rx)
     if not ok:
         raise ValueError(f"Cannot use wavelet matrix filter: {reason}")
 
@@ -1370,7 +1417,9 @@ def _median_wavelet_filter(image, radius, mode="reflect"):
     dtype = image.dtype
 
     # Create parameters
-    params = WaveletMatrixMedianParams(height, width, dtype, radius)
+    params = WaveletMatrixMedianParams(
+        height, width, dtype, radius_y=ry, radius_x=rx
+    )
 
     # Allocate buffers
     buffers = WaveletMatrixBuffers(params)
@@ -1380,10 +1429,11 @@ def _median_wavelet_filter(image, radius, mode="reflect"):
         params.val_type, params.val_bit_len, params.w_bit_len
     )
 
-    # Pad the input image
+    # Pad the input image with asymmetric padding for rectangular footprints
     # Note: scipy's 'reflect' = cupy's 'symmetric' (edge is included)
     pad_mode = "symmetric" if mode == "reflect" else mode
-    padded = cp.pad(image, radius, mode=pad_mode)
+    pad_width = ((ry, ry), (rx, rx))
+    padded = cp.pad(image, pad_width, mode=pad_mode)
 
     # For float mode, convert to ranks
     if params.is_float_mode:
