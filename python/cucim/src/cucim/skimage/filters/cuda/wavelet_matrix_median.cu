@@ -16,6 +16,13 @@
  * - Sumida et al. (2022) "High-Performance 2D Median Filter using Wavelet Matrix"
  *   https://dl.acm.org/doi/10.1145/3550454.3555512
  *
+ * Memory Layout and Axis Convention:
+ * - Input images must be C-contiguous (row-major order)
+ * - H (height) corresponds to axis 0 (rows), Y direction
+ * - W (width) corresponds to axis 1 (columns), X direction
+ * - ry (radius_y) is the filter radius along axis 0
+ * - rx (radius_x) is the filter radius along axis 1
+ *
  * Note: This file cannot be compiled standalone. It requires a preamble with
  * #define statements for the configuration parameters. See _median_wavelet.py
  * for the Python code that generates the full kernel.
