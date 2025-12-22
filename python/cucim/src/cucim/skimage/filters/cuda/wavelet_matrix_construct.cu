@@ -79,7 +79,7 @@ extern "C" __global__ void wavelet_first_pass(
         // Handle boundary - set index to 0 for out-of-bounds pixels
         if (idx >= WH) x_idx = 0;
 
-        // Load source value
+        // Load source value (padding beyond WH uses sentinel value from buffer)
         const WM_VAL_T v = src[idx];
 
         // Count zeros (values <= mask means bit is 0)
@@ -407,13 +407,15 @@ extern "C" __global__ void wavelet_upsweep(
  *   nsum_p: Block pointer to store total sum
  *   buf_byte_div32: Buffer bytes / 32
  *   bv_block_byte_div32: Bitvector block bytes / 32
+ *   nsum_pos: Position to store the total sum
  */
 extern "C" __global__ void wavelet_exclusive_sum(
     XYIdxT* __restrict__ nsum_scan_buf,
     XYIdxT* __restrict__ nsum_buf_test2,
     BlockT* __restrict__ nsum_p,
     const unsigned int buf_byte_div32,
-    const unsigned int bv_block_byte_div32
+    const unsigned int bv_block_byte_div32,
+    const XYIdxT nsum_pos
 ) {
     typedef cub::BlockScan<XYIdxT, WM_MAX_BLOCK_X> BlockScan;
     __shared__ typename BlockScan::TempStorage temp_storage;
@@ -434,12 +436,12 @@ extern "C" __global__ void wavelet_exclusive_sum(
     nsum_scan_buf[threadIdx.x] = thread_data2;
     nsum_buf_test2[threadIdx.x] = 0;
 
-    // Last thread stores total sum
+    // Last thread stores total sum at nsum_pos
     if (threadIdx.x == blockDim.x - 1) {
         thread_data2 += thread_data1;
         nsum_p = (BlockT*)((unsigned char*)nsum_p +
                            (size_t)blockIdx.x * (bv_block_byte_div32 * 32ull));
-        nsum_p->nsum = thread_data2;
+        nsum_p[nsum_pos].nsum = thread_data2;
     }
 }
 
