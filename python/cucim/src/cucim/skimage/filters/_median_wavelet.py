@@ -885,13 +885,10 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             ),
         )
 
-        # Save sorted column indices for this value bit level
-        # These will be used to build the column WM for level h+1
-        # (or level 0 for the last iteration)
-        hp1 = min(val_bit_len - 1, h + 1)
-        if h < val_bit_len - 1:
-            # Copy current sorted indices to the appropriate level buffer
-            buffers.wm_idx_levels[hp1][:] = dst_idx[:]
+        # Save column indices AFTER this upsweep
+        # The column WM for value level h uses indices sorted by bits >= h
+        # (i.e., after sorting by bit h)
+        buffers.wm_idx_levels[h][:] = dst_idx[:]
 
         # Swap buffers for next iteration
         src_val, dst_val = dst_val, src_val
@@ -919,8 +916,8 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 ),
             )
 
-    # Save the final sorted indices for level 0
-    buffers.wm_idx_levels[0][:] = src_idx[:]
+    # Note: wm_idx_levels[h] was saved before each upsweep in the loop above
+    # so wm_idx_levels[0] already has the indices before h=0 upsweep
 
     # -------------------------------------------------------------------------
     # Step 4: Last pass for column wavelet matrix initialization

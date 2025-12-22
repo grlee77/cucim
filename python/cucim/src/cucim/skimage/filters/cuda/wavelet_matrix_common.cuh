@@ -175,17 +175,25 @@ __device__ __forceinline__ unsigned long long block_mask(int bit_pos) {
 // ============================================================================
 
 /*
- * Compute rank0(i) - the count of 0-bits in the bitvector up to position i.
+ * Compute rank0(i) for the wavelet matrix median query.
  *
- * This is the core operation for wavelet matrix queries.
- * rank0(i) = i - rank1(i), where rank1(i) is the count of 1-bits.
+ * In this wavelet matrix implementation:
+ * - nbit[j] = 1 if the value at position j has the current bit CLEAR (value <= mask)
+ * - nbit[j] = 0 if the value at position j has the current bit SET (value > mask)
+ * - nsum stores the prefix count of 1s in nbit
+ *
+ * This function returns the count of positions in [0, i) that have nbit=1,
+ * which equals the count of values with the current bit CLEAR.
+ *
+ * This is used to navigate to the "0-partition" in the wavelet matrix.
  *
  * Parameters:
- *   i: Position in the bitvector (0-indexed)
+ *   i: Position in the bitvector (0-indexed, exclusive)
  *   nbit_bp: Array of BlockT structures containing the bitvector
  *
  * Returns:
- *   Number of 0-bits in positions [0, i)
+ *   Count of 1-bits in nbit for positions [0, i)
+ *   (= count of values with current bit = 0)
  */
 template <typename IdxType>
 __device__ __forceinline__ IdxType wavelet_rank0(
@@ -197,24 +205,20 @@ __device__ __forceinline__ IdxType wavelet_rank0(
 
     const BlockT block = nbit_bp[bi];
 
-    // rank1 = nsum (prefix sum) + popcount of bits below position ai
-    IdxType rank1 = block.nsum + block_popc(block.nbit & block_mask(ai));
-
-    // rank0 = i - rank1
-    return i - rank1;
+    // Count of 1s in nbit up to position i (exclusive)
+    // = prefix sum + partial count in current block
+    return block.nsum + block_popc(block.nbit & block_mask(ai));
 }
 
-// Alternate version that returns rank1 (count of 1-bits)
+// Alternate version that returns the count of 0s in nbit
+// (= count of values with current bit = 1)
 template <typename IdxType>
 __device__ __forceinline__ IdxType wavelet_rank1(
     const IdxType i,
     const BlockT* __restrict__ nbit_bp
 ) {
-    const IdxType bi = i / WM_WORD_SIZE;
-    const int ai = i % WM_WORD_SIZE;
-
-    const BlockT block = nbit_bp[bi];
-    return block.nsum + block_popc(block.nbit & block_mask(ai));
+    // rank1 = i - rank0 = count of 0s in nbit
+    return i - wavelet_rank0(i, nbit_bp);
 }
 
 // ============================================================================
