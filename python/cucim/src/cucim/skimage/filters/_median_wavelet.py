@@ -87,10 +87,37 @@ def _dtype_to_cuda_type(dtype):
     return type_map[dtype.type]
 
 
-def _get_val_bit_len(dtype):
-    """Get the number of bits for a value type."""
+def _get_val_bit_len(dtype, total_pixels=None):
+    """
+    Get the number of bits for a value type.
+
+    For integer types, this is simply the bit width.
+    For float32, we use ranks (0 to total_pixels-1), so we need
+    ceil(log2(total_pixels)) bits.
+
+    Parameters
+    ----------
+    dtype : numpy dtype
+        The data type
+    total_pixels : int, optional
+        Total number of pixels (required for float32)
+
+    Returns
+    -------
+    bit_len : int
+        Number of bits needed
+    """
     dtype = np.dtype(dtype)
+    if dtype == np.float32:
+        if total_pixels is None:
+            raise ValueError("total_pixels required for float32")
+        return _get_bit_len(total_pixels)
     return dtype.itemsize * 8
+
+
+def _is_float_mode(dtype):
+    """Check if dtype requires float mode (sorting + rank lookup)."""
+    return np.dtype(dtype) == np.float32
 
 
 # =============================================================================
@@ -162,7 +189,7 @@ def _compute_buffer_sizes(
     width : int
         Image width
     dtype : numpy dtype
-        Image data type (uint8, uint16, or uint32)
+        Image data type (uint8, uint16, float32)
     word_size : int
         Bitvector word size (32 or 64)
     thread_per_grid : int
@@ -174,7 +201,8 @@ def _compute_buffer_sizes(
         Named tuple with all computed buffer sizes
     """
     dtype = np.dtype(dtype)
-    val_bit_len = _get_val_bit_len(dtype)
+    total_pixels = height * width
+    val_bit_len = _get_val_bit_len(dtype, total_pixels)
     w_bit_len = _get_bit_len(width)
 
     # Total size rounded up to word_size multiple
@@ -455,8 +483,8 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, radius=None):
         return False, "Only 2D images are supported"
 
     # Check dtype
-    if image.dtype not in [cp.uint8, cp.uint16]:
-        return False, "Only uint8 and uint16 dtypes are supported"
+    if image.dtype not in [cp.uint8, cp.uint16, cp.float32]:
+        return False, "Only uint8, uint16, and float32 dtypes are supported"
 
     # Check image width (must fit in uint16)
     if image.shape[1] >= 65535:
@@ -520,13 +548,23 @@ class WaveletMatrixMedianParams:
         self.padded_h = height + 2 * radius
         self.padded_w = width + 2 * radius
 
+        # Float mode: use sorted ranks instead of direct values
+        self.is_float_mode = _is_float_mode(self.dtype)
+
         # Compute buffer sizes
         self.buf_sizes = _compute_buffer_sizes(
             self.padded_h, self.padded_w, self.dtype
         )
 
         # Store commonly used values
-        self.val_type = _dtype_to_cuda_type(self.dtype)
+        # For float mode, we use uint32 ranks as the "value type"
+        if self.is_float_mode:
+            self.val_type = "unsigned int"  # ranks are uint32
+            self.rank_dtype = cp.uint32
+        else:
+            self.val_type = _dtype_to_cuda_type(self.dtype)
+            self.rank_dtype = None
+
         self.val_bit_len = self.buf_sizes.val_bit_len
         self.w_bit_len = self.buf_sizes.w_bit_len
         self.nsum_pos = self.buf_sizes.nsum_pos
@@ -701,8 +739,16 @@ class WaveletMatrixBuffers:
         self.idx_buf2 = cp.zeros(buf.size, dtype=cp.uint16)
 
         # Value buffers
-        self.val_buf1 = cp.zeros(buf.size, dtype=params.dtype)
-        self.val_buf2 = cp.zeros(buf.size, dtype=params.dtype)
+        # For float mode, we use uint32 ranks instead of float values
+        if params.is_float_mode:
+            self.val_buf1 = cp.zeros(buf.size, dtype=cp.uint32)
+            self.val_buf2 = cp.zeros(buf.size, dtype=cp.uint32)
+            # Store sorted values for final lookup
+            self.sorted_values = cp.zeros(buf.size, dtype=cp.float32)
+        else:
+            self.val_buf1 = cp.zeros(buf.size, dtype=params.dtype)
+            self.val_buf2 = cp.zeros(buf.size, dtype=params.dtype)
+            self.sorted_values = None
 
         # Column wavelet matrix index buffers
         # We need to store sorted column indices for each value bit level
@@ -778,7 +824,13 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
 
     # Fill buffer with max value as sentinel (so padding has all bits = 1)
     # This ensures padding elements don't affect the wavelet matrix construction
-    max_val = np.iinfo(params.dtype).max
+    # For float mode, we use ranks which only need val_bit_len bits
+    if params.is_float_mode:
+        # For float mode, max_val should be >= max_rank but within val_bit_len bits
+        # The max rank is total_pixels - 1, so we use 2^val_bit_len - 1
+        max_val = (1 << params.val_bit_len) - 1
+    else:
+        max_val = np.iinfo(params.dtype).max
     buffers.val_buf1.fill(max_val)
 
     # Copy source to value buffer 1
@@ -800,11 +852,16 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     max_val = (1 << val_bit_len) - 1
     msb_mask = max_val >> 1  # e.g., 0x7F for uint8
 
+    # For float mode, use uint32 for masks; otherwise use the dtype
+    first_pass_mask_dtype = (
+        np.dtype(np.uint32) if params.is_float_mode else params.dtype
+    )
+
     kernels["wavelet_first_pass"](
         grid,
         block,
         (
-            params.dtype.type(msb_mask),  # mask
+            first_pass_mask_dtype.type(msb_mask),  # mask
             np.uint16(buf.block_pair_num),  # block_pair_num
             np.uint32(size_div_warp),  # size_div_warp
             buffers.val_buf1,  # src
@@ -864,11 +921,16 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         bv_curr_offset = h * bv_block_h_bytes
         bv_prev_offset = min(val_bit_len - 1, h + 1) * bv_block_h_bytes
 
+        # For float mode, use uint32 for masks; otherwise use the dtype
+        mask_dtype = (
+            np.dtype(np.uint32) if params.is_float_mode else params.dtype
+        )
+
         kernels["wavelet_upsweep"](
             grid,
             block,
             (
-                params.dtype.type(mask),  # mask
+                mask_dtype.type(mask),  # mask
                 np.uint16(buf.block_pair_num),  # block_pair_num
                 np.uint32(size_div_w),  # size_div_w
                 src_val,  # src
@@ -1154,20 +1216,80 @@ def _run_median_query(params, buffers, output, use_padded_kernel=True):
 # =============================================================================
 
 
+def _prepare_float_ranks(padded, params, buffers):
+    """
+    Prepare rank values for float32 images.
+
+    For float32, we sort the values and use their ranks (0 to n-1) as the
+    "values" for the wavelet matrix. The wavelet matrix then operates on
+    integers, and the median rank is looked up in the sorted values array
+    to get the actual float result.
+
+    Parameters
+    ----------
+    padded : cupy.ndarray
+        Padded float32 image
+    params : WaveletMatrixMedianParams
+        Filter parameters
+    buffers : WaveletMatrixBuffers
+        Pre-allocated buffers
+
+    Returns
+    -------
+    ranks : cupy.ndarray
+        uint32 array of ranks with same shape as padded
+    """
+    # Flatten and sort
+    flat = padded.ravel()
+    sorted_indices = cp.argsort(flat)
+
+    # Store sorted values for later lookup
+    buffers.sorted_values[: len(flat)] = flat[sorted_indices]
+
+    # Create rank array: rank[original_idx] = sorted_position
+    ranks = cp.empty_like(flat, dtype=cp.uint32)
+    ranks[sorted_indices] = cp.arange(len(flat), dtype=cp.uint32)
+
+    return ranks.reshape(padded.shape)
+
+
+def _lookup_float_results(rank_output, buffers):
+    """
+    Convert rank output back to float values.
+
+    Parameters
+    ----------
+    rank_output : cupy.ndarray
+        Output array containing median ranks (uint32)
+    buffers : WaveletMatrixBuffers
+        Buffers containing sorted values
+
+    Returns
+    -------
+    float_output : cupy.ndarray
+        Float32 array with actual median values
+    """
+    flat_ranks = rank_output.ravel()
+    float_output = buffers.sorted_values[flat_ranks]
+    return float_output.reshape(rank_output.shape)
+
+
 def _median_wavelet_filter(image, radius, mode="reflect"):
     """
     Apply wavelet matrix median filter to a 2D image.
 
     This function performs the complete wavelet matrix median filtering:
     1. Pad the input image
-    2. Construct wavelet matrices (value WM + column WMs)
-    3. Run median query kernel
-    4. Return the filtered result
+    2. For float32: sort values and prepare ranks
+    3. Construct wavelet matrices (value WM + column WMs)
+    4. Run median query kernel
+    5. For float32: look up actual values from sorted array
+    6. Return the filtered result
 
     Parameters
     ----------
     image : cupy.ndarray
-        Input 2D image (uint8 or uint16)
+        Input 2D image (uint8, uint16, or float32)
     radius : int
         Filter radius (kernel size = 2*radius + 1)
     mode : str
@@ -1206,13 +1328,25 @@ def _median_wavelet_filter(image, radius, mode="reflect"):
     pad_mode = "symmetric" if mode == "reflect" else mode
     padded = cp.pad(image, radius, mode=pad_mode)
 
+    # For float mode, convert to ranks
+    if params.is_float_mode:
+        padded_values = _prepare_float_ranks(padded, params, buffers)
+    else:
+        padded_values = padded
+
     # Run construction
-    _run_wavelet_construction(padded, params, buffers, construction_kernels)
+    _run_wavelet_construction(
+        padded_values, params, buffers, construction_kernels
+    )
 
     # Allocate output
-    output = cp.empty((height, width), dtype=dtype)
-
-    # Run median query
-    _run_median_query(params, buffers, output, use_padded_kernel=True)
+    # For float mode, query returns ranks (uint32), then we look up values
+    if params.is_float_mode:
+        rank_output = cp.empty((height, width), dtype=cp.uint32)
+        _run_median_query(params, buffers, rank_output, use_padded_kernel=True)
+        output = _lookup_float_results(rank_output, buffers)
+    else:
+        output = cp.empty((height, width), dtype=dtype)
+        _run_median_query(params, buffers, output, use_padded_kernel=True)
 
     return output
