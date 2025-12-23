@@ -19,6 +19,8 @@ from collections import namedtuple
 import cupy as cp
 import numpy as np
 
+from cucim.skimage._shared.utils import _to_np_mode
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -1539,9 +1541,6 @@ def _median_wavelet_filter(
     height, width = image.shape
     dtype = image.dtype
 
-    # Float mode always uses padding (rank-based approach needs all values)
-    effective_use_padding = use_padding or _is_float_mode(dtype)
-
     # Create parameters
     params = WaveletMatrixMedianParams(
         height,
@@ -1549,7 +1548,7 @@ def _median_wavelet_filter(
         dtype,
         radius_y=ry,
         radius_x=rx,
-        use_padding=effective_use_padding,
+        use_padding=use_padding,
     )
 
     # Allocate buffers
@@ -1560,10 +1559,10 @@ def _median_wavelet_filter(
         params.val_type, params.val_bit_len, params.w_bit_len
     )
 
-    if effective_use_padding:
+    if use_padding:
         # Pad the input image with asymmetric padding for rectangular footprints
-        # Note: scipy's 'reflect' = cupy's 'symmetric' (edge is included)
-        pad_mode = "symmetric" if mode == "reflect" else mode
+        # Convert scipy.ndimage mode to cupy.pad mode
+        pad_mode = _to_np_mode(mode)
         pad_width = ((ry, ry), (rx, rx))
         padded = cp.pad(image, pad_width, mode=pad_mode)
 
@@ -1574,7 +1573,11 @@ def _median_wavelet_filter(
             input_values = padded
     else:
         # Non-padded mode: use original image directly
-        input_values = image
+        # For float mode, still need to convert to ranks
+        if params.is_float_mode:
+            input_values = _prepare_float_ranks(image, params, buffers)
+        else:
+            input_values = image
 
     # Run construction
     _run_wavelet_construction(
@@ -1589,13 +1592,13 @@ def _median_wavelet_filter(
             params,
             buffers,
             rank_output,
-            use_padded_kernel=effective_use_padding,
+            use_padded_kernel=use_padding,
         )
         output = _lookup_float_results(rank_output, buffers)
     else:
         output = cp.empty((height, width), dtype=dtype)
         _run_median_query(
-            params, buffers, output, use_padded_kernel=effective_use_padding
+            params, buffers, output, use_padded_kernel=use_padding
         )
 
     return output
