@@ -1496,16 +1496,22 @@ def _median_wavelet_filter(
         - 'reflect': Symmetric reflection (d c b a | a b c d | d c b a)
         - 'constant': Pad with constant value (zeros)
         - 'nearest': Pad with nearest edge value
+        - 'mirror': Reflection without edge duplication (d c b | a b c d | c b a)
         - 'wrap': Circular wrap around
-        Note: Only used when use_padding=True. When use_padding=False, 'nearest'
-        (clamp-to-border) boundary handling is used within the query kernel.
+        Note: Only used when use_padding=True. When use_padding=False, the
+        `mode` parameter is ignored and clamp-to-border boundary handling is
+        used (see use_padding description).
     use_padding : bool, optional
         If True (default), pad the input image and build the wavelet matrix on
-        padded dimensions. The query kernel then has no boundary checks.
+        padded dimensions. The query kernel uses a full (2*radius+1) window for
+        all pixels, with boundary values determined by the `mode` parameter.
         If False, build the wavelet matrix on original dimensions and use a
-        boundary-aware query kernel (clamp-to-border mode). This uses less
-        memory but the query kernel has boundary checks. Ignored for float mode
-        which always uses padding (due to rank-based approach).
+        boundary-aware query kernel with clamp-to-border semantics. This is
+        ~20-30% faster and uses less memory, but **uses a smaller effective
+        window at image edges** because query bounds are clamped to valid image
+        coordinates rather than using padded/replicated values. For example,
+        at corner (0,0) with radius=3, non-padded mode uses a (radius+1)x(radius+1)
+        window instead of the full (2*radius+1)x(2*radius+1) window.
 
     Returns
     -------
@@ -1517,6 +1523,16 @@ def _median_wavelet_filter(
     The CUDA kernels assume C-contiguous (row-major) memory layout where
     axis 0 corresponds to rows (Y direction) and axis 1 corresponds to
     columns (X direction).
+
+    **Boundary handling comparison:**
+
+    - ``use_padding=True``: All pixels use a full-sized (2*radius+1)x(2*radius+1)
+      window. Edge pixels see replicated/reflected values based on `mode`.
+      This matches scipy.ndimage.median_filter behavior.
+
+    - ``use_padding=False``: Edge pixels use a smaller window (clamped to image
+      bounds). This is faster but produces different results at boundaries.
+      Interior pixels (distance > radius from any edge) are identical.
     """
     # Normalize radius parameters
     if radius is not None:
