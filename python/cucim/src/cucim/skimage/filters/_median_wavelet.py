@@ -763,6 +763,8 @@ def _get_construction_kernels(val_type, val_bit_len, w_bit_len):
         "wavelet_upsweep_wm",
         "wavelet_wm_first_pass",
         "wavelet_wm_upsweep",
+        # Fused kernel: value upsweep + column WM initialization
+        "wavelet_upsweep_with_col_init",
         # Batched kernels for processing all value levels in parallel
         "wavelet_wm_first_pass_batched",
         "wavelet_exclusive_sum_batched",
@@ -1002,8 +1004,16 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     )
 
     # -------------------------------------------------------------------------
-    # Step 3: Up-sweep for each value bit level
+    # Step 3: Up-sweep for each value bit level (with direct col index output)
     # -------------------------------------------------------------------------
+    # This uses the fused kernel wavelet_upsweep_with_col_init which:
+    #   1. Does value WM upsweep (sorting, bitvector creation)
+    #   2. Writes sorted column indices directly to wm_idx_levels[h]
+    # This eliminates the separate Python memcpy after each upsweep.
+    # NOTE: Zero counting (wavelet_wm_first_pass_batched) is NOT fused because
+    # it requires per-destination-block counts, but upsweep writes to scattered
+    # destination positions.
+
     size_div_w = buf.size // WM_WORD_SIZE
     block_t_size = buf.block_t_size
     bv_block_h_bytes = params.bv_block_len * block_t_size
@@ -1036,7 +1046,11 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             np.dtype(np.uint32) if params.is_float_mode else params.dtype
         )
 
-        kernels["wavelet_upsweep"](
+        # Output pointer for column WM indices: wm_idx_levels[h]
+        wm_idx_out = buffers.wm_idx_levels[h]
+
+        # FUSED kernel: value upsweep + direct column index output
+        kernels["wavelet_upsweep_with_col_init"](
             grid,
             block,
             (
@@ -1054,15 +1068,9 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 dst_idx,  # nxt_idx
                 buffers.bv_blocks[bv_prev_offset:],  # nbit_bp_pre
                 np.int32(is_last),  # is_last_val_bit
+                wm_idx_out,  # wm_idx_out: destination for sorted col indices
             ),
         )
-
-        # ---------------------------------------------------------------------
-        # Store sorted column indices for batched column WM construction
-        # ---------------------------------------------------------------------
-        # Copy sorted column indices to wm_idx_levels[h]
-        # The column WM for value level h uses indices sorted by bits >= h
-        buffers.wm_idx_levels[h][:] = dst_idx[:]
 
         # Swap value buffers for next iteration
         src_val, dst_val = dst_val, src_val
