@@ -901,6 +901,9 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     # w_bit_len used for column wavelet matrix (future expansion)
     # w_bit_len = params.w_bit_len
 
+    # Create a secondary stream for overlapping buffer clears with kernel execution
+    stream_aux = cp.cuda.Stream(non_blocking=True)
+
     # Flatten source if needed
     src_flat = src_padded.ravel()
 
@@ -1052,6 +1055,13 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             )
 
             next_bv_offset = (h - 1) * bv_block_h_bytes
+
+            # Start clearing column WM scan buffers in auxiliary stream
+            # This can overlap with the value exclusive_sum kernel
+            with stream_aux:
+                buffers.wm_scan_buf.fill(0)
+                buffers.wm_scan_buf2.fill(0)
+
             kernels["wavelet_exclusive_sum"](
                 exsum_grid,
                 exsum_block,
@@ -1065,12 +1075,16 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 ),
             )
 
+            # Sync auxiliary stream before column WM construction
+            stream_aux.synchronize()
+        else:
+            # For last value level, just clear buffers synchronously
+            buffers.wm_scan_buf.fill(0)
+            buffers.wm_scan_buf2.fill(0)
+
         # ---------------------------------------------------------------------
         # Column WM construction for value level h
         # ---------------------------------------------------------------------
-        # Initialize column WM scan buffers (can reuse after value exclusive_sum)
-        buffers.wm_scan_buf.fill(0)
-        buffers.wm_scan_buf2.fill(0)
 
         # MSB mask for column indices
         wm_msb_mask = (1 << (w_bit_len - 1)) - 1
