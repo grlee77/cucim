@@ -244,7 +244,11 @@ def median(
             radius_y = footprint_shape[0] // 2
             radius_x = footprint_shape[1] // 2
             temp = _median_wavelet_filter(
-                image, radius_y=radius_y, radius_x=radius_x, mode=mode
+                image,
+                radius_y=radius_y,
+                radius_x=radius_x,
+                mode=mode,
+                use_padding=True,
             )
 
             if output_array_provided:
