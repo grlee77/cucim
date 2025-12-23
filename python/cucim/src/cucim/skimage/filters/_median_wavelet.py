@@ -757,12 +757,7 @@ def _get_construction_kernels(val_type, val_bit_len, w_bit_len):
 
     kernel_names = [
         "wavelet_first_pass",
-        "wavelet_upsweep",
         "wavelet_exclusive_sum",
-        "wavelet_last_pass",
-        "wavelet_upsweep_wm",
-        "wavelet_wm_first_pass",
-        "wavelet_wm_upsweep",
         # Fused kernel: value upsweep + column WM initialization
         "wavelet_upsweep_with_col_init",
         # Batched kernels for processing all value levels in parallel
