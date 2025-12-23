@@ -395,20 +395,26 @@ extern "C" __global__ void wavelet_upsweep(
 
 
 // ============================================================================
-// Kernel 2b: Up-Sweep with Direct Column Index Output
+// Kernel 2b: Up-Sweep with OpenCV-Style Column WM Initialization
 // ============================================================================
 /*
- * Modified value WM up-sweep that writes sorted column indices directly
- * to the wm_idx_levels buffer (at DESTINATION positions).
+ * Modified value WM up-sweep with OpenCV-style column WM initialization:
+ *   1. Writes column indices at SOURCE positions (coalesced writes!)
+ *   2. Counts zeros for column WM MSB at source positions (fused)
+ *   3. Stores per-block counts to wm_scan_out
  *
- * This eliminates the Python-side memcpy after each upsweep.
+ * OpenCV insight: Column WM for level h+1 is populated during value level h
+ * because the SOURCE positions during level h are already sorted by bits >= h+1.
  *
- * NOTE: Zero counting for column WM is NOT fused because it requires
- * per-destination-block counts, but this kernel writes to scattered
- * destinations. The wavelet_wm_first_pass_batched kernel is still needed.
+ * This eliminates:
+ *   - Python memcpy operations
+ *   - Separate wavelet_wm_first_pass_batched kernel
  *
- * Additional Parameter (beyond wavelet_upsweep):
- *   wm_idx_out: Destination for sorted column indices (wm_idx_levels[h])
+ * Additional Parameters (beyond wavelet_upsweep):
+ *   wm_idx_out: Destination for col indices at SOURCE positions
+ *   wm_scan_out: Per-block zero counts for column WM MSB
+ *   wm_mask: Column WM MSB mask ((1 << (w_bit_len - 1)) - 1)
+ *   wm_write_enabled: Flag to enable column WM writes (0 = disabled)
  */
 extern "C" __global__ void wavelet_upsweep_with_col_init(
     const WM_VAL_T mask,
@@ -425,8 +431,11 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
     XIdxT* __restrict__ nxt_idx,
     const BlockT* __restrict__ nbit_bp_pre,
     const int is_last_val_bit,
-    // Additional parameter for column WM initialization
-    XIdxT* __restrict__ wm_idx_out       // Destination for sorted col indices
+    // Additional parameters for OpenCV-style column WM initialization
+    XIdxT* __restrict__ wm_idx_out,       // Col indices at SOURCE positions (coalesced)
+    XYIdxT* __restrict__ wm_scan_out,     // Per-block zero counts for column WM
+    const XIdxT wm_mask,                   // Column WM MSB mask
+    const int wm_write_enabled             // Flag to enable column WM writes
 ) {
     // Thread configuration
     constexpr int THREAD_PER_GRID = WM_THREAD_PER_GRID;
@@ -445,6 +454,7 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
 
     // Shared memory for reductions and scans
     __shared__ uint4 nsum_count_sh[THREADS_DIM_Y];
+    __shared__ XYIdxT wm_zero_count_sh[THREADS_DIM_Y];  // For column WM zero counting
     __shared__ XYIdxT pre_sum_share[2];
     __shared__ XYIdxT warp_scan_sums[THREADS_DIM_Y];
     __shared__ typename WarpScanX::TempStorage s_scanStorage;
@@ -465,6 +475,9 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
     const XYIdxT nsum_idx0_bound = (nsum_idx0_org + 1) * block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE;
     const XYIdxT nsum_idx1_bound = (nsum_idx1_org + 1) * block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE;
     uint4 nsum_count = make_uint4(0, 0, 0, 0);
+
+    // Column WM zero counter (fused counting at source positions)
+    XYIdxT wm_zero_count = 0;
 
     const unsigned short th_idx = threadIdx.y * WM_WARP_SIZE + threadIdx.x;
     if (th_idx == 0) {
@@ -508,7 +521,6 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
             if (threadIdx.x == kb) {
                 my_bits = bits;
             }
-
         }
 
         // Compute prefix sum of zero counts
@@ -551,6 +563,9 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
                  j < WM_WARP_SIZE / SRC_CACHE_DIV; ++j, ++i) {
                 if (i >= size_div_warp) break;
 
+                // Source position (coalesced access)
+                const XYIdxT ij = i * WM_WARP_SIZE + threadIdx.x;
+
                 const unsigned int e_nbit = __shfl_sync(FULL_WARP_MASK, my_bits, j);
                 const XYIdxT e_nsum = __shfl_sync(FULL_WARP_MASK, s, j);
                 XYIdxT rank = __popc(e_nbit << (WM_WARP_SIZE - threadIdx.x));
@@ -558,16 +573,19 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
                 XYIdxT idx = idx0;
 
                 if (vo > mask) {  // bit is 1
-                    const XYIdxT ij = i * WM_WARP_SIZE + threadIdx.x;
                     idx = ij + nsum - idx;
+                }
+
+                // OpenCV-style: Write column index to SOURCE position (coalesced!)
+                if (wm_write_enabled) {
+                    wm_idx_out[ij] = idx_v;  // Coalesced write to source position
+                    if (idx_v <= wm_mask) {
+                        ++wm_zero_count;  // Count zeros for column WM MSB
+                    }
                 }
 
                 if (idx < size_div_warp * WM_WARP_SIZE) {
                     nxt_idx[idx] = idx_v;
-                    // Write sorted column index to destination
-                    if (wm_idx_out != nullptr) {
-                        wm_idx_out[idx] = idx_v;
-                    }
                 }
 
                 if (j == WM_WARP_SIZE / SRC_CACHE_DIV - 1) break;
@@ -586,6 +604,9 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
              j < WM_WARP_SIZE / SRC_CACHE_DIV; ++j, ++i) {
             if (i >= size_div_warp) break;
 
+            // Source position (coalesced access)
+            const XYIdxT ij = i * WM_WARP_SIZE + threadIdx.x;
+
             const unsigned int e_nbit = __shfl_sync(FULL_WARP_MASK, my_bits, j);
             const XYIdxT e_nsum = __shfl_sync(FULL_WARP_MASK, s, j);
             XYIdxT rank = __popc(e_nbit << (WM_WARP_SIZE - threadIdx.x));
@@ -594,18 +615,22 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
             WM_VAL_T v = vo;
             XYIdxT idx = idx0;
             if (vo > mask) {  // bit is 1
-                const XYIdxT ij = i * WM_WARP_SIZE + threadIdx.x;
                 idx = ij + nsum - idx;
                 v &= mask;  // Clear the processed bit
+            }
+
+            // OpenCV-style: Write column index to SOURCE position (coalesced!)
+            // This writes column indices in value-sorted order at source positions
+            if (wm_write_enabled) {
+                wm_idx_out[ij] = idx_v;  // Coalesced write to source position
+                if (idx_v <= wm_mask) {
+                    ++wm_zero_count;  // Count zeros for column WM MSB
+                }
             }
 
             if (idx < size_div_warp * WM_WARP_SIZE) {
                 dst[idx] = v;
                 nxt_idx[idx] = idx_v;
-                // Write sorted column index to destination
-                if (wm_idx_out != nullptr) {
-                    wm_idx_out[idx] = idx_v;
-                }
             }
 
             // Count zeros for next level
@@ -636,14 +661,18 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
         nbit_bp[size_div_warp / WM_WORD_DIV_WARP].nsum = nsum;
     }
 
-    // Reduce and store next-level counts
+    // Reduce and store next-level counts for value WM
     nsum_count.x = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.x);
     nsum_count.y = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.y);
     nsum_count.z = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.z);
     nsum_count.w = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.w);
 
+    // Also reduce column WM zero count (fused counting)
+    wm_zero_count = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(wm_zero_count);
+
     if (threadIdx.x == 0) {
         nsum_count_sh[threadIdx.y] = nsum_count;
+        wm_zero_count_sh[threadIdx.y] = wm_zero_count;
     }
     __syncthreads();
 
@@ -654,14 +683,25 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
         nsum_count.z = WarpReduceY(WarpReduceY_temp_storage).Sum(nsum_count.z);
         nsum_count.w = WarpReduceY(WarpReduceY_temp_storage).Sum(nsum_count.w);
 
-        if (th_idx == 0 && !is_last_val_bit) {
-            const XYIdxT idx0_org = nsum_idx0_bound / ((XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE);
-            const XYIdxT idx1_org = nsum_idx1_bound / ((XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE);
+        // Reduce column WM zero count across warps
+        wm_zero_count = WarpReduceY(WarpReduceY_temp_storage).Sum(wm_zero_count_sh[threadIdx.x]);
 
-            if (nsum_count.x > 0) atomicAdd(nsum_buf_test2 + idx0_org - 1, nsum_count.x);
-            if (nsum_count.y > 0) atomicAdd(nsum_buf_test2 + idx0_org - 0, nsum_count.y);
-            if (nsum_count.z > 0) atomicAdd(nsum_buf_test2 + idx1_org - 1, nsum_count.z);
-            if (nsum_count.w > 0) atomicAdd(nsum_buf_test2 + idx1_org - 0, nsum_count.w);
+        if (th_idx == 0) {
+            // Store value WM counts for next level
+            if (!is_last_val_bit) {
+                const XYIdxT idx0_org = nsum_idx0_bound / ((XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE);
+                const XYIdxT idx1_org = nsum_idx1_bound / ((XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE);
+
+                if (nsum_count.x > 0) atomicAdd(nsum_buf_test2 + idx0_org - 1, nsum_count.x);
+                if (nsum_count.y > 0) atomicAdd(nsum_buf_test2 + idx0_org - 0, nsum_count.y);
+                if (nsum_count.z > 0) atomicAdd(nsum_buf_test2 + idx1_org - 1, nsum_count.z);
+                if (nsum_count.w > 0) atomicAdd(nsum_buf_test2 + idx1_org - 0, nsum_count.w);
+            }
+
+            // OpenCV-style: Store column WM zero count (no atomics - one write per block)
+            if (wm_write_enabled) {
+                wm_scan_out[blockIdx.x] = wm_zero_count;
+            }
         }
     }
 }
