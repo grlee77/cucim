@@ -479,7 +479,12 @@ def _get_median_query_kernel(val_type, val_bit_len, w_bit_len, padded=False):
 
 
 def _can_use_wavelet_matrix(
-    image, footprint_shape=None, radius=None, radius_y=None, radius_x=None
+    image,
+    footprint_shape=None,
+    radius=None,
+    radius_y=None,
+    radius_x=None,
+    use_padding=True,
 ):
     """
     Check if the wavelet matrix median filter can be used.
@@ -496,6 +501,9 @@ def _can_use_wavelet_matrix(
         The filter radius along axis 0 (rows). Alternative to footprint_shape.
     radius_x : int, optional
         The filter radius along axis 1 (columns). Alternative to footprint_shape.
+    use_padding : bool, optional
+        If True (default), check padded dimensions. If False, check original
+        dimensions (for non-padded kernel mode).
 
     Returns
     -------
@@ -549,15 +557,15 @@ def _can_use_wavelet_matrix(
 
     # For rank-based dtypes, check total pixels (ranks stored as uint32)
     if _uses_rank_mode(image.dtype):
-        # Account for padding (radius added on each side)
-        if ry is not None and rx is not None:
-            padded_h = image.shape[0] + 2 * ry
-            padded_w = image.shape[1] + 2 * rx
+        # Account for padding (radius added on each side) if padding is used
+        if use_padding and ry is not None and rx is not None:
+            check_h = image.shape[0] + 2 * ry
+            check_w = image.shape[1] + 2 * rx
         else:
-            padded_h = image.shape[0]
-            padded_w = image.shape[1]
+            check_h = image.shape[0]
+            check_w = image.shape[1]
 
-        total_pixels = padded_h * padded_w
+        total_pixels = check_h * check_w
         if total_pixels > 2**32 - 1:
             return (
                 False,
@@ -569,10 +577,15 @@ def _can_use_wavelet_matrix(
     if ry is not None and rx is not None:
         if ry < 1 or rx < 1:
             return False, "Radius must be at least 1"
-        # Check padded dimensions
-        padded_w = image.shape[1] + 2 * rx
-        if padded_w >= 65535:
-            return False, "Padded width exceeds maximum (65535)"
+        # Check dimensions for wavelet matrix
+        if use_padding:
+            check_w = image.shape[1] + 2 * rx
+            if check_w >= 65535:
+                return False, "Padded width exceeds maximum (65535)"
+        else:
+            # For non-padded mode, check original width
+            if image.shape[1] >= 65535:
+                return False, "Image width exceeds maximum (65535)"
 
     return True, None
 
@@ -591,7 +604,14 @@ class WaveletMatrixMedianParams:
     """
 
     def __init__(
-        self, height, width, dtype, radius=None, radius_y=None, radius_x=None
+        self,
+        height,
+        width,
+        dtype,
+        radius=None,
+        radius_y=None,
+        radius_x=None,
+        use_padding=True,
     ):
         """
         Initialize parameters for wavelet matrix median filter.
@@ -610,10 +630,15 @@ class WaveletMatrixMedianParams:
             Filter radius along axis 0 (rows/height)
         radius_x : int, optional
             Filter radius along axis 1 (columns/width)
+        use_padding : bool, optional
+            If True (default), pad the input image and build wavelet matrix on
+            padded dimensions. If False, build wavelet matrix on original
+            dimensions and use boundary-aware query kernel.
         """
         self.height = height
         self.width = width
         self.dtype = np.dtype(dtype)
+        self.use_padding = use_padding
 
         # Handle radius parameters
         if radius is not None:
@@ -630,9 +655,14 @@ class WaveletMatrixMedianParams:
         # Keep single radius for backward compatibility (square case)
         self.radius = self.radius_y if self.radius_y == self.radius_x else None
 
-        # Padded dimensions
-        self.padded_h = height + 2 * self.radius_y
-        self.padded_w = width + 2 * self.radius_x
+        # Dimensions for wavelet matrix construction
+        if use_padding:
+            self.padded_h = height + 2 * self.radius_y
+            self.padded_w = width + 2 * self.radius_x
+        else:
+            # Non-padded mode: build WM on original dimensions
+            self.padded_h = height
+            self.padded_w = width
 
         # Float mode: use sorted ranks instead of direct values
         self.is_float_mode = _is_float_mode(self.dtype)
@@ -1430,13 +1460,18 @@ def _lookup_float_results(rank_output, buffers):
 
 
 def _median_wavelet_filter(
-    image, radius=None, radius_y=None, radius_x=None, mode="reflect"
+    image,
+    radius=None,
+    radius_y=None,
+    radius_x=None,
+    mode="reflect",
+    use_padding=True,
 ):
     """
     Apply wavelet matrix median filter to a 2D image.
 
     This function performs the complete wavelet matrix median filtering:
-    1. Pad the input image
+    1. (If use_padding=True) Pad the input image
     2. For float32: sort values and prepare ranks
     3. Construct wavelet matrices (value WM + column WMs)
     4. Run median query kernel
@@ -1460,6 +1495,15 @@ def _median_wavelet_filter(
         - 'constant': Pad with constant value (zeros)
         - 'nearest': Pad with nearest edge value
         - 'wrap': Circular wrap around
+        Note: Only used when use_padding=True. When use_padding=False, 'nearest'
+        (clamp-to-border) boundary handling is used within the query kernel.
+    use_padding : bool, optional
+        If True (default), pad the input image and build the wavelet matrix on
+        padded dimensions. The query kernel then has no boundary checks.
+        If False, build the wavelet matrix on original dimensions and use a
+        boundary-aware query kernel (clamp-to-border mode). This uses less
+        memory but the query kernel has boundary checks. Ignored for float mode
+        which always uses padding (due to rank-based approach).
 
     Returns
     -------
@@ -1483,7 +1527,9 @@ def _median_wavelet_filter(
         )
 
     # Validate input
-    ok, reason = _can_use_wavelet_matrix(image, radius_y=ry, radius_x=rx)
+    ok, reason = _can_use_wavelet_matrix(
+        image, radius_y=ry, radius_x=rx, use_padding=use_padding
+    )
     if not ok:
         raise ValueError(f"Cannot use wavelet matrix filter: {reason}")
 
@@ -1493,9 +1539,17 @@ def _median_wavelet_filter(
     height, width = image.shape
     dtype = image.dtype
 
+    # Float mode always uses padding (rank-based approach needs all values)
+    effective_use_padding = use_padding or _is_float_mode(dtype)
+
     # Create parameters
     params = WaveletMatrixMedianParams(
-        height, width, dtype, radius_y=ry, radius_x=rx
+        height,
+        width,
+        dtype,
+        radius_y=ry,
+        radius_x=rx,
+        use_padding=effective_use_padding,
     )
 
     # Allocate buffers
@@ -1506,31 +1560,42 @@ def _median_wavelet_filter(
         params.val_type, params.val_bit_len, params.w_bit_len
     )
 
-    # Pad the input image with asymmetric padding for rectangular footprints
-    # Note: scipy's 'reflect' = cupy's 'symmetric' (edge is included)
-    pad_mode = "symmetric" if mode == "reflect" else mode
-    pad_width = ((ry, ry), (rx, rx))
-    padded = cp.pad(image, pad_width, mode=pad_mode)
+    if effective_use_padding:
+        # Pad the input image with asymmetric padding for rectangular footprints
+        # Note: scipy's 'reflect' = cupy's 'symmetric' (edge is included)
+        pad_mode = "symmetric" if mode == "reflect" else mode
+        pad_width = ((ry, ry), (rx, rx))
+        padded = cp.pad(image, pad_width, mode=pad_mode)
 
-    # For float mode, convert to ranks
-    if params.is_float_mode:
-        padded_values = _prepare_float_ranks(padded, params, buffers)
+        # For float mode, convert to ranks
+        if params.is_float_mode:
+            input_values = _prepare_float_ranks(padded, params, buffers)
+        else:
+            input_values = padded
     else:
-        padded_values = padded
+        # Non-padded mode: use original image directly
+        input_values = image
 
     # Run construction
     _run_wavelet_construction(
-        padded_values, params, buffers, construction_kernels
+        input_values, params, buffers, construction_kernels
     )
 
     # Allocate output
     # For float mode, query returns ranks (uint32), then we look up values
     if params.is_float_mode:
         rank_output = cp.empty((height, width), dtype=cp.uint32)
-        _run_median_query(params, buffers, rank_output, use_padded_kernel=True)
+        _run_median_query(
+            params,
+            buffers,
+            rank_output,
+            use_padded_kernel=effective_use_padding,
+        )
         output = _lookup_float_results(rank_output, buffers)
     else:
         output = cp.empty((height, width), dtype=dtype)
-        _run_median_query(params, buffers, output, use_padded_kernel=True)
+        _run_median_query(
+            params, buffers, output, use_padded_kernel=effective_use_padding
+        )
 
     return output
