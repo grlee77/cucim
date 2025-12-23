@@ -845,16 +845,15 @@ class WaveletMatrixBuffers:
         # then build all column WMs in parallel using grid.y = val_bit_len.
         # This requires more memory but significantly reduces kernel launches.
         #
-        # wm_idx_levels[h] stores column indices sorted by value bits >= h
+        # wm_idx_levels[h, :] stores column indices sorted by value bits >= h
         # (populated at input positions during value upsweep for level h)
+        # Shape: (val_bit_len, buf.size) - contiguous 2D array for efficient batched access
         val_bit_len = params.val_bit_len
-        self.wm_idx_levels = [
-            cp.zeros(buf.size, dtype=cp.uint16) for _ in range(val_bit_len)
-        ]
+        self.wm_idx_levels = cp.zeros((val_bit_len, buf.size), dtype=cp.uint16)
 
-        # Working buffers for column WM construction (2 for alternating)
-        self.wm_idx_buf1 = cp.zeros(buf.size, dtype=cp.uint16)
-        self.wm_idx_buf2 = cp.zeros(buf.size, dtype=cp.uint16)
+        # Working buffer for column WM construction (alternating with wm_idx_levels)
+        # Same shape as wm_idx_levels for batched processing
+        self.wm_idx_work = cp.zeros((val_bit_len, buf.size), dtype=cp.uint16)
 
         # Scan buffers for column WM (need val_bit_len sets for batch processing)
         # Layout: [level_0_data, level_1_data, ..., level_{n-1}_data]
@@ -1113,9 +1112,10 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     # MSB mask for column indices
     wm_msb_mask = (1 << (w_bit_len - 1)) - 1
 
-    # Create contiguous buffer with all wm_idx_levels data
+    # wm_idx_levels is already a contiguous 2D array (val_bit_len, buf.size)
+    # Use ravel() to get a 1D view for kernel access
     # Layout: [level_0_data, level_1_data, ..., level_{n-1}_data]
-    wm_idx_all = cp.concatenate(buffers.wm_idx_levels)
+    wm_idx_flat = buffers.wm_idx_levels.ravel()
     idx_buf_stride = buf.size
 
     # First pass: count zeros for MSB of column indices (all levels)
@@ -1126,7 +1126,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             np.uint16(wm_msb_mask),  # mask
             np.uint16(buf.block_pair_num),  # block_pair_num
             np.uint32(size_div_w),  # size_div_warp
-            wm_idx_all,  # src_base
+            wm_idx_flat,  # src_base
             buffers.wm_scan_buf,  # nsum_scan_buf
             np.uint32(nsum_scan_stride),  # nsum_scan_stride
             np.uint32(buf.size),  # size
@@ -1151,13 +1151,11 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         ),
     )
 
-    # Create working buffers for batched column WM upsweep
-    # We need two contiguous buffers for alternating src/dst
-    wm_work_buf1 = wm_idx_all.copy()  # Start with source data
-    wm_work_buf2 = cp.zeros_like(wm_idx_all)
-
-    wm_src_base = wm_work_buf1
-    wm_dst_base = wm_work_buf2
+    # Use wm_idx_levels as source and wm_idx_work as destination
+    # Copy initial data to work buffer, then alternate
+    buffers.wm_idx_work[:] = buffers.wm_idx_levels[:]
+    wm_src_base = buffers.wm_idx_work.ravel()
+    wm_dst_base = buffers.wm_idx_levels.ravel()  # Reuse as scratch
 
     # Up-sweep for each column bit level (processing all value levels in parallel)
     for wm_h in range(w_bit_len - 1, -1, -1):
