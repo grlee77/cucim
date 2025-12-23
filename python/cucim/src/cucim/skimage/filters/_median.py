@@ -174,9 +174,17 @@ def median(
 
     if algorithm in ["auto", "wavelet_matrix"]:
         # Wavelet matrix supports rectangular footprints with odd dimensions
+        # and requires ALL elements in the footprint to be non-zero (full rectangle)
         if image.ndim != 2:
             can_use_wavelet = False
             wm_reason = "Only 2D images are supported"
+        elif footprint is not None and not cp.all(footprint):
+            # Footprint has zeros - wavelet matrix only supports full rectangles
+            can_use_wavelet = False
+            wm_reason = (
+                "Footprint contains zeros. Wavelet matrix only supports "
+                "full rectangular footprints (all elements non-zero)."
+            )
         else:
             can_use_wavelet, wm_reason = _can_use_wavelet_matrix(
                 image, footprint_shape=footprint_shape
