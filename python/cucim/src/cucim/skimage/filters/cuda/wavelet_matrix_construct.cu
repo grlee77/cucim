@@ -1036,3 +1036,390 @@ extern "C" __global__ void wavelet_wm_upsweep(
         }
     }
 }
+
+
+// ============================================================================
+// BATCHED KERNELS FOR COLUMN WM CONSTRUCTION
+// ============================================================================
+// These kernels process multiple value levels in parallel using blockIdx.y
+// to select the value level. This significantly reduces kernel launch overhead.
+
+
+// ============================================================================
+// Kernel: Batched Column WM First Pass
+// ============================================================================
+/*
+ * Counts zeros for MSB of column indices across all value levels.
+ * Each blockIdx.y handles a different value level.
+ *
+ * Parameters:
+ *   mask: Bit mask for MSB comparison
+ *   block_pair_num: Number of block pairs per grid block
+ *   size_div_warp: Total size divided by warp size
+ *   src_base: Base pointer to column index sources
+ *   nsum_scan_buf: Output buffer for block zero counts (strided by value level)
+ *   nsum_scan_stride: Stride between value level data in nsum_scan_buf
+ *   size: Total buffer size
+ *   idx_buf_stride: Stride between value level index buffers (in elements)
+ */
+extern "C" __global__ void wavelet_wm_first_pass_batched(
+    const XIdxT mask,
+    const unsigned short block_pair_num,
+    const XYIdxT size_div_warp,
+    const XIdxT* __restrict__ src_base,
+    XYIdxT* __restrict__ nsum_scan_buf,
+    const XYIdxT nsum_scan_stride,
+    const XYIdxT size,
+    const XYIdxT idx_buf_stride
+) {
+    constexpr int THREAD_PER_GRID = WM_THREAD_PER_GRID;
+    constexpr int THREADS_DIM_Y = WM_THREADS_DIM_Y;
+
+    // Select source for this value level (blockIdx.y)
+    const XIdxT* __restrict__ src = src_base + blockIdx.y * idx_buf_stride;
+
+    // Offset output buffer for this value level
+    XYIdxT* __restrict__ out_buf = nsum_scan_buf + blockIdx.y * nsum_scan_stride;
+
+    XYIdxT cs = 0;
+
+    XYIdxT i = (XYIdxT)blockIdx.x * block_pair_num * THREADS_DIM_Y + threadIdx.y;
+
+    for (XYIdxT k = 0; k < block_pair_num; ++k, i += THREADS_DIM_Y) {
+        if (i >= size_div_warp) break;
+
+        const XYIdxT idx = i * WM_WARP_SIZE + threadIdx.x;
+        if (idx >= size) continue;
+
+        const XIdxT v = src[idx];
+
+        if (v <= mask) {
+            ++cs;
+        }
+    }
+
+    using WarpReduce = cub::WarpReduce<unsigned int>;
+    __shared__ typename WarpReduce::TempStorage WarpReduce_temp_storage[WM_THREADS_DIM_Y];
+    __shared__ XYIdxT cs_sum_sh[WM_THREADS_DIM_Y];
+
+    cs = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(cs);
+
+    if (threadIdx.x == 0) {
+        cs_sum_sh[threadIdx.y] = cs;
+    }
+    __syncthreads();
+
+    if (threadIdx.y != 0) return;
+
+    XYIdxT cs_bsum = (threadIdx.x < WM_THREADS_DIM_Y ? cs_sum_sh[threadIdx.x] : 0);
+    cs_bsum = WarpReduce(WarpReduce_temp_storage[0]).Sum(cs_bsum);
+
+    if (threadIdx.x == 0) {
+        out_buf[blockIdx.x] = cs_bsum;
+    }
+}
+
+
+// ============================================================================
+// Kernel: Batched Exclusive Sum
+// ============================================================================
+/*
+ * Computes exclusive prefix sums for all value levels.
+ * Each blockIdx.y handles a different value level.
+ *
+ * Parameters:
+ *   nsum_scan_buf: Input block counts (strided by value level)
+ *   nsum_buf_test2: Secondary buffer for swap (strided by value level)
+ *   nsum_p_base: Base pointer for storing total sums
+ *   nsum_pos: Position to store the total sum within bitvector block
+ *   nsum_scan_stride: Stride between value level data
+ *   wm_block_stride: Stride between value level WM storage (in bytes)
+ *   wm_level_offset: Offset for the column bit level within each value level (in bytes)
+ *   grid_x: Number of blocks in X dimension (for bounds check)
+ */
+extern "C" __global__ void wavelet_exclusive_sum_batched(
+    XYIdxT* __restrict__ nsum_scan_buf,
+    XYIdxT* __restrict__ nsum_buf_test2,
+    BlockT* __restrict__ nsum_p_base,
+    const XYIdxT nsum_pos,
+    const XYIdxT nsum_scan_stride,
+    const unsigned int wm_block_stride,
+    const unsigned int wm_level_offset,
+    const int grid_x
+) {
+    typedef cub::BlockScan<XYIdxT, WM_MAX_BLOCK_X> BlockScan;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+
+    // Offset buffers for this value level
+    XYIdxT* in_buf = nsum_scan_buf + blockIdx.y * nsum_scan_stride;
+    XYIdxT* out_buf = nsum_buf_test2 + blockIdx.y * nsum_scan_stride;
+
+    // Compute output pointer for this value level and column bit level
+    BlockT* nsum_p = (BlockT*)((char*)nsum_p_base +
+                               blockIdx.y * wm_block_stride +
+                               wm_level_offset);
+
+    XYIdxT thread_data1;
+    XYIdxT thread_data2;
+
+    thread_data1 = (threadIdx.x < grid_x) ? in_buf[threadIdx.x] : 0;
+    out_buf[threadIdx.x] = 0;
+
+    BlockScan(temp_storage).ExclusiveSum(thread_data1, thread_data2);
+
+    if (threadIdx.x < grid_x) {
+        in_buf[threadIdx.x] = thread_data2;
+    }
+
+    // Store total sum
+    thread_data2 += thread_data1;
+    if (threadIdx.x == blockDim.x - 1) {
+        nsum_p[nsum_pos].nsum = thread_data2;
+    }
+}
+
+
+// ============================================================================
+// Kernel: Batched Column WM Upsweep
+// ============================================================================
+/*
+ * Processes column WM upsweep for all value levels in parallel.
+ * Each blockIdx.y handles a different value level.
+ *
+ * Parameters:
+ *   mask: Bit mask for current column bit level
+ *   block_pair_num: Number of block pairs per grid block
+ *   size_div_w: Total size divided by word size
+ *   src_base: Base pointer for source column indices
+ *   dst_base: Base pointer for destination column indices
+ *   nbit_bp_base: Base pointer for bitvector output
+ *   nsum_buf_test: Prefix sum buffer (strided)
+ *   nsum_buf_test2: Secondary sum buffer (strided)
+ *   bv_block_div32: Bitvector block bytes / 32
+ *   nbit_bp_pre_base: Base pointer for previous level bitvector
+ *   is_last_bit: True if this is the last bit level
+ *   nsum_scan_stride: Stride between value level data
+ *   wm_block_stride: Stride between value level WM storage (in bytes)
+ *   wm_curr_offset: Offset for current column bit level (in bytes)
+ *   wm_prev_offset: Offset for previous column bit level (in bytes)
+ *   size: Total buffer size
+ *   idx_buf_stride: Stride between value level index buffers (in elements)
+ */
+extern "C" __global__ void wavelet_wm_upsweep_batched(
+    const XIdxT mask,
+    const unsigned short block_pair_num,
+    const XYIdxT size_div_w,
+    XIdxT* __restrict__ src_base,
+    XIdxT* __restrict__ dst_base,
+    BlockT* __restrict__ nbit_bp_base,
+    const XYIdxT* __restrict__ nsum_buf_test,
+    XYIdxT* __restrict__ nsum_buf_test2,
+    const unsigned int bv_block_div32,
+    const BlockT* __restrict__ nbit_bp_pre_base,
+    const int is_last_bit,
+    const XYIdxT nsum_scan_stride,
+    const unsigned int wm_block_stride,
+    const unsigned int wm_curr_offset,
+    const unsigned int wm_prev_offset,
+    const XYIdxT size,
+    const XYIdxT idx_buf_stride
+) {
+    constexpr int THREAD_PER_GRID = WM_THREAD_PER_GRID;
+    constexpr int THREADS_DIM_Y = WM_THREADS_DIM_Y;
+    constexpr int SRC_CACHE_DIV = WM_SRC_CACHE_DIV;
+
+    using WarpScanX = cub::WarpScan<XYIdxT, WM_WARP_SIZE / SRC_CACHE_DIV>;
+    using WarpScanY = cub::WarpScan<XYIdxT, THREADS_DIM_Y>;
+    using WarpReduce = cub::WarpReduce<unsigned int>;
+    using WarpReduceY = cub::WarpReduce<unsigned int, THREADS_DIM_Y>;
+
+    __shared__ XIdxT src_val_cache[THREADS_DIM_Y][(WM_WARP_SIZE/SRC_CACHE_DIV)-1][WM_WARP_SIZE];
+
+    __shared__ uint4 nsum_count_sh[THREADS_DIM_Y];
+    __shared__ XYIdxT pre_sum_share[2];
+    __shared__ XYIdxT warp_scan_sums[THREADS_DIM_Y];
+    __shared__ typename WarpScanX::TempStorage s_scanStorage;
+    __shared__ typename WarpScanY::TempStorage s_scanStorage2;
+    __shared__ typename WarpReduce::TempStorage WarpReduce_temp_storage[THREADS_DIM_Y];
+    __shared__ typename WarpReduceY::TempStorage WarpReduceY_temp_storage;
+
+    // Select source/dest for this value level (blockIdx.y)
+    XIdxT* __restrict__ src = src_base + blockIdx.y * idx_buf_stride;
+    XIdxT* __restrict__ dst = dst_base + blockIdx.y * idx_buf_stride;
+
+    // Offset sum buffers for this value level
+    const XYIdxT* __restrict__ in_sum = nsum_buf_test + blockIdx.y * nsum_scan_stride;
+    XYIdxT* __restrict__ out_sum = nsum_buf_test2 + blockIdx.y * nsum_scan_stride;
+
+    // Compute bitvector pointers for this value level
+    BlockT* __restrict__ nbit_bp = (BlockT*)((char*)nbit_bp_base +
+                                             blockIdx.y * wm_block_stride +
+                                             wm_curr_offset);
+    const BlockT* __restrict__ nbit_bp_pre = (const BlockT*)((const char*)nbit_bp_pre_base +
+                                                              blockIdx.y * wm_block_stride +
+                                                              wm_prev_offset);
+
+    const XIdxT inf = (XIdxT)((1u << WM_W_BIT_LEN) - 1);
+
+    const XYIdxT size_div_warp = size_div_w * WM_WORD_DIV_WARP;
+    const XYIdxT nsum = nbit_bp[size_div_w].nsum;
+    const XYIdxT nsum_offset = in_sum[blockIdx.x];
+    const XYIdxT nsum_pre = nbit_bp_pre[size_div_w].nsum;
+
+    XYIdxT nsum_idx0_org = nsum_offset;
+    XYIdxT nsum_idx1_org = (XYIdxT)blockIdx.x * block_pair_num * THREAD_PER_GRID + nsum - nsum_idx0_org;
+    nsum_idx0_org /= (XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE;
+    nsum_idx1_org /= (XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE;
+    const XYIdxT nsum_idx0_bound = (nsum_idx0_org + 1) * block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE;
+    const XYIdxT nsum_idx1_bound = (nsum_idx1_org + 1) * block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE;
+    uint4 nsum_count = make_uint4(0, 0, 0, 0);
+
+    const unsigned short th_idx = threadIdx.y * WM_WARP_SIZE + threadIdx.x;
+    if (th_idx == 0) {
+        pre_sum_share[0] = nsum_offset;
+    }
+
+    for (XYIdxT ka = 0; ka < block_pair_num; ka += WM_WARP_SIZE / SRC_CACHE_DIV) {
+        const XYIdxT ibb = ((XYIdxT)blockIdx.x * block_pair_num + ka) * THREADS_DIM_Y;
+        if (ibb >= size_div_warp) break;
+
+        unsigned int my_bits = 0;
+        XIdxT first_val;
+
+        for (XYIdxT kb = 0, i = ibb + WM_WARP_SIZE / SRC_CACHE_DIV * threadIdx.y;
+             kb < WM_WARP_SIZE / SRC_CACHE_DIV; ++kb, ++i) {
+            if (i >= size_div_warp) break;
+
+            unsigned int bits;
+            const XYIdxT ij = i * WM_WARP_SIZE + threadIdx.x;
+            const XIdxT v = (ij < size) ? src[ij] : inf;
+
+            if (kb == 0) {
+                first_val = v;
+            } else {
+                src_val_cache[threadIdx.y][kb - 1][threadIdx.x] = v;
+            }
+
+            if (v <= mask) {
+                bits = __activemask();
+            } else {
+                bits = ~__activemask();
+            }
+
+            if (threadIdx.x == kb) {
+                my_bits = bits;
+            }
+        }
+
+        XYIdxT c, t = 0;
+        if (threadIdx.y < THREADS_DIM_Y) {
+            c = __popc(my_bits);
+
+            WarpScanX(s_scanStorage).ExclusiveSum(c, t);
+            if (threadIdx.x == WM_WARP_SIZE / SRC_CACHE_DIV - 1) {
+                warp_scan_sums[threadIdx.y] = c + t;
+            }
+        }
+
+        __syncthreads();
+
+        XYIdxT pre_sum = pre_sum_share[(ka & (WM_WARP_SIZE / SRC_CACHE_DIV)) > 0 ? 1 : 0];
+        XYIdxT s = threadIdx.x < THREADS_DIM_Y ? warp_scan_sums[threadIdx.x] : 0;
+        WarpScanY(s_scanStorage2).ExclusiveSum(s, s);
+
+        s = __shfl_sync(FULL_WARP_MASK, s, threadIdx.y);
+        s += t + pre_sum;
+
+        if (SRC_CACHE_DIV == 1 || threadIdx.x < WM_WARP_SIZE / SRC_CACHE_DIV) {
+            if (th_idx == THREAD_PER_GRID - WM_WARP_SIZE + WM_WARP_SIZE / SRC_CACHE_DIV - 1) {
+                pre_sum_share[(ka & (WM_WARP_SIZE / SRC_CACHE_DIV)) == 0 ? 1 : 0] = s + c;
+            }
+            const XYIdxT bi = ibb + threadIdx.y * WM_WARP_SIZE / SRC_CACHE_DIV + threadIdx.x;
+            if (bi < size_div_warp) {
+                nbit_bp[bi].nsum = s;
+                nbit_bp[bi].nbit = my_bits;
+            }
+        }
+
+        // Reorder column indices
+        const XIdxT mask_2 = mask >> 1;
+        XIdxT vo = first_val;
+
+        for (XYIdxT j = 0, i = ibb + WM_WARP_SIZE / SRC_CACHE_DIV * threadIdx.y;
+             j < WM_WARP_SIZE / SRC_CACHE_DIV; ++j, ++i) {
+            if (i >= size_div_warp) break;
+
+            const unsigned int e_nbit = __shfl_sync(FULL_WARP_MASK, my_bits, j);
+            const XYIdxT e_nsum = __shfl_sync(FULL_WARP_MASK, s, j);
+            XYIdxT rank = __popc(e_nbit << (WM_WARP_SIZE - threadIdx.x));
+            const XYIdxT idx0 = e_nsum + rank;
+
+            XIdxT v = vo;
+            XYIdxT idx = idx0;
+            if (vo > mask) {
+                const XYIdxT ij = i * WM_WARP_SIZE + threadIdx.x;
+                idx = ij + nsum - idx;
+                v &= mask;  // Clear the processed bit
+            }
+
+            if (idx < size) {
+                dst[idx] = v;
+            }
+
+            // Count zeros for next level
+            if (!is_last_bit && v <= mask_2) {
+                if (vo <= mask) {
+                    if (idx < nsum_idx0_bound) {
+                        nsum_count.x++;
+                    } else {
+                        nsum_count.y++;
+                    }
+                } else {
+                    if (idx < nsum_idx1_bound) {
+                        nsum_count.z++;
+                    } else {
+                        nsum_count.w++;
+                    }
+                }
+            }
+
+            if (j == WM_WARP_SIZE / SRC_CACHE_DIV - 1) break;
+            vo = src_val_cache[threadIdx.y][j][threadIdx.x];
+        }
+    }
+
+    if (blockIdx.x == gridDim.x - 1 && th_idx == 0) {
+        nbit_bp[size_div_warp / WM_WORD_DIV_WARP].nsum = nsum;
+    }
+
+    // Reduce counts
+    nsum_count.x = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.x);
+    nsum_count.y = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.y);
+    nsum_count.z = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.z);
+    nsum_count.w = WarpReduce(WarpReduce_temp_storage[threadIdx.y]).Sum(nsum_count.w);
+
+    if (threadIdx.x == 0) {
+        nsum_count_sh[threadIdx.y] = nsum_count;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < THREADS_DIM_Y) {
+        nsum_count = nsum_count_sh[threadIdx.x];
+        nsum_count.x = WarpReduceY(WarpReduceY_temp_storage).Sum(nsum_count.x);
+        nsum_count.y = WarpReduceY(WarpReduceY_temp_storage).Sum(nsum_count.y);
+        nsum_count.z = WarpReduceY(WarpReduceY_temp_storage).Sum(nsum_count.z);
+        nsum_count.w = WarpReduceY(WarpReduceY_temp_storage).Sum(nsum_count.w);
+
+        if (th_idx == 0 && !is_last_bit) {
+            const XYIdxT idx0_org = nsum_idx0_bound /
+                ((XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE);
+            const XYIdxT idx1_org = nsum_idx1_bound /
+                ((XYIdxT)block_pair_num * THREADS_DIM_Y * WM_WARP_SIZE);
+
+            if (nsum_count.x > 0) atomicAdd(out_sum + idx0_org - 1, nsum_count.x);
+            if (nsum_count.y > 0) atomicAdd(out_sum + idx0_org - 0, nsum_count.y);
+            if (nsum_count.z > 0) atomicAdd(out_sum + idx1_org - 1, nsum_count.z);
+            if (nsum_count.w > 0) atomicAdd(out_sum + idx1_org - 0, nsum_count.w);
+        }
+    }
+}

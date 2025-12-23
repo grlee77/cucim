@@ -763,6 +763,10 @@ def _get_construction_kernels(val_type, val_bit_len, w_bit_len):
         "wavelet_upsweep_wm",
         "wavelet_wm_first_pass",
         "wavelet_wm_upsweep",
+        # Batched kernels for processing all value levels in parallel
+        "wavelet_wm_first_pass_batched",
+        "wavelet_exclusive_sum_batched",
+        "wavelet_wm_upsweep_batched",
     ]
 
     kernels = {}
@@ -837,14 +841,29 @@ class WaveletMatrixBuffers:
             self.sorted_values = None
 
         # Working buffers for column WM construction
-        # Memory optimization: Instead of storing all val_bit_len levels of
-        # sorted column indices (wm_idx_levels), we build each column WM
-        # immediately after the corresponding value level upsweep.
-        # We only need 2 working buffers instead of val_bit_len + 2.
+        # OpenCV-style batched approach: Store column indices for ALL value levels,
+        # then build all column WMs in parallel using grid.y = val_bit_len.
+        # This requires more memory but significantly reduces kernel launches.
+        #
+        # wm_idx_levels[h] stores column indices sorted by value bits >= h
+        # (populated at input positions during value upsweep for level h)
+        val_bit_len = params.val_bit_len
+        self.wm_idx_levels = [
+            cp.zeros(buf.size, dtype=cp.uint16) for _ in range(val_bit_len)
+        ]
+
+        # Working buffers for column WM construction (2 for alternating)
         self.wm_idx_buf1 = cp.zeros(buf.size, dtype=cp.uint16)
         self.wm_idx_buf2 = cp.zeros(buf.size, dtype=cp.uint16)
-        self.wm_scan_buf = cp.zeros(buf.nsum_scan_buf_len, dtype=cp.uint32)
-        self.wm_scan_buf2 = cp.zeros(buf.nsum_scan_buf_len, dtype=cp.uint32)
+
+        # Scan buffers for column WM (need val_bit_len sets for batch processing)
+        # Layout: [level_0_data, level_1_data, ..., level_{n-1}_data]
+        self.wm_scan_buf = cp.zeros(
+            buf.nsum_scan_buf_len * val_bit_len, dtype=cp.uint32
+        )
+        self.wm_scan_buf2 = cp.zeros(
+            buf.nsum_scan_buf_len * val_bit_len, dtype=cp.uint32
+        )
 
     def get_bv_level_ptr(self, level):
         """Get pointer to bitvector storage for a specific bit level."""
@@ -869,16 +888,24 @@ class WaveletMatrixBuffers:
 
 def _run_wavelet_construction(src_padded, params, buffers, kernels):
     """
-    Run the wavelet matrix construction pipeline.
+    Run the wavelet matrix construction pipeline (OpenCV-style batched approach).
 
-    This function orchestrates the multi-pass construction of the wavelet matrix
+    This function orchestrates the multi-pass construction of the wavelet matrix:
+
+    Phase 1: Value WM Construction
     1. First pass: Initialize indices and count MSB zeros
     2. Exclusive sum: Compute prefix sums of block counts
     3. For each value bit (MSB to LSB):
        a. Up-sweep: Build bitvector and reorder values
-       b. Exclusive sum: Update prefix sums
-    4. For each column bit:
-       a. Up-sweep WM: Build column wavelet matrix
+       b. Store sorted column indices in wm_idx_levels[h]
+       c. Exclusive sum: Update prefix sums
+
+    Phase 2: Batched Column WM Construction
+    For all value levels in parallel (using grid.y = val_bit_len):
+    1. First pass: Count zeros for MSB of column indices
+    2. Exclusive sum: Compute prefix sums
+    3. For each column bit:
+       a. Up-sweep: Build column WM bitvectors
        b. Exclusive sum: Update prefix sums
 
     Parameters
@@ -898,11 +925,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     """
     buf = params.buf_sizes
     val_bit_len = params.val_bit_len
-    # w_bit_len used for column wavelet matrix (future expansion)
-    # w_bit_len = params.w_bit_len
-
-    # Create a secondary stream for overlapping buffer clears with kernel execution
-    stream_aux = cp.cuda.Stream(non_blocking=True)
+    w_bit_len = params.w_bit_len
 
     # Flatten source if needed
     src_flat = src_padded.ravel()
@@ -1036,11 +1059,11 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         )
 
         # ---------------------------------------------------------------------
-        # Build column WM for value level h immediately (memory optimization)
+        # Store sorted column indices for batched column WM construction
         # ---------------------------------------------------------------------
-        # Copy sorted column indices to working buffer before swap
+        # Copy sorted column indices to wm_idx_levels[h]
         # The column WM for value level h uses indices sorted by bits >= h
-        buffers.wm_idx_buf1[:] = dst_idx[:]
+        buffers.wm_idx_levels[h][:] = dst_idx[:]
 
         # Swap value buffers for next iteration
         src_val, dst_val = dst_val, src_val
@@ -1055,13 +1078,6 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             )
 
             next_bv_offset = (h - 1) * bv_block_h_bytes
-
-            # Start clearing column WM scan buffers in auxiliary stream
-            # This can overlap with the value exclusive_sum kernel
-            with stream_aux:
-                buffers.wm_scan_buf.fill(0)
-                buffers.wm_scan_buf2.fill(0)
-
             kernels["wavelet_exclusive_sum"](
                 exsum_grid,
                 exsum_block,
@@ -1075,114 +1091,137 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 ),
             )
 
-            # Sync auxiliary stream before column WM construction
-            stream_aux.synchronize()
-        else:
-            # For last value level, just clear buffers synchronously
-            buffers.wm_scan_buf.fill(0)
-            buffers.wm_scan_buf2.fill(0)
+    # =========================================================================
+    # Phase 2: Batched Column WM Construction
+    # =========================================================================
+    # Process all val_bit_len column WMs in parallel using grid.y = val_bit_len
 
-        # ---------------------------------------------------------------------
-        # Column WM construction for value level h
-        # ---------------------------------------------------------------------
+    # Clear all column WM scan buffers
+    buffers.wm_scan_buf.fill(0)
+    buffers.wm_scan_buf2.fill(0)
 
-        # MSB mask for column indices
-        wm_msb_mask = (1 << (w_bit_len - 1)) - 1
+    # Grid for batched kernels: (grid_x, val_bit_len)
+    batched_grid = (buf.grid_x, val_bit_len, 1)
+    batched_exsum_grid = (1, val_bit_len, 1)
 
-        # First pass: count zeros for MSB
-        kernels["wavelet_wm_first_pass"](
-            grid,
+    # Stride between value level data in scan buffers
+    nsum_scan_stride = buf.nsum_scan_buf_len
+
+    # Stride between value level WM storage (in bytes)
+    wm_block_stride = w_bit_len * wm_block_h_bytes
+
+    # MSB mask for column indices
+    wm_msb_mask = (1 << (w_bit_len - 1)) - 1
+
+    # Create contiguous buffer with all wm_idx_levels data
+    # Layout: [level_0_data, level_1_data, ..., level_{n-1}_data]
+    wm_idx_all = cp.concatenate(buffers.wm_idx_levels)
+    idx_buf_stride = buf.size
+
+    # First pass: count zeros for MSB of column indices (all levels)
+    kernels["wavelet_wm_first_pass_batched"](
+        batched_grid,
+        block,
+        (
+            np.uint16(wm_msb_mask),  # mask
+            np.uint16(buf.block_pair_num),  # block_pair_num
+            np.uint32(size_div_w),  # size_div_warp
+            wm_idx_all,  # src_base
+            buffers.wm_scan_buf,  # nsum_scan_buf
+            np.uint32(nsum_scan_stride),  # nsum_scan_stride
+            np.uint32(buf.size),  # size
+            np.uint32(idx_buf_stride),  # idx_buf_stride
+        ),
+    )
+
+    # Exclusive sum for first column WM level (MSB = w_bit_len - 1) - all levels
+    wm_level_offset = (w_bit_len - 1) * wm_block_h_bytes
+    kernels["wavelet_exclusive_sum_batched"](
+        batched_exsum_grid,
+        exsum_block,
+        (
+            buffers.wm_scan_buf,
+            buffers.wm_scan_buf2,
+            buffers.wm_blocks,  # nsum_p_base
+            np.uint32(buf.nsum_pos),  # nsum_pos
+            np.uint32(nsum_scan_stride),  # nsum_scan_stride
+            np.uint32(wm_block_stride),  # wm_block_stride
+            np.uint32(wm_level_offset),  # wm_level_offset
+            np.int32(buf.grid_x),  # grid_x
+        ),
+    )
+
+    # Create working buffers for batched column WM upsweep
+    # We need two contiguous buffers for alternating src/dst
+    wm_work_buf1 = wm_idx_all.copy()  # Start with source data
+    wm_work_buf2 = cp.zeros_like(wm_idx_all)
+
+    wm_src_base = wm_work_buf1
+    wm_dst_base = wm_work_buf2
+
+    # Up-sweep for each column bit level (processing all value levels in parallel)
+    for wm_h in range(w_bit_len - 1, -1, -1):
+        is_last_wm = 1 if wm_h == 0 else 0
+
+        # Current mask for column bit
+        wm_bit_pos = w_bit_len - 1 - wm_h
+        wm_mask = (1 << (w_bit_len - wm_bit_pos - 1)) - 1
+
+        # Compute offsets for current and previous column WM levels
+        wm_curr_offset = wm_h * wm_block_h_bytes
+        prev_wm_level = min(w_bit_len - 1, wm_h + 1)
+        wm_prev_offset = prev_wm_level * wm_block_h_bytes
+
+        kernels["wavelet_wm_upsweep_batched"](
+            batched_grid,
             block,
             (
-                np.uint16(wm_msb_mask),  # mask
+                np.uint16(wm_mask),  # mask
                 np.uint16(buf.block_pair_num),  # block_pair_num
-                np.uint32(size_div_w),  # size_div_warp (actually size_div_w)
-                buffers.wm_idx_buf1,  # src
-                buffers.wm_scan_buf,  # nsum_scan_buf
-                np.uint32(buf.buf_bytes_div32),  # buf_byte_div32
+                np.uint32(size_div_w),  # size_div_w
+                wm_src_base,  # src_base
+                wm_dst_base,  # dst_base
+                buffers.wm_blocks,  # nbit_bp_base
+                buffers.wm_scan_buf,  # nsum_buf_test
+                buffers.wm_scan_buf2,  # nsum_buf_test2
+                np.uint32(buf.wm_bv_block_bytes_div32),  # bv_block_div32
+                buffers.wm_blocks,  # nbit_bp_pre_base
+                np.int32(is_last_wm),  # is_last_bit
+                np.uint32(nsum_scan_stride),  # nsum_scan_stride
+                np.uint32(wm_block_stride),  # wm_block_stride
+                np.uint32(wm_curr_offset),  # wm_curr_offset
+                np.uint32(wm_prev_offset),  # wm_prev_offset
+                np.uint32(buf.size),  # size
+                np.uint32(idx_buf_stride),  # idx_buf_stride
             ),
         )
 
-        # Compute offset for this value level's column WM
-        wm_base_offset = h * w_bit_len * wm_block_h_bytes
+        # Swap buffers
+        wm_src_base, wm_dst_base = wm_dst_base, wm_src_base
 
-        # Exclusive sum for first column WM level (MSB = w_bit_len - 1)
-        kernels["wavelet_exclusive_sum"](
-            exsum_grid,
-            exsum_block,
-            (
-                buffers.wm_scan_buf,
+        # Exclusive sum for next level (skip for last)
+        if not is_last_wm:
+            buffers.wm_scan_buf, buffers.wm_scan_buf2 = (
                 buffers.wm_scan_buf2,
-                buffers.wm_blocks[
-                    wm_base_offset + (w_bit_len - 1) * wm_block_h_bytes :
-                ],
-                np.uint32(buf.buf_bytes_div32),
-                np.uint32(buf.wm_bv_block_bytes_div32),
-                np.uint32(buf.nsum_pos),  # nsum_pos
-            ),
-        )
-
-        # Alternating buffers for column WM construction
-        wm_src = buffers.wm_idx_buf1
-        wm_dst = buffers.wm_idx_buf2
-
-        # Up-sweep for each column bit level
-        for wm_h in range(w_bit_len - 1, -1, -1):
-            is_last_wm = 1 if wm_h == 0 else 0
-
-            # Current mask for column bit
-            wm_bit_pos = w_bit_len - 1 - wm_h
-            wm_mask = (1 << (w_bit_len - wm_bit_pos - 1)) - 1
-
-            # Compute offsets for current and previous column WM levels
-            # OpenCV convention: level wm_h at offset wm_h * wm_block_h_bytes
-            wm_curr_offset = wm_base_offset + wm_h * wm_block_h_bytes
-            prev_wm_level = min(w_bit_len - 1, wm_h + 1)
-            wm_prev_offset = wm_base_offset + prev_wm_level * wm_block_h_bytes
-
-            kernels["wavelet_wm_upsweep"](
-                grid,
-                block,
-                (
-                    np.uint16(wm_mask),  # mask
-                    np.uint16(buf.block_pair_num),  # block_pair_num
-                    np.uint32(size_div_w),  # size_div_w
-                    wm_src,  # src
-                    wm_dst,  # dst
-                    buffers.wm_blocks[wm_curr_offset:],  # nbit_bp
-                    buffers.wm_scan_buf,  # nsum_buf_test
-                    buffers.wm_scan_buf2,  # nsum_buf_test2
-                    np.uint32(buf.wm_bv_block_bytes_div32),  # bv_block_div32
-                    np.uint32(buf.buf_bytes_div32),  # buf_byte_div32
-                    buffers.wm_blocks[wm_prev_offset:],  # nbit_bp_pre
-                    np.int32(is_last_wm),  # is_last_bit
-                ),
+                buffers.wm_scan_buf,
             )
 
-            # Swap buffers
-            wm_src, wm_dst = wm_dst, wm_src
-
-            # Exclusive sum for next level (skip for last)
-            if not is_last_wm:
-                buffers.wm_scan_buf, buffers.wm_scan_buf2 = (
-                    buffers.wm_scan_buf2,
+            next_level = wm_h - 1
+            next_wm_offset = next_level * wm_block_h_bytes
+            kernels["wavelet_exclusive_sum_batched"](
+                batched_exsum_grid,
+                exsum_block,
+                (
                     buffers.wm_scan_buf,
-                )
-
-                next_level = wm_h - 1
-                next_wm_offset = wm_base_offset + next_level * wm_block_h_bytes
-                kernels["wavelet_exclusive_sum"](
-                    exsum_grid,
-                    exsum_block,
-                    (
-                        buffers.wm_scan_buf,
-                        buffers.wm_scan_buf2,
-                        buffers.wm_blocks[next_wm_offset:],
-                        np.uint32(buf.buf_bytes_div32),
-                        np.uint32(buf.wm_bv_block_bytes_div32),
-                        np.uint32(buf.nsum_pos),  # nsum_pos
-                    ),
-                )
+                    buffers.wm_scan_buf2,
+                    buffers.wm_blocks,  # nsum_p_base
+                    np.uint32(buf.nsum_pos),  # nsum_pos
+                    np.uint32(nsum_scan_stride),  # nsum_scan_stride
+                    np.uint32(wm_block_stride),  # wm_block_stride
+                    np.uint32(next_wm_offset),  # wm_level_offset
+                    np.int32(buf.grid_x),  # grid_x
+                ),
+            )
 
     return buffers
 
