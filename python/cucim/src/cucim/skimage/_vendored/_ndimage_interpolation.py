@@ -522,6 +522,19 @@ def affine_transform(
         )
         kern(filtered, offset, matrix, output)
     else:
+        # identify batch axes where the row is an identity row with zero offset
+        # i.e., matrix[j, j] == 1, matrix[j, k] == 0 for k != j, and offset[j] == 0
+        matrix_host = cupy.asnumpy(matrix)
+        batch_axes = tuple(
+            j
+            for j in range(ndim)
+            if (
+                matrix_host[j, j] == 1.0
+                and all(matrix_host[j, k] == 0.0 for k in range(ndim) if k != j)
+                and offset[j] == 0.0
+            )
+        )
+
         kern = _interp_kernels._get_affine_kernel(
             ndim,
             large_int,
@@ -531,6 +544,7 @@ def affine_transform(
             order=order,
             integer_output=integer_output,
             nprepad=nprepad,
+            batch_axes=batch_axes,
         )
         m = cupy.zeros((ndim, ndim + 1), dtype=cupy.float64)
         m[:, :-1] = matrix

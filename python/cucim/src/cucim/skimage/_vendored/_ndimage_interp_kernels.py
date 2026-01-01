@@ -251,7 +251,7 @@ def _get_coord_shift(ndim, nprepad=0, batch_axes=None):
     return ops
 
 
-def _get_coord_affine(ndim, nprepad=0):
+def _get_coord_affine(ndim, nprepad=0, batch_axes=None):
     """Compute target coordinate based on a homogeneous transformation matrix.
 
     The homogeneous matrix has shape (ndim, ndim + 1). It corresponds to
@@ -270,24 +270,37 @@ def _get_coord_affine(ndim, nprepad=0):
         c_0 = mat[0] * in_coords[0] + mat[1] * in_coords[1] + aff[2];
         c_1 = mat[3] * in_coords[0] + mat[4] * in_coords[1] + aff[5];
 
+    For batch axes (identity row with zero offset), the identity is used:
+
+        c_j = in_coord[j]
+
     """
+    if batch_axes is None:
+        batch_axes = ()
     ops = []
     pre = f" + (W){nprepad}" if nprepad > 0 else ""
     ncol = ndim + 1
     for j in range(ndim):
-        ops.append(
-            f"""
-            W c_{j} = (W)0.0;"""
-        )
-        for k in range(ndim):
+        if j in batch_axes:
+            # identity transform for batch axes
             ops.append(
                 f"""
-            c_{j} += mat[{ncol * j + k}] * (W)in_coord[{k}];"""
+            W c_{j} = (W)in_coord[{j}]{pre};"""
             )
-        ops.append(
-            f"""
+        else:
+            ops.append(
+                f"""
+            W c_{j} = (W)0.0;"""
+            )
+            for k in range(ndim):
+                ops.append(
+                    f"""
+            c_{j} += mat[{ncol * j + k}] * (W)in_coord[{k}];"""
+                )
+            ops.append(
+                f"""
             c_{j} += mat[{ncol * j + ndim}]{pre};"""
-        )
+            )
     return ops
 
 
@@ -827,6 +840,7 @@ def _get_affine_kernel(
     order=1,
     integer_output=False,
     nprepad=0,
+    batch_axes=None,
 ):
     in_params = "raw X x, raw W mat"
     out_params = "Y y"
@@ -841,6 +855,7 @@ def _get_affine_kernel(
         name="affine",
         integer_output=integer_output,
         nprepad=nprepad,
+        batch_axes=batch_axes,
     )
     return cupy.ElementwiseKernel(
         in_params, out_params, operation, name, preamble=math_constants_preamble
