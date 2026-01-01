@@ -20,7 +20,7 @@ math_constants_preamble = r"""
 spline_weights_inline = _spline_kernel_weights.spline_weights_inline
 
 
-def _get_coord_map(ndim, nprepad=0):
+def _get_coord_map(ndim, nprepad=0, batch_axes=None):
     """Extract target coordinate from coords array (for map_coordinates).
 
     Notes
@@ -39,15 +39,30 @@ def _get_coord_map(ndim, nprepad=0):
     y will be indexed by the CIndexer, _ind.
     Thus ncoords = _ind.size();
 
+    For batch axes (identity mapping), the output index is used directly:
+
+        c_j = in_coord[j]
+
     """
+    if batch_axes is None:
+        batch_axes = ()
     ops = []
-    ops.append("ptrdiff_t ncoords = _ind.size();")
+    # only need ncoords if there are non-batch axes
+    if len(batch_axes) < ndim:
+        ops.append("ptrdiff_t ncoords = _ind.size();")
     pre = f" + (W){nprepad}" if nprepad > 0 else ""
     for j in range(ndim):
-        ops.append(
-            f"""
+        if j in batch_axes:
+            # batch axis: use identity (output index = input coordinate)
+            ops.append(
+                f"""
+    W c_{j} = (W)in_coord[{j}]{pre};"""
+            )
+        else:
+            ops.append(
+                f"""
     W c_{j} = coords[i + {j} * ncoords]{pre};"""
-        )
+            )
     return ops
 
 
@@ -707,9 +722,13 @@ def _get_map_kernel(
     order=1,
     integer_output=False,
     nprepad=0,
+    batch_axes=None,
 ):
     in_params = "raw X x, raw W coords"
     out_params = "Y y"
+    # if there are batch axes, we need in_coord to be computed
+    # (batch axes use in_coord[j] instead of reading from coords)
+    omit_in_coord = not batch_axes
     operation, name = _generate_interp_custom(
         coord_func=_get_coord_map,
         ndim=ndim,
@@ -721,7 +740,8 @@ def _get_map_kernel(
         name="map",
         integer_output=integer_output,
         nprepad=nprepad,
-        omit_in_coord=True,  # input image coordinates are not needed
+        omit_in_coord=omit_in_coord,
+        batch_axes=batch_axes,
     )
     return cupy.ElementwiseKernel(
         in_params, out_params, operation, name, preamble=math_constants_preamble

@@ -276,6 +276,8 @@ def map_coordinates(
     mode="constant",
     cval=0.0,
     prefilter=True,
+    *,
+    batch_axes=None,
 ):
     """Map the input array to new coordinates by interpolation.
 
@@ -309,6 +311,12 @@ def map_coordinates(
             slightly blurred if ``order > 1``, unless the input is prefiltered,
             i.e. it is the result of calling ``spline_filter`` on the original
             input.
+        batch_axes (tuple of int, optional): Axes along which the coordinates
+            represent an identity mapping (i.e., output index equals input
+            coordinate). For these axes, interpolation is skipped and the
+            coordinate values in the ``coordinates`` array are ignored.
+            This can improve performance when only a subset of dimensions
+            require interpolation.
 
     Returns:
         cupy.ndarray:
@@ -336,6 +344,11 @@ def map_coordinates(
     coordinates = _check_coordinates(coordinates, order)
     filtered, nprepad = _filter_input(input, prefilter, mode, cval, order)
     large_int = max(math.prod(input.shape), coordinates.shape[0]) > 1 << 31
+
+    # convert batch_axes to tuple for hashing in memoized kernel getter
+    if batch_axes is not None:
+        batch_axes = tuple(batch_axes)
+
     kern = _interp_kernels._get_map_kernel(
         input.ndim,
         large_int,
@@ -345,6 +358,7 @@ def map_coordinates(
         order=order,
         integer_output=integer_output,
         nprepad=nprepad,
+        batch_axes=batch_axes,
     )
     kern(filtered, coordinates, ret)
     return ret
