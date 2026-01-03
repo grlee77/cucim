@@ -1148,7 +1148,7 @@ def warp(
     prefilter = order > 1
 
     ndi_mode = _to_ndimage_mode(mode)
-    # print(f"warp: {batch_axes=}")
+
     warped = ndi.map_coordinates(
         image,
         coords,
