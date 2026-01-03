@@ -377,7 +377,7 @@ def map_coordinates(
     )
     large_int = max(math.prod(input.shape), coordinates.shape[0]) > 1 << 31
 
-    kern = _interp_kernels._get_map_kernel(
+    kern_info = _interp_kernels._get_map_kernel(
         input.ndim,
         large_int,
         yshape=coordinates.shape[1:],
@@ -388,7 +388,10 @@ def map_coordinates(
         nprepad=nprepad,
         batch_axes=batch_axes,
     )
-    kern(filtered, coordinates, ret)
+    if kern_info.size is not None:
+        kern_info.kernel(filtered, coordinates, ret, size=kern_info.size)
+    else:
+        kern_info.kernel(filtered, coordinates, ret)
     return ret
 
 
@@ -554,7 +557,7 @@ def affine_transform(
 
         offset = cupy.asarray(offset, dtype=cupy.float64)
         offset = -offset / matrix
-        kern = _interp_kernels._get_zoom_shift_kernel(
+        kern_info = _interp_kernels._get_zoom_shift_kernel(
             ndim,
             large_int,
             output_shape,
@@ -565,7 +568,12 @@ def affine_transform(
             nprepad=nprepad,
             batch_axes=batch_axes,
         )
-        kern(filtered, offset, matrix, output)
+        if kern_info.size is not None:
+            kern_info.kernel(
+                filtered, offset, matrix, output, size=kern_info.size
+            )
+        else:
+            kern_info.kernel(filtered, offset, matrix, output)
     else:
         # identify batch axes where the row is an identity row with zero offset
         # i.e., matrix[j, j] == 1, matrix[j, k] == 0 for k != j, and offset[j] == 0
@@ -584,7 +592,7 @@ def affine_transform(
             input, prefilter, mode, cval, order, batch_axes=batch_axes
         )
 
-        kern = _interp_kernels._get_affine_kernel(
+        kern_info = _interp_kernels._get_affine_kernel(
             ndim,
             large_int,
             output_shape,
@@ -598,7 +606,10 @@ def affine_transform(
         m = cupy.zeros((ndim, ndim + 1), dtype=cupy.float64)
         m[:, :-1] = matrix
         m[:, -1] = cupy.asarray(offset, dtype=cupy.float64)
-        kern(filtered, m, output)
+        if kern_info.size is not None:
+            kern_info.kernel(filtered, m, output, size=kern_info.size)
+        else:
+            kern_info.kernel(filtered, m, output)
     return output
 
 
@@ -812,7 +823,7 @@ def shift(
             input, prefilter, mode, cval, order, batch_axes=batch_axes
         )
 
-        kern = _interp_kernels._get_shift_kernel(
+        kern_info = _interp_kernels._get_shift_kernel(
             input.ndim,
             large_int,
             input.shape,
@@ -828,7 +839,10 @@ def shift(
             raise ValueError("shift must be 1d")
         if shift.size != filtered.ndim:
             raise ValueError("len(shift) must equal input.ndim")
-        kern(filtered, shift, output)
+        if kern_info.size is not None:
+            kern_info.kernel(filtered, shift, output, size=kern_info.size)
+        else:
+            kern_info.kernel(filtered, shift, output)
     return output
 
 
@@ -969,7 +983,7 @@ def zoom(
             input, prefilter, mode, cval, order, batch_axes=batch_axes
         )
 
-        kern = _interp_kernels._get_zoom_kernel(
+        kern_info = _interp_kernels._get_zoom_kernel(
             input.ndim,
             large_int,
             output_shape,
@@ -981,5 +995,8 @@ def zoom(
             batch_axes=batch_axes,
         )
         zoom = cupy.asarray(zoom, dtype=cupy.float64)
-        kern(filtered, zoom, output)
+        if kern_info.size is not None:
+            kern_info.kernel(filtered, zoom, output, size=kern_info.size)
+        else:
+            kern_info.kernel(filtered, zoom, output)
     return output
