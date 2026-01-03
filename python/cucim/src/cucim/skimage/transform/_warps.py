@@ -17,7 +17,6 @@ from .._shared.utils import (
     safe_as_int,
     warn,
 )
-from .._vendored import pad
 from ..measure import block_reduce
 from ._geometric import (
     AffineTransform,
@@ -1352,6 +1351,87 @@ def warp_polar(
     return warped
 
 
+@cp.memoize(for_each_device=True)
+def _get_local_mean_weights_kernel(grid_mode):
+    """Get a kernel for computing local mean weights."""
+    if grid_mode:
+        # grid_mode=True: breaks are evenly spaced
+        # old_breaks[k] = k, new_breaks[k] = k * old_size / new_size
+        # Row sum is always old_size / new_size, so we can normalize directly
+        return cp.ElementwiseKernel(
+            "int32 old_size, float64 scale",
+            "W weights",
+            """
+            // For 2D C-contiguous array of shape (new_size, old_size):
+            // row = i / old_size, col = i % old_size
+            int row = i / old_size;
+            int col = i % old_size;
+
+            // new_breaks[row] = row * scale, new_breaks[row+1] = (row+1) * scale
+            // old_breaks[col] = col, old_breaks[col+1] = col + 1
+            double new_lo = row * scale;
+            double new_hi = (row + 1) * scale;
+            double old_lo = col;
+            double old_hi = col + 1;
+
+            double upper = (new_hi < old_hi) ? new_hi : old_hi;
+            double lower = (new_lo > old_lo) ? new_lo : old_lo;
+            double w = upper - lower;
+
+            // Normalize by row sum (which equals scale for grid_mode)
+            weights = (W)((w > 0) ? w / scale : 0);
+            """,
+            "local_mean_weights_grid",
+        )
+    else:
+        # grid_mode=False: more complex break computation
+        # Need two-pass: compute unnormalized, then normalize
+        return cp.ElementwiseKernel(
+            "int32 new_size, int32 old_size, float64 old, float64 val, float64 step",
+            "W weights",
+            """
+            // For 2D C-contiguous array of shape (new_size, old_size):
+            // row = i / old_size, col = i % old_size
+            int row = i / old_size;
+            int col = i % old_size;
+
+            // Compute old_breaks[col] and old_breaks[col+1]
+            // old_breaks = [0, 0.5, 1.5, ..., old-0.5, old]
+            double old_lo, old_hi;
+            if (col == 0) {
+                old_lo = 0.0;
+            } else {
+                old_lo = 0.5 + (col - 1);
+            }
+            if (col == old_size - 1) {
+                old_hi = old;
+            } else {
+                old_hi = 0.5 + col;
+            }
+
+            // Compute new_breaks[row] and new_breaks[row+1]
+            // new_breaks = [0, val, val+step, ..., old-val, old]
+            double new_lo, new_hi;
+            if (row == 0) {
+                new_lo = 0.0;
+            } else {
+                new_lo = val + (row - 1) * step;
+            }
+            if (row == new_size - 1) {
+                new_hi = old;
+            } else {
+                new_hi = val + row * step;
+            }
+
+            double upper = (new_hi < old_hi) ? new_hi : old_hi;
+            double lower = (new_lo > old_lo) ? new_lo : old_lo;
+            double w = upper - lower;
+            weights = (W)((w > 0) ? w : 0);
+            """,
+            "local_mean_weights_pixel",
+        )
+
+
 def _local_mean_weights(old_size, new_size, grid_mode, dtype):
     """Create a 2D weight matrix for resizing with the local mean.
 
@@ -1373,33 +1453,23 @@ def _local_mean_weights(old_size, new_size, grid_mode, dtype):
         Rows sum to 1.
 
     """
+    weights = cp.empty((new_size, old_size), dtype=dtype)
+    kern = _get_local_mean_weights_kernel(grid_mode)
+
     if grid_mode:
-        old_breaks = cp.linspace(0, old_size, num=old_size + 1, dtype=dtype)
-        new_breaks = cp.linspace(0, old_size, num=new_size + 1, dtype=dtype)
+        scale = old_size / new_size
+        kern(old_size, scale, weights)
     else:
         old, new = old_size - 1, new_size - 1
-        old_breaks = pad(
-            cp.linspace(0.5, old - 0.5, old, dtype=dtype),
-            1,
-            "constant",
-            constant_values=(0, old),
-        )
         if new == 0:
             val = np.inf
+            step = 0.0
         else:
             val = 0.5 * old / new
-        new_breaks = pad(
-            cp.linspace(val, old - val, new, dtype=dtype),
-            1,
-            "constant",
-            constant_values=(0, old),
-        )
-
-    upper = cp.minimum(new_breaks[1:, np.newaxis], old_breaks[np.newaxis, 1:])
-    lower = cp.maximum(new_breaks[:-1, np.newaxis], old_breaks[np.newaxis, :-1])
-
-    weights = cp.maximum(upper - lower, 0)
-    weights /= weights.sum(axis=1, keepdims=True)
+            step = (old - 2 * val) / (new - 1) if new > 1 else 0.0
+        kern(new_size, old_size, float(old), val, step, weights)
+        # Normalize rows (grid_mode=False doesn't have constant row sum)
+        weights /= weights.sum(axis=1, keepdims=True)
 
     return weights
 
