@@ -235,7 +235,7 @@ def _check_coordinates(coordinates, order, allow_float32=True):
     return coordinates
 
 
-def _prepad_for_spline_filter(input, mode, cval):
+def _prepad_for_spline_filter(input, mode, cval, batch_axes=None):
     if mode in ["nearest", "grid-constant"]:
         # these modes need padding to get accurate boundary values
         npad = 12  # empirical factor chosen by SciPy
@@ -243,14 +243,22 @@ def _prepad_for_spline_filter(input, mode, cval):
             kwargs = dict(mode="constant", constant_values=cval)
         else:
             kwargs = dict(mode="edge")
-        padded = cupy.pad(input, npad, **kwargs)
+        if batch_axes:
+            # Only pad non-batch axes
+            pad_width = [
+                (0, 0) if axis in batch_axes else (npad, npad)
+                for axis in range(input.ndim)
+            ]
+        else:
+            pad_width = npad
+        padded = cupy.pad(input, pad_width, **kwargs)
     else:
         npad = 0
         padded = input
     return padded, npad
 
 
-def _filter_input(image, prefilter, mode, cval, order):
+def _filter_input(image, prefilter, mode, cval, order, batch_axes=None):
     """Perform spline prefiltering when needed.
 
     Spline orders > 1 need a prefiltering stage to preserve resolution.
@@ -259,12 +267,29 @@ def _filter_input(image, prefilter, mode, cval, order):
     prepadding of the input with cupy.pad is used to maintain accuracy.
     ``npad`` is an integer corresponding to the amount of padding at each edge
     of the array.
+
+    Parameters
+    ----------
+    batch_axes : tuple of int, optional
+        Axes that should not be prefiltered (identity/batch dimensions).
     """
     if not prefilter or order < 2:
         return (cupy.ascontiguousarray(image), 0)
-    padded, npad = _prepad_for_spline_filter(image, mode, cval)
+    padded, npad = _prepad_for_spline_filter(image, mode, cval, batch_axes)
     float_dtype = cupy.promote_types(image.dtype, cupy.float32)
-    filtered = spline_filter(padded, order, output=float_dtype, mode=mode)
+
+    if batch_axes:
+        # Only filter along non-batch axes, following spline_filter's pattern
+        x = padded
+        temp = padded.astype(float_dtype, copy=True)
+        for axis in range(image.ndim):
+            if axis not in batch_axes:
+                spline_filter1d(x, order, axis, output=temp, mode=mode)
+                x = temp
+        filtered = temp
+    else:
+        filtered = spline_filter(padded, order, output=float_dtype, mode=mode)
+
     return cupy.ascontiguousarray(filtered), npad
 
 
@@ -342,17 +367,20 @@ def map_coordinates(
     if input.dtype.kind in "iu":
         input = input.astype(cupy.float32)
     coordinates = _check_coordinates(coordinates, order)
-    filtered, nprepad = _filter_input(input, prefilter, mode, cval, order)
-    large_int = max(math.prod(input.shape), coordinates.shape[0]) > 1 << 31
 
     # convert batch_axes to tuple for hashing in memoized kernel getter
     if batch_axes is not None:
         batch_axes = tuple(batch_axes)
 
+    filtered, nprepad = _filter_input(
+        input, prefilter, mode, cval, order, batch_axes=batch_axes
+    )
+    large_int = max(math.prod(input.shape), coordinates.shape[0]) > 1 << 31
+
     kern = _interp_kernels._get_map_kernel(
         input.ndim,
         large_int,
-        yshape=coordinates.shape,
+        yshape=coordinates.shape[1:],
         mode=mode,
         cval=cval,
         order=order,

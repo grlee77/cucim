@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 import math
@@ -942,6 +942,7 @@ def warp(
     cval=0.0,
     clip=None,
     preserve_range=False,
+    batch_axes=None,
 ):
     """Warp an image according to a given coordinate transformation.
 
@@ -1012,7 +1013,12 @@ def warp(
         image is converted according to the conventions of `img_as_float`.
         Also see
         https://scikit-image.org/docs/dev/user_guide/data_types.html
-
+    batch_axes (tuple of int, optional): Axes along which the coordinates
+        represent an identity mapping (i.e., output index equals input
+        coordinate). For these axes, interpolation is skipped and the
+        coordinate values in the ``coordinates`` array are ignored.
+        This can improve performance when only a subset of dimensions
+        require interpolation.
     Returns
     -------
     warped : double ndarray
@@ -1143,6 +1149,7 @@ def warp(
     prefilter = order > 1
 
     ndi_mode = _to_ndimage_mode(mode)
+    # print(f"warp: {batch_axes=}")
     warped = ndi.map_coordinates(
         image,
         coords,
@@ -1150,6 +1157,7 @@ def warp(
         mode=ndi_mode,
         order=order,
         cval=cval,
+        batch_axes=batch_axes,
     )
 
     _clip_warp_output(image, warped, mode, cval, order, clip)
@@ -1326,8 +1334,19 @@ def warp_polar(
     k_angle = height / (2 * np.pi)
     warp_args = {"k_angle": k_angle, "k_radius": k_radius, "center": center}
 
+    if multichannel:
+        channel_axis = channel_axis % image.ndim
+        batch_axes = (channel_axis,)
+    else:
+        batch_axes = ()
+
     warped = warp(
-        image, map_func, map_args=warp_args, output_shape=output_shape, **kwargs
+        image,
+        map_func,
+        map_args=warp_args,
+        output_shape=output_shape,
+        batch_axes=batch_axes,
+        **kwargs,
     )
 
     return warped
