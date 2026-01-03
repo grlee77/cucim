@@ -536,7 +536,6 @@ def affine_transform(
     output = _util._get_output(output, input, shape=output_shape)
     if input.dtype.kind in "iu":
         input = input.astype(cupy.float32)
-    filtered, nprepad = _filter_input(input, prefilter, mode, cval, order)
 
     integer_output = output.dtype.kind in "iu"
     _util._check_cval(mode, cval, integer_output)
@@ -547,6 +546,10 @@ def affine_transform(
         matrix_host = cupy.asnumpy(matrix)
         batch_axes = tuple(
             j for j in range(ndim) if matrix_host[j] == 1.0 and offset[j] == 0.0
+        )
+
+        filtered, nprepad = _filter_input(
+            input, prefilter, mode, cval, order, batch_axes=batch_axes
         )
 
         offset = cupy.asarray(offset, dtype=cupy.float64)
@@ -575,6 +578,10 @@ def affine_transform(
                 and all(matrix_host[j, k] == 0.0 for k in range(ndim) if k != j)
                 and offset[j] == 0.0
             )
+        )
+
+        filtered, nprepad = _filter_input(
+            input, prefilter, mode, cval, order, batch_axes=batch_axes
         )
 
         kern = _interp_kernels._get_affine_kernel(
@@ -794,13 +801,16 @@ def shift(
         output = _util._get_output(output, input)
         if input.dtype.kind in "iu":
             input = input.astype(cupy.float32)
-        filtered, nprepad = _filter_input(input, prefilter, mode, cval, order)
         integer_output = output.dtype.kind in "iu"
         _util._check_cval(mode, cval, integer_output)
         large_int = math.prod(input.shape) > 1 << 31
 
         # identify batch axes where shift == 0 (no interpolation needed)
         batch_axes = tuple(j for j, s in enumerate(shift) if s == 0)
+
+        filtered, nprepad = _filter_input(
+            input, prefilter, mode, cval, order, batch_axes=batch_axes
+        )
 
         kern = _interp_kernels._get_shift_kernel(
             input.ndim,
@@ -941,7 +951,6 @@ def zoom(
         output = _util._get_output(output, input, shape=output_shape)
         if input.dtype.kind in "iu":
             input = input.astype(cupy.float32)
-        filtered, nprepad = _filter_input(input, prefilter, mode, cval, order)
         integer_output = output.dtype.kind in "iu"
         _util._check_cval(mode, cval, integer_output)
         large_int = (
@@ -954,6 +963,10 @@ def zoom(
             j
             for j, (in_s, out_s) in enumerate(zip(input.shape, output_shape))
             if in_s == out_s
+        )
+
+        filtered, nprepad = _filter_input(
+            input, prefilter, mode, cval, order, batch_axes=batch_axes
         )
 
         kern = _interp_kernels._get_zoom_kernel(
