@@ -678,8 +678,8 @@ def _generate_interp_custom(
             if mode == "wrap":
                 ops.append(
                     f"""
-                double dcoordf = c_{j};
-                double dcoordc = c_{j} + 1;"""
+                double dcoordf_{j} = c_{j};
+                double dcoordc_{j} = c_{j} + 1;"""
                 )
             else:
                 # handle boundaries for extension modes.
@@ -691,7 +691,7 @@ def _generate_interp_custom(
 
             if mode != "constant":
                 if mode == "wrap":
-                    ixvar = "dcoordf"
+                    ixvar = f"dcoordf_{j}"
                     float_ix = True
                 else:
                     ixvar = f"cf_bounded_{j}"
@@ -702,7 +702,7 @@ def _generate_interp_custom(
                     )
                 )
 
-                ixvar = "dcoordc" if mode == "wrap" else f"cc_bounded_{j}"
+                ixvar = f"dcoordc_{j}" if mode == "wrap" else f"cc_bounded_{j}"
                 ops.append(
                     _util._generate_boundary_condition_ops(
                         mode, ixvar, f"xsize_{j}", int_t, float_ix
@@ -711,8 +711,8 @@ def _generate_interp_custom(
                 if mode == "wrap":
                     ops.append(
                         f"""
-                    {int_t} cf_bounded_{j} = ({int_t})floor(dcoordf);;
-                    {int_t} cc_bounded_{j} = ({int_t})floor(dcoordf + 1);;
+                    {int_t} cf_bounded_{j} = ({int_t})floor(dcoordf_{j});;
+                    {int_t} cc_bounded_{j} = ({int_t})floor(dcoordf_{j} + 1);;
                     """
                     )
 
@@ -854,8 +854,8 @@ def _generate_interp_custom(
 
             # get starting coordinate for spline interpolation along axis j
             if mode in ["wrap"]:
-                ops.append(f"double dcoord = c_{j};")
-                coord_var = "dcoord"
+                ops.append(f"double dcoord_{j} = c_{j};")
+                coord_var = f"dcoord_{j}"
                 ops.append(
                     _util._generate_boundary_condition_ops(
                         mode, coord_var, f"xsize_{j}", int_t, True
