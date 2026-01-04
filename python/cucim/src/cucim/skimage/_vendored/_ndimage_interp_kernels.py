@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 
 import math
-from collections import namedtuple
+from typing import NamedTuple
 
 import cupy
 import numpy
@@ -15,10 +15,13 @@ from cucim.skimage._vendored import (
     _ndimage_util as _util,
 )
 
-# Kernel info returned by kernel getter functions
-# - kernel: the CuPy ElementwiseKernel
-# - size: the number of kernel invocations (None means use output array size)
-KernelInfo = namedtuple("KernelInfo", ["kernel", "size"])
+
+class KernelInfo(NamedTuple):
+    """Kernel info returned by kernel getter functions."""
+
+    kernel: cupy.ElementwiseKernel
+    size: int | None  # None means use output array size
+
 
 math_constants_preamble = r"""
 // workaround for HIP: line begins with #include
@@ -72,7 +75,7 @@ def _get_coord_map(ndim, nprepad=0, batch_axes=None, loop_batch_axis=False):
     ]
     if non_batch_axes_to_process:
         if loop_batch_axis:
-            # When looping, ncoords = full output size = spatial_size * batch_size
+            # When looping, ncoords =  spatial_size * batch_size
             ops.append("ptrdiff_t ncoords = _ind.size() * batch_size;")
         else:
             ops.append("ptrdiff_t ncoords = _ind.size();")
@@ -1056,7 +1059,8 @@ def _get_map_kernel(
     in_params = "raw X x, raw W coords"
 
     # Optimize for contiguous batch axis at the end
-    loop_batch_axis = batch_axes == (ndim - 1,)
+    # Only enable when there's at least one spatial axis (ndim > 1)
+    loop_batch_axis = batch_axes == (ndim - 1,) and ndim > 1
     if loop_batch_axis:
         out_params = "raw Y y"
         size = math.prod(yshape[:-1])
@@ -1103,7 +1107,8 @@ def _get_shift_kernel(
     in_params = "raw X x, raw W shift"
 
     # Optimize for contiguous batch axis at the end
-    loop_batch_axis = batch_axes == (ndim - 1,)
+    # Only enable when there's at least one spatial axis (ndim > 1)
+    loop_batch_axis = batch_axes == (ndim - 1,) and ndim > 1
     if loop_batch_axis:
         out_params = "raw Y y"
         size = math.prod(yshape[:-1])
@@ -1147,7 +1152,8 @@ def _get_zoom_shift_kernel(
     in_params = "raw X x, raw W shift, raw W zoom"
 
     # Optimize for contiguous batch axis at the end
-    loop_batch_axis = batch_axes == (ndim - 1,)
+    # Only enable when there's at least one spatial axis (ndim > 1)
+    loop_batch_axis = batch_axes == (ndim - 1,) and ndim > 1
     if loop_batch_axis:
         out_params = "raw Y y"
         size = math.prod(yshape[:-1])
@@ -1195,7 +1201,8 @@ def _get_zoom_kernel(
     in_params = "raw X x, raw W zoom"
 
     # Optimize for contiguous batch axis at the end
-    loop_batch_axis = batch_axes == (ndim - 1,)
+    # Only enable when there's at least one spatial axis (ndim > 1)
+    loop_batch_axis = batch_axes == (ndim - 1,) and ndim > 1
     if loop_batch_axis:
         out_params = "raw Y y"
         size = math.prod(yshape[:-1])
@@ -1238,7 +1245,8 @@ def _get_affine_kernel(
     in_params = "raw X x, raw W mat"
 
     # Optimize for contiguous batch axis at the end
-    loop_batch_axis = batch_axes == (ndim - 1,)
+    # Only enable when there's at least one spatial axis (ndim > 1)
+    loop_batch_axis = batch_axes == (ndim - 1,) and ndim > 1
     if loop_batch_axis:
         out_params = "raw Y y"
         size = math.prod(yshape[:-1])
