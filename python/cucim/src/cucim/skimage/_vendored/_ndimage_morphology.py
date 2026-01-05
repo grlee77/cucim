@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Infrastructure, Inc.
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Networks, Inc.
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 
 import math
@@ -1148,8 +1148,10 @@ def grey_erosion(
         axes (tuple of int or None): The axes over which to apply the filter.
             If None, `input` is filtered along all axes. If an `origin` tuple
             is provided, its length must match the number of axes.
-        mask (cupy.ndarray or None, optional): If provided, filtering will only
-            apply to the regions where the mask is True.
+        mask (cupy.ndarray or None): If provided, only pixels where mask is
+            True will be filtered. Pixels where mask is False will retain
+            their original values. This is useful for NaN-safe filtering
+            where mask can be set to ``~cupy.isnan(input)``.
 
     Returns:
         cupy.ndarray: The result of greyscale erosion.
@@ -1267,8 +1269,10 @@ def grey_dilation(
         axes (tuple of int or None): The axes over which to apply the filter.
             If None, `input` is filtered along all axes. If an `origin` tuple
             is provided, its length must match the number of axes.
-        mask (cupy.ndarray or None, optional): If provided, filtering will only
-            apply to the regions where the mask is True.
+        mask (cupy.ndarray or None): If provided, only pixels where mask is
+            True will be filtered. Pixels where mask is False will retain
+            their original values. This is useful for NaN-safe filtering
+            where mask can be set to ``~cupy.isnan(input)``.
 
     Returns:
         cupy.ndarray: The result of greyscale dilation.

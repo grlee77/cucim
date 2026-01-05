@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Infrastructure, Inc.
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Networks, Inc.
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 
 """A vendored subset of cupyx.scipy.ndimage._filters"""
@@ -1599,11 +1599,13 @@ def _min_or_max_filter(
         # Determine structure for dilation based on filter size
         if sizes is not None:
             # Separable filter: use sizes directly
-            structure = sizes
+            dilation_structure = sizes
         else:
             # Non-separable filter: use footprint shape
-            structure = ftprnt.shape
-        dilated_mask = _dilate_mask(original_mask, structure, axes=axes)
+            dilation_structure = ftprnt.shape
+        dilated_mask = _dilate_mask(
+            original_mask, dilation_structure, axes=axes
+        )
     elif mask is not None and skip_mask_dilation_and_restoration:
         # Use the mask as-is (assume it's already dilated)
         dilated_mask = cupy.asarray(mask, dtype=bool)
