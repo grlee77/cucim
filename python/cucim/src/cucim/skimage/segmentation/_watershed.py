@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Watershed segmentation using cellular automaton algorithm.
 
 This module implements the CA-watershed algorithm based on:
@@ -13,6 +16,11 @@ In Pattern Recognition (ICPR), 2014 22nd International Conference on.
 """
 
 import cupy as cp
+import numpy as np
+from cupyx.scipy import ndimage as ndi
+
+from ..morphology.extrema import local_minima
+from ..util._regular_grid import regular_seeds
 
 
 # CUDA kernel for initialization (standard watershed)
@@ -908,14 +916,17 @@ def _validate_inputs(image, markers, mask, connectivity):
     ----------
     image : cupy.ndarray
         Input image (gradient magnitude or similar), 2D or 3D
-    markers : cupy.ndarray
-        Marker array with positive integers for seeds
+    markers : int, cupy.ndarray, or None
+        The marker image. If None, markers are determined as the local
+        minima of the image. If int, that many regularly-spaced markers
+        are generated. If array, used as-is.
     mask : cupy.ndarray or None
         Optional mask array
     connectivity : int
         Neighborhood connectivity as integer.
         For 2D: 1 (4-connectivity) or 2 (8-connectivity)
-        For 3D: 1 (6-connectivity), 2 (18-connectivity), or 3 (26-connectivity)
+        For 3D: 1 (6-connectivity), 2 (18-connectivity), or 3
+        (26-connectivity)
 
     Returns
     -------
@@ -935,10 +946,11 @@ def _validate_inputs(image, markers, mask, connectivity):
     ndim = image.ndim
 
     # Check connectivity - must be an integer
-    if not isinstance(connectivity, (int, cp.integer)):
+    if not isinstance(connectivity, (int, np.integer, cp.integer)):
         raise TypeError(
             f"connectivity must be an integer, got {type(connectivity)}"
         )
+    connectivity = int(connectivity)
 
     # Check connectivity value based on dimensionality
     if ndim == 2:
@@ -957,36 +969,55 @@ def _validate_inputs(image, markers, mask, connectivity):
     if image.dtype != cp.float32:
         image = image.astype(cp.float32)
 
-    # Check markers
-    if markers is None:
-        raise ValueError("markers must be provided (cannot be None)")
-
-    if not isinstance(markers, cp.ndarray):
-        markers = cp.asarray(markers)
-
-    if markers.shape != image.shape:
-        raise ValueError(
-            f"markers shape {markers.shape} must match "
-            f"image shape {image.shape}"
-        )
-
-    # Convert markers to int32
-    if markers.dtype != cp.int32:
-        markers = markers.astype(cp.int32)
-
-    # Check mask
+    # Validate mask before markers (needed for marker generation)
+    n_pixels = image.size
     if mask is not None:
         if not isinstance(mask, cp.ndarray):
             mask = cp.asarray(mask)
 
         if mask.shape != image.shape:
             raise ValueError(
-                f"mask shape {mask.shape} must match "
+                f"mask shape {mask.shape} must match image shape {image.shape}"
+            )
+
+        mask = mask.astype(cp.uint8)
+        n_pixels = int(cp.sum(mask))
+
+    # Handle markers
+    if markers is None:
+        # Auto-detect markers from local minima (matching scikit-image)
+        markers_bool = local_minima(image, connectivity=connectivity)
+        if mask is not None:
+            markers_bool = markers_bool * mask.astype(bool)
+        footprint = ndi.generate_binary_structure(ndim, connectivity)
+        markers = ndi.label(markers_bool, structure=footprint)[0]
+        markers = markers.astype(cp.int32)
+    elif not isinstance(markers, (cp.ndarray, np.ndarray, list, tuple)):
+        # Assume int: generate that many regularly-spaced markers
+        n_markers = int(markers)
+        # Scale n_markers by fraction of masked pixels (like scikit-image)
+        markers = regular_seeds(
+            image.shape, int(n_markers / (n_pixels / image.size))
+        )
+        if mask is not None:
+            markers *= mask.astype(markers.dtype)
+        markers = markers.astype(cp.int32)
+    else:
+        if not isinstance(markers, cp.ndarray):
+            markers = cp.asarray(markers)
+
+        if mask is not None:
+            markers = markers * mask.astype(markers.dtype)
+
+        if markers.shape != image.shape:
+            raise ValueError(
+                f"markers shape {markers.shape} must match "
                 f"image shape {image.shape}"
             )
 
-        # Convert mask to uint8
-        mask = mask.astype(cp.uint8)
+        # Convert markers to int32
+        if markers.dtype != cp.int32:
+            markers = markers.astype(cp.int32)
 
     return image, markers, mask, connectivity
 
@@ -1013,13 +1044,17 @@ def watershed(
         Input image (typically a gradient magnitude or distance transform).
         Lower values have higher priority for watershed expansion.
         Supports both 2D and 3D images.
-    markers : cupy.ndarray of int, shape (M, N) or (D, M, N)
-        Array of markers (seeds) for the watershed. Non-zero values
-        represent different regions. Zero values are the areas to be
-        segmented. Each unique non-zero integer (positive or negative)
-        represents a different basin to grow from. Negative markers are
-        supported for compatibility with scikit-image (e.g., -1 for
-        background regions).
+    markers : int, cupy.ndarray of int, or None, optional
+        The desired number of basins, or an array marking the basins with
+        the values to be assigned in the label matrix. Zero means not a
+        marker. If None (default), markers are determined as the local
+        minima of the image, using
+        :func:`cucim.skimage.morphology.local_minima` followed by
+        :func:`cupyx.scipy.ndimage.label` (with the same given
+        `connectivity`). If an int, that many regularly-spaced markers
+        are generated using :func:`cucim.skimage.util.regular_seeds`.
+        If an array, non-zero values represent different regions to grow
+        from. Negative markers are supported (e.g., -1 for background).
     connectivity : int, optional
         Neighborhood connectivity as integer:
         - For 2D images:
