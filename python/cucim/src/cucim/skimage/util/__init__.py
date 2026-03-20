@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 """Generic utilities.
@@ -24,6 +24,7 @@ from .dtype import (
 )
 from .noise import random_noise
 from .shape import view_as_blocks, view_as_windows
+from ._regular_grid import regular_grid, regular_seeds
 
 __all__ = [
     "compare_images",
@@ -41,5 +42,7 @@ __all__ = [
     "crop",
     "map_array",
     "random_noise",
+    "regular_grid",
+    "regular_seeds",
     "invert",
 ]
