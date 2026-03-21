@@ -24,6 +24,21 @@ from cupyx.scipy import ndimage as ndi
 from ..morphology.extrema import local_minima
 from ..util._regular_grid import regular_seeds
 
+# Preamble for CUDA kernels that use fixed-width integer types (libcudacxx)
+_KERNEL_PREAMBLE = "#include <cuda/std/cstdint>\n"
+
+# Mapping from CuPy/NumPy integer dtype to fixed-width C type for kernel codegen
+_DTYPE_TO_CTYPE = {
+    cp.dtype("int8"): "cuda::std::int8_t",
+    cp.dtype("uint8"): "cuda::std::uint8_t",
+    cp.dtype("int16"): "cuda::std::int16_t",
+    cp.dtype("uint16"): "cuda::std::uint16_t",
+    cp.dtype("int32"): "cuda::std::int32_t",
+    cp.dtype("uint32"): "cuda::std::uint32_t",
+    cp.dtype("int64"): "cuda::std::int64_t",
+    cp.dtype("uint64"): "cuda::std::uint64_t",
+}
+
 
 def _get_neighbor_offsets_1d():
     """Get 1D neighbor offsets (left and right)."""
@@ -241,7 +256,7 @@ def _generate_neighbor_nidx(ndim, dim_names, offsets):
 
 # CUDA kernel for initialization (standard watershed)
 @cp.memoize(for_each_device=True)
-def _get_watershed_init_kernel(use_age=False):
+def _get_watershed_init_kernel(use_age=False, label_ctype="int32_t"):
     """Get initialization kernel for CA-watershed.
 
     This kernel initializes the label, state, and priority arrays
@@ -253,13 +268,16 @@ def _get_watershed_init_kernel(use_age=False):
     age_init_mask = "age[idx] = 0;" if use_age else ""
     age_init_marker = "age[idx] = 0;" if use_age else ""
     age_init_unlabeled = "age[idx] = 2147483647;" if use_age else ""
+    L = label_ctype
 
-    kernel_code = f"""
+    kernel_code = (
+        _KERNEL_PREAMBLE
+        + f"""
 extern "C" __global__
 void watershed_init(
     const float* image,
-    const int* markers,
-    int* labels,
+    const {L}* markers,
+    {L}* labels,
     unsigned char* state,
     float* priority,
     {age_params}
@@ -271,27 +289,22 @@ void watershed_init(
 
     if (idx >= size) return;
 
-    // Check if pixel is in the mask
     if (has_mask && !mask[idx]) {{
         labels[idx] = 0;
-        state[idx] = 0;  // WATERSHED (background)
+        state[idx] = 0;
         priority[idx] = 0.0f;
         {age_init_mask}
         return;
     }}
 
-    // Initialize from markers
-    int marker_label = markers[idx];
+    {L} marker_label = markers[idx];
 
     if (marker_label != 0) {{
-        // Seed pixel - already labeled (can be positive or negative)
-        // Priority is the image value at the marker (like scikit-image)
         labels[idx] = marker_label;
         state[idx] = 1;  // LABELED (will not change)
         priority[idx] = image[idx];
         {age_init_marker}
     }} else {{
-        // Unlabeled pixel - to be processed
         labels[idx] = 0;
         state[idx] = 2;  // UNLABELED (needs processing)
         priority[idx] = 3.4028235e+38f;  // FLT_MAX
@@ -299,11 +312,14 @@ void watershed_init(
     }}
 }}
 """
+    )
     return cp.RawKernel(kernel_code, "watershed_init")
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
+def _get_watershed_step_kernel(
+    ndim, connectivity=1, use_age=False, label_ctype="int32_t"
+):
     """Get iteration kernel for nD CA-watershed.
 
     This kernel uses image intensity as priority (like scikit-image).
@@ -346,6 +362,7 @@ def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
         better_path_cmp = "if (new_priority < best_priority)"
         age_update = ""
 
+    L = label_ctype
     neighbor_code = ""
     for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
         neighbor_code += f"""
@@ -353,7 +370,7 @@ def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
         {nc_decl_str}
         if ({bounds_str}) {{
             int nidx = {nidx_expr};
-            int nlabel = labels[nidx];
+            {L} nlabel = labels[nidx];
             float npriority = priority[nidx];
             {age_read}
 
@@ -389,11 +406,13 @@ def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
         better_path_final_cmp = "if (best_priority < priority[idx])"
         age_final_update = ""
 
-    kernel_code = f"""
+    kernel_code = (
+        _KERNEL_PREAMBLE
+        + f"""
 extern "C" __global__
 void watershed_step(
     const float* __restrict__ image,
-    int* __restrict__ labels,
+    {L}* __restrict__ labels,
     unsigned char* __restrict__ state,
     float* __restrict__ priority,
     {age_param}
@@ -410,7 +429,7 @@ void watershed_step(
 
     float best_priority = priority[idx];
     {age_best_init}
-    int best_label = 0;
+    {L} best_label = 0;
     int found_label = 0;
 
     {neighbor_code}
@@ -426,6 +445,7 @@ void watershed_step(
     }}
 }}
 """
+    )
 
     return cp.RawKernel(kernel_code, "watershed_step")
 
@@ -443,6 +463,7 @@ def _watershed_standard(
     threads_per_block,
     max_iterations,
     use_age=True,
+    label_dtype=cp.int32,
     **kwargs,
 ):
     """Run standard watershed algorithm (compactness=0).
@@ -450,8 +471,9 @@ def _watershed_standard(
     Uses image intensity as priority (like scikit-image) to produce
     regions that follow image gradients rather than compact shapes.
     """
-    # Initialize state arrays (as contiguous flat arrays)
-    labels = cp.zeros(size, dtype=cp.int32)
+    label_ctype = _DTYPE_TO_CTYPE[cp.dtype(label_dtype)]
+
+    labels = cp.zeros(size, dtype=label_dtype)
     state = cp.zeros(size, dtype=cp.uint8)
     priority = cp.zeros(size, dtype=cp.float32)
     changed = cp.zeros(1, dtype=cp.int32)
@@ -461,8 +483,9 @@ def _watershed_standard(
     else:
         age = None
 
-    # Initialize from markers
-    init_kernel = _get_watershed_init_kernel(use_age=use_age)
+    init_kernel = _get_watershed_init_kernel(
+        use_age=use_age, label_ctype=label_ctype
+    )
 
     init_args = [image_flat, markers.ravel(), labels, state, priority]
     if use_age:
@@ -475,9 +498,8 @@ def _watershed_standard(
         tuple(init_args),
     )
 
-    # Iteratively propagate labels using unified nD kernel
     step_kernel = _get_watershed_step_kernel(
-        ndim, connectivity, use_age=use_age
+        ndim, connectivity, use_age=use_age, label_ctype=label_ctype
     )
 
     # Kernel takes dimension sizes in C-order (same as image.shape)
@@ -510,7 +532,9 @@ HALO = 1  # Halo size (1 pixel for immediate neighbors)
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_block_async_kernel_2d(connectivity=1, inner_iterations=16):
+def _get_watershed_block_async_kernel_2d(
+    connectivity=1, inner_iterations=16, label_ctype="cuda::std::int32_t"
+):
     """Get block-asynchronous iteration kernel for 2D CA-watershed.
 
     This kernel uses shared memory tiling to reduce global memory traffic.
@@ -532,6 +556,7 @@ def _get_watershed_block_async_kernel_2d(connectivity=1, inner_iterations=16):
     kernel : cupy.RawKernel
         Compiled CUDA kernel
     """
+    L = label_ctype
     neighbors = _get_neighbor_offsets(2, connectivity)
 
     # Shared memory dimensions (tile + halo on each side)
@@ -548,7 +573,7 @@ def _get_watershed_block_async_kernel_2d(connectivity=1, inner_iterations=16):
                 int nsy = sy + ({dy});
                 int nsidx = nsy * {shared_w} + nsx;
 
-                int nlabel = s_labels[nsidx];
+                {L} nlabel = s_labels[nsidx];
                 float npriority = s_priority[nsidx];
 
                 // If neighbor has a label, it can propagate
@@ -569,11 +594,13 @@ def _get_watershed_block_async_kernel_2d(connectivity=1, inner_iterations=16):
             }}
 """
 
-    kernel_code = f"""
+    kernel_code = (
+        _KERNEL_PREAMBLE
+        + f"""
 extern "C" __global__
 void watershed_block_async_2d(
     const float* __restrict__ image,
-    int* __restrict__ labels,
+    {L}* __restrict__ labels,
     unsigned char* __restrict__ state,
     float* __restrict__ priority,
     int* __restrict__ global_changed,
@@ -582,7 +609,7 @@ void watershed_block_async_2d(
 ) {{
     // Shared memory for tile + halo
     // Layout: labels, state, priority, image
-    __shared__ int s_labels[{shared_w} * {shared_h}];
+    __shared__ {L} s_labels[{shared_w} * {shared_h}];
     __shared__ unsigned char s_state[{shared_w} * {shared_h}];
     __shared__ float s_priority[{shared_w} * {shared_h}];
     __shared__ float s_image[{shared_w} * {shared_h}];
@@ -792,7 +819,7 @@ void watershed_block_async_2d(
         // Only process unlabeled pixels in the main tile (not halo)
         if (s_state[sidx] == 2) {{
             float best_priority = s_priority[sidx];
-            int best_label = 0;
+            {L} best_label = 0;
             int found_label = 0;
 
             // Check all neighbors
@@ -836,7 +863,8 @@ void watershed_block_async_2d(
         atomicAdd(global_changed, s_changed);
     }}
 }}
-"""  # noqa: E501
+"""
+    )  # noqa: E501
 
     return cp.RawKernel(kernel_code, "watershed_block_async_2d")
 
@@ -854,6 +882,8 @@ def _watershed_standard_block_async(
     threads_per_block,
     max_iterations,
     inner_iterations=16,
+    label_dtype=cp.int32,
+    **kwargs,
 ):
     """Run standard watershed with block-asynchronous algorithm.
 
@@ -865,14 +895,14 @@ def _watershed_standard_block_async(
     inner_iterations : int
         Number of iterations per block before global sync. Default is 8.
     """
-    # Initialize state arrays (as contiguous flat arrays)
-    labels = cp.zeros(size, dtype=cp.int32)
+    label_ctype = _DTYPE_TO_CTYPE[cp.dtype(label_dtype)]
+
+    labels = cp.zeros(size, dtype=label_dtype)
     state = cp.zeros(size, dtype=cp.uint8)
     priority = cp.zeros(size, dtype=cp.float32)
     changed = cp.zeros(1, dtype=cp.int32)
 
-    # Initialize from markers (same as standard version)
-    init_kernel = _get_watershed_init_kernel()
+    init_kernel = _get_watershed_init_kernel(label_ctype=label_ctype)
 
     init_kernel(
         (blocks,),
@@ -889,9 +919,8 @@ def _watershed_standard_block_async(
         ),
     )
 
-    # Get block-async kernel
     step_kernel = _get_watershed_block_async_kernel_2d(
-        connectivity, inner_iterations
+        connectivity, inner_iterations, label_ctype=label_ctype
     )
 
     # Block configuration must match TILE_W x TILE_H
@@ -941,7 +970,7 @@ def _watershed_standard_block_async(
 # CUDA kernel for initialization (compact watershed)
 @cp.memoize(for_each_device=True)
 @cp.memoize(for_each_device=True)
-def _get_watershed_compact_init_kernel(ndim):
+def _get_watershed_compact_init_kernel(ndim, label_ctype="int32_t"):
     """Get initialization kernel for nD compact CA-watershed.
 
     This kernel initializes the label, state, priority, and source
@@ -949,6 +978,7 @@ def _get_watershed_compact_init_kernel(ndim):
     original marker location for each pixel (one int array per
     dimension), needed for Euclidean distance computation.
     """
+    L = label_ctype
     dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
     src_names = [f"source_{j}" for j in range(ndim)]
 
@@ -959,11 +989,13 @@ def _get_watershed_compact_init_kernel(ndim):
     )
     src_init_unlabeled = "\n        ".join(f"{s}[idx] = -1;" for s in src_names)
 
-    kernel_code = f"""
+    kernel_code = (
+        _KERNEL_PREAMBLE
+        + f"""
 extern "C" __global__
 void watershed_compact_init(
-    const int* markers,
-    int* labels,
+    const {L}* markers,
+    {L}* labels,
     unsigned char* state,
     float* priority,
     {src_params},
@@ -978,7 +1010,6 @@ void watershed_compact_init(
 
     {coord_code}
 
-    // Check if pixel is in the mask
     if (has_mask && !mask[idx]) {{
         labels[idx] = 0;
         state[idx] = 0;
@@ -987,7 +1018,7 @@ void watershed_compact_init(
         return;
     }}
 
-    int marker_label = markers[idx];
+    {L} marker_label = markers[idx];
 
     if (marker_label != 0) {{
         labels[idx] = marker_label;
@@ -1002,12 +1033,15 @@ void watershed_compact_init(
     }}
 }}
 """
+    )
     return cp.RawKernel(kernel_code, "watershed_compact_init")
 
 
 @cp.memoize(for_each_device=True)
 @cp.memoize(for_each_device=True)
-def _get_watershed_compact_step_kernel(ndim, connectivity=1):
+def _get_watershed_compact_step_kernel(
+    ndim, connectivity=1, label_ctype="int32_t"
+):
     """Get iteration kernel for nD compact CA-watershed.
 
     This kernel implements the compact watershed variant, which adds a
@@ -1030,6 +1064,7 @@ def _get_watershed_compact_step_kernel(ndim, connectivity=1):
     kernel : cupy.RawKernel
         Compiled CUDA kernel
     """  # noqa: E501
+    L = label_ctype
     dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
     neighbors = _get_neighbor_offsets(ndim, connectivity)
     neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
@@ -1043,16 +1078,13 @@ def _get_watershed_compact_step_kernel(ndim, connectivity=1):
     # Generate neighbor checking code
     neighbor_code = ""
     for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
-        # Read source coordinates from neighbor
         src_reads = "\n                ".join(
             f"int nsrc_{j} = {s}[nidx];" for j, s in enumerate(src_names)
         )
-        # Euclidean distance: sqrt(sum((c_j - nsrc_j)^2))
         dist_terms = " + ".join(f"d_{j} * d_{j}" for j in range(ndim))
         dist_decls = "\n                ".join(
             f"float d_{j} = (float)(c_{j} - nsrc_{j});" for j in range(ndim)
         )
-        # Update best source coordinates
         best_src_updates = "\n                    ".join(
             f"best_src_{j} = nsrc_{j};" for j in range(ndim)
         )
@@ -1062,7 +1094,7 @@ def _get_watershed_compact_step_kernel(ndim, connectivity=1):
         {nc_decl_str}
         if ({bounds_str}) {{
             int nidx = {nidx_expr};
-            int nlabel = labels[nidx];
+            {L} nlabel = labels[nidx];
 
             if (nlabel != 0) {{
                 {src_reads}
@@ -1088,16 +1120,17 @@ def _get_watershed_compact_step_kernel(ndim, connectivity=1):
     }}
 """
 
-    # Final update: write best source coordinates
     final_src_updates = "\n            ".join(
         f"{s}[idx] = best_src_{j};" for j, s in enumerate(src_names)
     )
 
-    kernel_code = f"""
+    kernel_code = (
+        _KERNEL_PREAMBLE
+        + f"""
 extern "C" __global__
 void watershed_compact_step(
     const float* __restrict__ image,
-    int* __restrict__ labels,
+    {L}* __restrict__ labels,
     unsigned char* __restrict__ state,
     float* __restrict__ priority,
     {src_params},
@@ -1114,7 +1147,7 @@ void watershed_compact_step(
     if (state[idx] != 2) return;
 
     float best_priority = priority[idx];
-    int best_label = 0;
+    {L} best_label = 0;
     {best_src_decls}
     int found_label = 0;
 
@@ -1131,6 +1164,7 @@ void watershed_compact_step(
     }}
 }}
 """
+    )
 
     return cp.RawKernel(kernel_code, "watershed_compact_step")
 
@@ -1148,6 +1182,7 @@ def _watershed_compact(
     blocks,
     threads_per_block,
     max_iterations,
+    label_dtype=cp.int32,
     **kwargs,
 ):
     """Run compact watershed algorithm (compactness > 0).
@@ -1155,18 +1190,19 @@ def _watershed_compact(
     This code path uses floating-point priorities that combine
     image values with Euclidean distance from the source marker.
     """
-    # Initialize state arrays (as contiguous flat arrays)
-    labels = cp.zeros(size, dtype=cp.int32)
+    label_ctype = _DTYPE_TO_CTYPE[cp.dtype(label_dtype)]
+
+    labels = cp.zeros(size, dtype=label_dtype)
     state = cp.zeros(size, dtype=cp.uint8)
     priority = cp.zeros(size, dtype=cp.float32)
     sources = [cp.zeros(size, dtype=cp.int32) for _ in range(ndim)]
     changed = cp.zeros(1, dtype=cp.int32)
 
-    # Dimension sizes in C-order (same as image.shape)
     dim_args = tuple(int(s) for s in image_shape)
 
-    # Initialize from markers
-    init_kernel = _get_watershed_compact_init_kernel(ndim)
+    init_kernel = _get_watershed_compact_init_kernel(
+        ndim, label_ctype=label_ctype
+    )
 
     init_args = [markers.ravel(), labels, state, priority]
     init_args.extend(sources)
@@ -1178,8 +1214,9 @@ def _watershed_compact(
         tuple(init_args),
     )
 
-    # Iteratively propagate labels
-    step_kernel = _get_watershed_compact_step_kernel(ndim, connectivity)
+    step_kernel = _get_watershed_compact_step_kernel(
+        ndim, connectivity, label_ctype=label_ctype
+    )
 
     step_args = [image_flat, labels, state, priority]
     step_args.extend(sources)
@@ -1201,7 +1238,7 @@ def _watershed_compact(
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_line_kernel(ndim, connectivity=1):
+def _get_watershed_line_kernel(ndim, connectivity=1, label_ctype="int32_t"):
     """Get post-processing kernel to create 1-pixel watershed lines.
 
     After the CA iteration has converged and all pixels have final labels,
@@ -1219,7 +1256,10 @@ def _get_watershed_line_kernel(ndim, connectivity=1):
         Number of dimensions.
     connectivity : int
         Neighborhood connectivity.
+    label_ctype : str
+        C type string for label arrays (e.g. "int32_t", "int8_t").
     """
+    L = label_ctype
     dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
     neighbors = _get_neighbor_offsets(ndim, connectivity)
     neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
@@ -1231,7 +1271,7 @@ def _get_watershed_line_kernel(ndim, connectivity=1):
             {nc_decl_str}
             if ({bounds_str}) {{
                 int nidx = {nidx_expr};
-                int nlabel = labels_in[nidx];
+                {L} nlabel = labels_in[nidx];
                 if (nlabel != 0 && nlabel != my_label) {{
                     float npri = priority[nidx];
                     if (npri < my_pri ||
@@ -1243,12 +1283,14 @@ def _get_watershed_line_kernel(ndim, connectivity=1):
         }}
 """
 
-    kernel_code = f"""
+    kernel_code = (
+        _KERNEL_PREAMBLE
+        + f"""
 extern "C" __global__
 void watershed_line(
-    const int* __restrict__ labels_in,
+    const {L}* __restrict__ labels_in,
     const float* __restrict__ priority,
-    int* __restrict__ labels_out,
+    {L}* __restrict__ labels_out,
     {dim_params}
 ) {{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1257,7 +1299,7 @@ void watershed_line(
 
     {coord_code}
 
-    int my_label = labels_in[idx];
+    {L} my_label = labels_in[idx];
     if (my_label == 0) {{
         labels_out[idx] = 0;
         return;
@@ -1270,6 +1312,7 @@ void watershed_line(
     labels_out[idx] = is_boundary ? 0 : my_label;
 }}
 """
+    )
     return cp.RawKernel(kernel_code, "watershed_line")
 
 
@@ -1324,7 +1367,6 @@ def _validate_inputs(image, markers, mask, connectivity):
             markers_bool = markers_bool * mask.astype(bool)
         footprint = ndi.generate_binary_structure(ndim, connectivity)
         markers = ndi.label(markers_bool, structure=footprint)[0]
-        markers = markers.astype(cp.int32)
     elif not isinstance(markers, (cp.ndarray, np.ndarray, list, tuple)):
         # Assume int: generate that many regularly-spaced markers
         n_markers = int(markers)
@@ -1334,7 +1376,6 @@ def _validate_inputs(image, markers, mask, connectivity):
         )
         if mask is not None:
             markers *= mask.astype(markers.dtype)
-        markers = markers.astype(cp.int32)
     else:
         if not isinstance(markers, cp.ndarray):
             markers = cp.asarray(markers)
@@ -1347,10 +1388,6 @@ def _validate_inputs(image, markers, mask, connectivity):
                 f"markers shape {markers.shape} must match "
                 f"image shape {image.shape}"
             )
-
-        # Convert markers to int32
-        if markers.dtype != cp.int32:
-            markers = markers.astype(cp.int32)
 
     return image, markers, mask, connectivity
 
@@ -1507,16 +1544,24 @@ def watershed(
     >>> labels_compact = segmentation.watershed(-image,
     >>>                                         markers, compactness=0.1)
     """
-    # Save original marker dtype for output casting
+    # Determine output label dtype from markers
     if isinstance(markers, (cp.ndarray, np.ndarray)):
-        out_dtype = markers.dtype
+        label_dtype = cp.dtype(markers.dtype)
     else:
-        out_dtype = cp.int32
+        label_dtype = cp.dtype(cp.int32)
+
+    # Ensure it's a supported integer type for kernel codegen
+    if label_dtype not in _DTYPE_TO_CTYPE:
+        label_dtype = cp.dtype(cp.int32)
 
     # Validate and prepare inputs
     image, markers, mask, connectivity = _validate_inputs(
         image, markers, mask, connectivity
     )
+
+    # Ensure markers match the label dtype
+    if markers.dtype != label_dtype:
+        markers = markers.astype(label_dtype)
 
     ndim = image.ndim
 
@@ -1556,6 +1601,8 @@ def watershed(
                 ndim == 2 and min(height, width) >= 128 and not use_age
             )
 
+    label_ctype = _DTYPE_TO_CTYPE[label_dtype]
+
     # common kwargs shared across all watershed implementations
     common_kwargs = dict(
         image_flat=image_flat,
@@ -1567,6 +1614,7 @@ def watershed(
         blocks=blocks,
         threads_per_block=threads_per_block,
         max_iterations=max_iterations,
+        label_dtype=label_dtype,
     )
 
     if compactness == 0:
@@ -1595,9 +1643,10 @@ def watershed(
     # Post-processing: create watershed lines if requested
     if watershed_line:
         labels_out = cp.empty_like(labels)
-        wl_kernel = _get_watershed_line_kernel(ndim, connectivity)
-        # Kernel expects (width, height[, depth]) = reversed shape order
-        dim_args = tuple(int(s) for s in reversed(image.shape))
+        wl_kernel = _get_watershed_line_kernel(
+            ndim, connectivity, label_ctype=label_ctype
+        )
+        dim_args = tuple(int(s) for s in image.shape)
         wl_kernel(
             (blocks,),
             (threads_per_block,),
@@ -1605,10 +1654,4 @@ def watershed(
         )
         labels = labels_out
 
-    # Reshape back to original dimensions
-    result = labels.reshape(image.shape)
-
-    # Cast to original marker dtype
-    if result.dtype != out_dtype:
-        result = result.astype(out_dtype)
-    return result
+    return labels.reshape(image.shape)
