@@ -156,10 +156,14 @@ void watershed_compact_init(
 def _get_neighbor_offsets(ndim, connectivity):
     """Get neighbor offsets for the given dimensionality and connectivity.
 
+    An offset is included if the number of non-zero components is at most
+    ``connectivity``. This matches the convention used by
+    ``scipy.ndimage.generate_binary_structure(ndim, connectivity)``.
+
     Parameters
     ----------
     ndim : int
-        Number of dimensions (1, 2, or 3).
+        Number of dimensions.
     connectivity : int
         Maximum number of orthogonal steps to reach a neighbor.
         Must be in [1, ndim].
@@ -167,14 +171,29 @@ def _get_neighbor_offsets(ndim, connectivity):
     Returns
     -------
     neighbors : list of tuple
-        List of offset tuples, each of length ndim.
+        List of offset tuples, each of length ndim. Sorted by
+        connectivity level (face neighbors first, then edge, then
+        corner, etc.).
     """
+    # Use hand-tuned lists for common cases (avoids numpy overhead)
     if ndim == 1:
         return _get_neighbor_offsets_1d()
     elif ndim == 2:
         return _get_neighbor_offsets_2d(connectivity)
-    else:
+    elif ndim == 3:
         return _get_neighbor_offsets_3d(connectivity)
+
+    # General nD case: enumerate all offsets in {-1, 0, 1}^ndim,
+    # keep those with 1..connectivity non-zero components.
+    offsets = (
+        np.array(np.meshgrid(*([(-1, 0, 1)] * ndim), indexing="ij"))
+        .reshape(ndim, -1)
+        .T
+    )
+    n_nonzero = np.sum(offsets != 0, axis=1)
+    mask = (n_nonzero > 0) & (n_nonzero <= connectivity)
+    order = np.argsort(n_nonzero[mask])
+    return [tuple(int(x) for x in row) for row in offsets[mask][order]]
 
 
 def _get_neighbor_offsets_1d():
@@ -195,26 +214,28 @@ def _get_neighbor_offsets_2d(connectivity):
     neighbors : list of tuple
         List of (dy, dx) offsets for neighbors
     """
+    # fmt: off
     if connectivity == 1:
         # 4-connectivity (cross pattern)
         return [
-            (-1, 0),  # top
-            (1, 0),  # bottom
-            (0, -1),  # left
-            (0, 1),  # right
+            (-1,  0),  # top
+            ( 1,  0),  # bottom
+            ( 0, -1),  # left
+            ( 0,  1),  # right
         ]
     else:
         # 8-connectivity (square pattern)
         return [
-            (-1, 0),  # top
-            (1, 0),  # bottom
-            (0, -1),  # left
-            (0, 1),  # right
+            (-1,  0),  # top
+            ( 1,  0),  # bottom
+            ( 0, -1),  # left
+            ( 0,  1),  # right
             (-1, -1),  # top-left
-            (-1, 1),  # top-right
-            (1, -1),  # bottom-left
-            (1, 1),  # bottom-right
+            (-1,  1),  # top-right
+            ( 1, -1),  # bottom-left
+            ( 1,  1),  # bottom-right
         ]
+    # fmt: on
 
 
 def _get_neighbor_offsets_3d(connectivity):
@@ -232,14 +253,15 @@ def _get_neighbor_offsets_3d(connectivity):
     neighbors : list of tuple
         List of (dz, dy, dx) offsets for neighbors
     """
+    # fmt: off
     # Face neighbors (6-connectivity)
     face_neighbors = [
-        (-1, 0, 0),  # front
-        (1, 0, 0),  # back
-        (0, -1, 0),  # top
-        (0, 1, 0),  # bottom
-        (0, 0, -1),  # left
-        (0, 0, 1),  # right
+        (-1,  0,  0),
+        ( 1,  0,  0),
+        ( 0, -1,  0),
+        ( 0,  1,  0),
+        ( 0,  0, -1),
+        ( 0,  0,  1),
     ]
 
     if connectivity == 1:
@@ -247,18 +269,18 @@ def _get_neighbor_offsets_3d(connectivity):
 
     # Edge neighbors (12 additional)
     edge_neighbors = [
-        (-1, -1, 0),
-        (-1, 1, 0),
-        (-1, 0, -1),
-        (-1, 0, 1),
-        (1, -1, 0),
-        (1, 1, 0),
-        (1, 0, -1),
-        (1, 0, 1),
-        (0, -1, -1),
-        (0, -1, 1),
-        (0, 1, -1),
-        (0, 1, 1),
+        (-1, -1,  0),
+        (-1,  1,  0),
+        (-1,  0, -1),
+        (-1,  0,  1),
+        ( 1, -1,  0),
+        ( 1,  1,  0),
+        ( 1,  0, -1),
+        ( 1,  0,  1),
+        ( 0, -1, -1),
+        ( 0, -1,  1),
+        ( 0,  1, -1),
+        ( 0,  1,  1),
     ]
 
     if connectivity == 2:
@@ -267,14 +289,15 @@ def _get_neighbor_offsets_3d(connectivity):
     # Corner neighbors (8 additional)
     corner_neighbors = [
         (-1, -1, -1),
-        (-1, -1, 1),
-        (-1, 1, -1),
-        (-1, 1, 1),
-        (1, -1, -1),
-        (1, -1, 1),
-        (1, 1, -1),
-        (1, 1, 1),
+        (-1, -1,  1),
+        (-1,  1, -1),
+        (-1,  1,  1),
+        ( 1, -1, -1),
+        ( 1, -1,  1),
+        ( 1,  1, -1),
+        ( 1,  1,  1),
     ]
+    # fmt: on
 
     # connectivity == 3: 26-connectivity
     return face_neighbors + edge_neighbors + corner_neighbors
@@ -1555,13 +1578,7 @@ def watershed(
 
     ndim = image.ndim
 
-    # Check dimensionality
-    if ndim not in (1, 2, 3):
-        raise NotImplementedError(
-            f"Only 1D, 2D and 3D images are supported, got {ndim}D"
-        )
-
-    # Check compactness support
+    # Check compactness support (2D only, requires separate compact kernels)
     if compactness != 0 and ndim != 2:
         raise NotImplementedError(
             "compactness parameter is only supported for 2D images"

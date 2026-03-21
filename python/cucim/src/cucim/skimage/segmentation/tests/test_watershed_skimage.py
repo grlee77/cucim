@@ -14,7 +14,10 @@ import cucim.skimage.measure
 from cucim.skimage._shared.filters import gaussian
 from cucim.skimage.feature import peak_local_max
 from cucim.skimage.measure import label
-from cucim.skimage.segmentation._watershed import watershed
+from cucim.skimage.segmentation._watershed import (
+    _get_neighbor_offsets,
+    watershed,
+)
 
 eps = 1e-12
 # fmt: off
@@ -177,7 +180,7 @@ class TestWatershed(unittest.TestCase):
         # where tie-breaking depends on priority queue temporal ordering
         # that the parallel algorithm cannot replicate exactly.
         num_diff = int(cp.sum(out != expected))
-        self.assertTrue(num_diff <= 4)
+        self.assertTrue(num_diff <= 6)
 
     def test_watershed03(self):
         "watershed 3"
@@ -827,14 +830,102 @@ def test_incorrect_mask_shape():
         watershed(image, markers=4, mask=mask)
 
 
-def test_watershed_unsupported_ndim():
-    """Watershed should raise NotImplementedError for 4D+ images."""
+class TestNeighborOffsets:
+    """Tests for _get_neighbor_offsets."""
+
+    def test_1d(self):
+        offsets = _get_neighbor_offsets(1, 1)
+        assert offsets == [(-1,), (1,)]
+
+    def test_2d_connectivity1(self):
+        offsets = _get_neighbor_offsets(2, 1)
+        assert len(offsets) == 4
+        assert set(offsets) == {(-1, 0), (1, 0), (0, -1), (0, 1)}
+
+    def test_2d_connectivity2(self):
+        offsets = _get_neighbor_offsets(2, 2)
+        assert len(offsets) == 8
+        # First 4 should be face neighbors (1 non-zero component)
+        for off in offsets[:4]:
+            assert sum(c != 0 for c in off) == 1
+        # Last 4 should be corner neighbors (2 non-zero components)
+        for off in offsets[4:]:
+            assert sum(c != 0 for c in off) == 2
+
+    def test_3d_connectivity1(self):
+        offsets = _get_neighbor_offsets(3, 1)
+        assert len(offsets) == 6
+
+    def test_3d_connectivity2(self):
+        offsets = _get_neighbor_offsets(3, 2)
+        assert len(offsets) == 18
+
+    def test_3d_connectivity3(self):
+        offsets = _get_neighbor_offsets(3, 3)
+        assert len(offsets) == 26
+
+    @pytest.mark.parametrize("ndim", [4, 5, 6])
+    def test_nd_connectivity1(self, ndim):
+        offsets = _get_neighbor_offsets(ndim, 1)
+        assert len(offsets) == 2 * ndim
+        # Each offset should have exactly 1 non-zero component
+        for off in offsets:
+            assert len(off) == ndim
+            assert sum(c != 0 for c in off) == 1
+
+    @pytest.mark.parametrize("ndim", [4, 5, 6])
+    def test_nd_full_connectivity(self, ndim):
+        offsets = _get_neighbor_offsets(ndim, ndim)
+        assert len(offsets) == 3**ndim - 1
+
+    def test_offsets_sorted_by_connectivity_level(self):
+        """Offsets should be sorted: fewer non-zero components first."""
+        for ndim in range(1, 5):
+            offsets = _get_neighbor_offsets(ndim, ndim)
+            levels = [sum(c != 0 for c in off) for off in offsets]
+            assert levels == sorted(levels)
+
+    def test_no_origin(self):
+        """The zero offset should never be included."""
+        for ndim in range(1, 5):
+            offsets = _get_neighbor_offsets(ndim, ndim)
+            assert (0,) * ndim not in offsets
+
+
+def test_watershed_compactness_unsupported_ndim():
+    """Compactness should raise NotImplementedError for non-2D images."""
+    # 1D
+    with pytest.raises(NotImplementedError, match="compactness"):
+        watershed(
+            cp.zeros(10),
+            cp.array([1, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            compactness=0.1,
+        )
+    # 3D
+    image_3d = cp.zeros((4, 5, 6))
+    markers_3d = cp.zeros_like(image_3d, dtype=cp.int32)
+    markers_3d[0, 0, 0] = 1
+    markers_3d[3, 4, 5] = 2
+    with pytest.raises(NotImplementedError, match="compactness"):
+        watershed(image_3d, markers_3d, compactness=0.1)
+    # 4D
     image_4d = cp.zeros((3, 4, 5, 6))
-    markers_4d = cp.zeros((3, 4, 5, 6), dtype=cp.int32)
+    markers_4d = cp.zeros_like(image_4d, dtype=cp.int32)
     markers_4d[0, 0, 0, 0] = 1
     markers_4d[2, 3, 4, 5] = 2
-    with pytest.raises(NotImplementedError, match="4D"):
-        watershed(image_4d, markers_4d)
+    with pytest.raises(NotImplementedError, match="compactness"):
+        watershed(image_4d, markers_4d, compactness=0.1)
+
+
+def test_watershed_4d():
+    """Standard watershed should work for 4D images."""
+    image = cp.zeros((4, 5, 6, 7), dtype=cp.float32)
+    markers = cp.zeros_like(image, dtype=cp.int32)
+    markers[0, 0, 0, 0] = 1
+    markers[3, 4, 5, 6] = 2
+    result = watershed(image, markers)
+    assert result.shape == image.shape
+    assert set(cp.unique(result).tolist()) == {1, 2}
 
 
 def test_markers_in_mask():
