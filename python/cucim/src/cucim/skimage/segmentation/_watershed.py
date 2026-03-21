@@ -23,6 +23,156 @@ from ..morphology.extrema import local_minima
 from ..util._regular_grid import regular_seeds
 
 
+def _get_neighbor_offsets_1d():
+    """Get 1D neighbor offsets (left and right)."""
+    return [(-1,), (1,)]
+
+
+def _get_neighbor_offsets_2d(connectivity):
+    """Get 2D neighbor offsets based on connectivity.
+
+    Parameters
+    ----------
+    connectivity : int
+        1 for 4-connectivity, 2 for 8-connectivity
+
+    Returns
+    -------
+    neighbors : list of tuple
+        List of (dy, dx) offsets for neighbors
+    """
+    # fmt: off
+    if connectivity == 1:
+        # 4-connectivity (cross pattern)
+        return [
+            (-1,  0),  # top
+            ( 1,  0),  # bottom
+            ( 0, -1),  # left
+            ( 0,  1),  # right
+        ]
+    else:
+        # 8-connectivity (square pattern)
+        return [
+            (-1,  0),  # top
+            ( 1,  0),  # bottom
+            ( 0, -1),  # left
+            ( 0,  1),  # right
+            (-1, -1),  # top-left
+            (-1,  1),  # top-right
+            ( 1, -1),  # bottom-left
+            ( 1,  1),  # bottom-right
+        ]
+    # fmt: on
+
+
+def _get_neighbor_offsets_3d(connectivity):
+    """Get 3D neighbor offsets based on connectivity.
+
+    Parameters
+    ----------
+    connectivity : int
+        1 for 6-connectivity (face neighbors)
+        2 for 18-connectivity (face + edge neighbors)
+        3 for 26-connectivity (face + edge + corner neighbors)
+
+    Returns
+    -------
+    neighbors : list of tuple
+        List of (dz, dy, dx) offsets for neighbors
+    """
+    # fmt: off
+    # Face neighbors (6-connectivity)
+    face_neighbors = [
+        (-1,  0,  0),
+        ( 1,  0,  0),
+        ( 0, -1,  0),
+        ( 0,  1,  0),
+        ( 0,  0, -1),
+        ( 0,  0,  1),
+    ]
+
+    if connectivity == 1:
+        return face_neighbors
+
+    # Edge neighbors (12 additional)
+    edge_neighbors = [
+        (-1, -1,  0),
+        (-1,  1,  0),
+        (-1,  0, -1),
+        (-1,  0,  1),
+        ( 1, -1,  0),
+        ( 1,  1,  0),
+        ( 1,  0, -1),
+        ( 1,  0,  1),
+        ( 0, -1, -1),
+        ( 0, -1,  1),
+        ( 0,  1, -1),
+        ( 0,  1,  1),
+    ]
+
+    if connectivity == 2:
+        return face_neighbors + edge_neighbors
+
+    # Corner neighbors (8 additional)
+    corner_neighbors = [
+        (-1, -1, -1),
+        (-1, -1,  1),
+        (-1,  1, -1),
+        (-1,  1,  1),
+        ( 1, -1, -1),
+        ( 1, -1,  1),
+        ( 1,  1, -1),
+        ( 1,  1,  1),
+    ]
+    # fmt: on
+
+    # connectivity == 3: 26-connectivity
+    return face_neighbors + edge_neighbors + corner_neighbors
+
+
+def _get_neighbor_offsets(ndim, connectivity):
+    """Get neighbor offsets for the given dimensionality and connectivity.
+
+    An offset is included if the number of non-zero components is at most
+    ``connectivity``. This matches the convention used by
+    ``scipy.ndimage.generate_binary_structure(ndim, connectivity)``.
+
+    Parameters
+    ----------
+    ndim : int
+        Number of dimensions.
+    connectivity : int
+        Maximum number of orthogonal steps to reach a neighbor.
+        Must be in [1, ndim].
+
+    Returns
+    -------
+    neighbors : list of tuple
+        List of offset tuples, each of length ndim. Sorted by
+        connectivity level (face neighbors first, then edge, then
+        corner, etc.).
+    """
+    # Use hand-tuned lists for common cases (avoids numpy overhead)
+    if ndim == 1:
+        return _get_neighbor_offsets_1d()
+    elif ndim == 2:
+        return _get_neighbor_offsets_2d(connectivity)
+    elif ndim == 3:
+        return _get_neighbor_offsets_3d(connectivity)
+
+    # General nD case: enumerate all offsets in {-1, 0, 1}^ndim,
+    # keep those with 1..connectivity non-zero components.
+    offsets = (
+        np.array(np.meshgrid(*([(-1, 0, 1)] * ndim), indexing="ij"))
+        .reshape(ndim, -1)
+        .T
+    )
+    n_nonzero = np.sum(offsets != 0, axis=1)
+    mask = (n_nonzero > 0) & (n_nonzero <= connectivity)
+    order = np.argsort(n_nonzero[mask])
+    return [tuple(int(x) for x in row) for row in offsets[mask][order]]
+
+
 # CUDA kernel for initialization (standard watershed)
 @cp.memoize(for_each_device=True)
 def _get_watershed_init_kernel(use_age=False):
@@ -153,156 +303,6 @@ void watershed_compact_init(
     )
 
 
-def _get_neighbor_offsets(ndim, connectivity):
-    """Get neighbor offsets for the given dimensionality and connectivity.
-
-    An offset is included if the number of non-zero components is at most
-    ``connectivity``. This matches the convention used by
-    ``scipy.ndimage.generate_binary_structure(ndim, connectivity)``.
-
-    Parameters
-    ----------
-    ndim : int
-        Number of dimensions.
-    connectivity : int
-        Maximum number of orthogonal steps to reach a neighbor.
-        Must be in [1, ndim].
-
-    Returns
-    -------
-    neighbors : list of tuple
-        List of offset tuples, each of length ndim. Sorted by
-        connectivity level (face neighbors first, then edge, then
-        corner, etc.).
-    """
-    # Use hand-tuned lists for common cases (avoids numpy overhead)
-    if ndim == 1:
-        return _get_neighbor_offsets_1d()
-    elif ndim == 2:
-        return _get_neighbor_offsets_2d(connectivity)
-    elif ndim == 3:
-        return _get_neighbor_offsets_3d(connectivity)
-
-    # General nD case: enumerate all offsets in {-1, 0, 1}^ndim,
-    # keep those with 1..connectivity non-zero components.
-    offsets = (
-        np.array(np.meshgrid(*([(-1, 0, 1)] * ndim), indexing="ij"))
-        .reshape(ndim, -1)
-        .T
-    )
-    n_nonzero = np.sum(offsets != 0, axis=1)
-    mask = (n_nonzero > 0) & (n_nonzero <= connectivity)
-    order = np.argsort(n_nonzero[mask])
-    return [tuple(int(x) for x in row) for row in offsets[mask][order]]
-
-
-def _get_neighbor_offsets_1d():
-    """Get 1D neighbor offsets (left and right)."""
-    return [(-1,), (1,)]
-
-
-def _get_neighbor_offsets_2d(connectivity):
-    """Get 2D neighbor offsets based on connectivity.
-
-    Parameters
-    ----------
-    connectivity : int
-        1 for 4-connectivity, 2 for 8-connectivity
-
-    Returns
-    -------
-    neighbors : list of tuple
-        List of (dy, dx) offsets for neighbors
-    """
-    # fmt: off
-    if connectivity == 1:
-        # 4-connectivity (cross pattern)
-        return [
-            (-1,  0),  # top
-            ( 1,  0),  # bottom
-            ( 0, -1),  # left
-            ( 0,  1),  # right
-        ]
-    else:
-        # 8-connectivity (square pattern)
-        return [
-            (-1,  0),  # top
-            ( 1,  0),  # bottom
-            ( 0, -1),  # left
-            ( 0,  1),  # right
-            (-1, -1),  # top-left
-            (-1,  1),  # top-right
-            ( 1, -1),  # bottom-left
-            ( 1,  1),  # bottom-right
-        ]
-    # fmt: on
-
-
-def _get_neighbor_offsets_3d(connectivity):
-    """Get 3D neighbor offsets based on connectivity.
-
-    Parameters
-    ----------
-    connectivity : int
-        1 for 6-connectivity (face neighbors)
-        2 for 18-connectivity (face + edge neighbors)
-        3 for 26-connectivity (face + edge + corner neighbors)
-
-    Returns
-    -------
-    neighbors : list of tuple
-        List of (dz, dy, dx) offsets for neighbors
-    """
-    # fmt: off
-    # Face neighbors (6-connectivity)
-    face_neighbors = [
-        (-1,  0,  0),
-        ( 1,  0,  0),
-        ( 0, -1,  0),
-        ( 0,  1,  0),
-        ( 0,  0, -1),
-        ( 0,  0,  1),
-    ]
-
-    if connectivity == 1:
-        return face_neighbors
-
-    # Edge neighbors (12 additional)
-    edge_neighbors = [
-        (-1, -1,  0),
-        (-1,  1,  0),
-        (-1,  0, -1),
-        (-1,  0,  1),
-        ( 1, -1,  0),
-        ( 1,  1,  0),
-        ( 1,  0, -1),
-        ( 1,  0,  1),
-        ( 0, -1, -1),
-        ( 0, -1,  1),
-        ( 0,  1, -1),
-        ( 0,  1,  1),
-    ]
-
-    if connectivity == 2:
-        return face_neighbors + edge_neighbors
-
-    # Corner neighbors (8 additional)
-    corner_neighbors = [
-        (-1, -1, -1),
-        (-1, -1,  1),
-        (-1,  1, -1),
-        (-1,  1,  1),
-        ( 1, -1, -1),
-        ( 1, -1,  1),
-        ( 1,  1, -1),
-        ( 1,  1,  1),
-    ]
-    # fmt: on
-
-    # connectivity == 3: 26-connectivity
-    return face_neighbors + edge_neighbors + corner_neighbors
-
-
 @cp.memoize(for_each_device=True)
 def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
     """Get iteration kernel for nD CA-watershed.
@@ -317,7 +317,7 @@ def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
     Parameters
     ----------
     ndim : int
-        Number of dimensions (1, 2, or 3).
+        Number of dimensions.
     connectivity : int
         Neighborhood connectivity (1 to ndim).
     use_age : bool
@@ -329,35 +329,9 @@ def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
     kernel : cupy.RawKernel
         Compiled CUDA kernel
     """
+    dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
     neighbors = _get_neighbor_offsets(ndim, connectivity)
-
-    # Dimension names in C-order: dim_0 is the slowest-varying (outermost),
-    # dim_{ndim-1} is the fastest-varying (contiguous).
-    # Coordinates: c_0 .. c_{ndim-1}
-    dim_names = [f"dim_{j}" for j in range(ndim)]
-
-    # Kernel parameters for dimension sizes
-    dim_params = ", ".join(f"int {d}" for d in dim_names)
-
-    # Compute total size
-    size_expr = " * ".join(dim_names)
-
-    # Generate coordinate extraction from flat index (C-order)
-    # c_{ndim-1} = idx % dim_{ndim-1}
-    # c_{ndim-2} = (idx / dim_{ndim-1}) % dim_{ndim-2}
-    # c_0 = idx / (dim_1 * ... * dim_{ndim-1})
-    coord_lines = []
-    for j in range(ndim - 1, -1, -1):
-        if j == ndim - 1:
-            coord_lines.append(f"int c_{j} = idx % {dim_names[j]};")
-            if ndim > 1:
-                coord_lines.append(f"int _rem_{j} = idx / {dim_names[j]};")
-        elif j == 0:
-            coord_lines.append(f"int c_0 = _rem_{j + 1};")
-        else:
-            coord_lines.append(f"int c_{j} = _rem_{j + 1} % {dim_names[j]};")
-            coord_lines.append(f"int _rem_{j} = _rem_{j + 1} / {dim_names[j]};")
-    coord_code = "\n    ".join(coord_lines)
+    neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
 
     # Generate neighbor checking code
     age_read = "int nage = age[nidx];" if use_age else ""
@@ -374,22 +348,7 @@ def _get_watershed_step_kernel(ndim, connectivity=1, use_age=False):
         age_update = ""
 
     neighbor_code = ""
-    for i, offsets in enumerate(neighbors):
-        # Neighbor coordinate computation and bounds check
-        nc_decls = []
-        bounds = []
-        for j, off in enumerate(offsets):
-            nc_decls.append(f"int nc_{j} = c_{j} + ({off});")
-            bounds.append(f"nc_{j} >= 0 && nc_{j} < {dim_names[j]}")
-        nc_decl_str = "\n        ".join(nc_decls)
-        bounds_str = " && ".join(bounds)
-
-        # Flat index from nD coordinates (C-order)
-        nidx_parts = [f"nc_{j}" for j in range(ndim)]
-        nidx_expr = nidx_parts[0]
-        for j in range(1, ndim):
-            nidx_expr = f"({nidx_expr}) * {dim_names[j]} + {nidx_parts[j]}"
-
+    for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
         neighbor_code += f"""
     {{
         {nc_decl_str}
@@ -936,6 +895,65 @@ void watershed_compact_step_2d(
 
 
 @cp.memoize(for_each_device=True)
+def _generate_coord_code(ndim):
+    """Generate CUDA code to extract nD coordinates from a flat index.
+
+    Returns (dim_names, dim_params, size_expr, coord_code) where:
+    - dim_names: list of dimension size variable names in C-order
+    - dim_params: kernel parameter declaration string
+    - size_expr: C expression for total size
+    - coord_code: C code to compute c_0..c_{ndim-1} from idx
+    """
+    dim_names = [f"dim_{j}" for j in range(ndim)]
+    dim_params = ", ".join(f"int {d}" for d in dim_names)
+    size_expr = " * ".join(dim_names)
+
+    coord_lines = []
+    for j in range(ndim - 1, -1, -1):
+        if j == ndim - 1:
+            coord_lines.append(f"int c_{j} = idx % {dim_names[j]};")
+            if ndim > 1:
+                coord_lines.append(f"int _rem_{j} = idx / {dim_names[j]};")
+        elif j == 0:
+            coord_lines.append(f"int c_0 = _rem_{j + 1};")
+        else:
+            coord_lines.append(f"int c_{j} = _rem_{j + 1} % {dim_names[j]};")
+            coord_lines.append(f"int _rem_{j} = _rem_{j + 1} / {dim_names[j]};")
+    coord_code = "\n    ".join(coord_lines)
+
+    return dim_names, dim_params, size_expr, coord_code
+
+
+def _generate_neighbor_nidx(ndim, dim_names, offsets):
+    """Generate CUDA code for neighbor coordinate + flat index computation.
+
+    For each neighbor offset, generates:
+    - nc_0..nc_{ndim-1} neighbor coordinate declarations
+    - bounds check expression
+    - nidx flat index expression
+
+    Returns (nc_decl_str, bounds_str, nidx_expr) for each offset.
+    """
+    results = []
+    for offset in offsets:
+        nc_decls = []
+        bounds = []
+        for j, off in enumerate(offset):
+            nc_decls.append(f"int nc_{j} = c_{j} + ({off});")
+            bounds.append(f"nc_{j} >= 0 && nc_{j} < {dim_names[j]}")
+
+        nc_decl_str = "\n        ".join(nc_decls)
+        bounds_str = " && ".join(bounds)
+
+        nidx_parts = [f"nc_{j}" for j in range(ndim)]
+        nidx_expr = nidx_parts[0]
+        for j in range(1, ndim):
+            nidx_expr = f"({nidx_expr}) * {dim_names[j]} + {nidx_parts[j]}"
+        results.append((nc_decl_str, bounds_str, nidx_expr))
+    return results
+
+
+@cp.memoize(for_each_device=True)
 def _get_watershed_line_kernel(ndim, connectivity=1):
     """Get post-processing kernel to create 1-pixel watershed lines.
 
@@ -946,30 +964,26 @@ def _get_watershed_line_kernel(ndim, connectivity=1):
     pixel with the higher label value is zeroed as a consistent
     tie-breaker.
 
-    Uses a 1D grid for all dimensionalities. The kernel takes flat
-    arrays (labels_in, priority, labels_out) plus dimension sizes to
-    recover coordinates for neighbor bounds checking.
+    Uses a 1D grid for all dimensionalities.
 
     Parameters
     ----------
     ndim : int
-        Number of dimensions (1, 2, or 3).
+        Number of dimensions.
     connectivity : int
         Neighborhood connectivity.
     """
-    # Generate coordinate extraction and neighbor check code
-    if ndim == 1:
-        coord_code = "int x = idx;"
-        dim_params = "int size"
-        size_expr = "size"
-        neighbors = _get_neighbor_offsets_1d()
-        neighbor_check = ""
-        for i, (dx,) in enumerate(neighbors):
-            neighbor_check += f"""
+    dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
+    neighbors = _get_neighbor_offsets(ndim, connectivity)
+    neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
+
+    neighbor_check = ""
+    for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
+        neighbor_check += f"""
         {{
-            int nx = x + ({dx});
-            if (nx >= 0 && nx < size) {{
-                int nidx = nx;
+            {nc_decl_str}
+            if ({bounds_str}) {{
+                int nidx = {nidx_expr};
                 int nlabel = labels_in[nidx];
                 if (nlabel != 0 && nlabel != my_label) {{
                     float npri = priority[nidx];
@@ -981,59 +995,6 @@ def _get_watershed_line_kernel(ndim, connectivity=1):
             }}
         }}
 """
-    elif ndim == 2:
-        coord_code = "int x = idx % width;\n    int y = idx / width;"
-        dim_params = "int width, int height"
-        size_expr = "width * height"
-        neighbors = _get_neighbor_offsets_2d(connectivity)
-        neighbor_check = ""
-        for i, (dy, dx) in enumerate(neighbors):
-            neighbor_check += f"""
-        {{
-            int ny = y + ({dy});
-            int nx = x + ({dx});
-            if (ny >= 0 && ny < height && nx >= 0 && nx < width) {{
-                int nidx = ny * width + nx;
-                int nlabel = labels_in[nidx];
-                if (nlabel != 0 && nlabel != my_label) {{
-                    float npri = priority[nidx];
-                    if (npri < my_pri ||
-                        (npri == my_pri && nlabel < my_label)) {{
-                        is_boundary = 1;
-                    }}
-                }}
-            }}
-        }}
-"""
-    else:  # ndim == 3
-        coord_code = (
-            "int x = idx % width;\n"
-            "    int y = (idx / width) % height;\n"
-            "    int z = idx / (width * height);"
-        )
-        dim_params = "int width, int height, int depth"
-        size_expr = "width * height * depth"
-        neighbors = _get_neighbor_offsets_3d(connectivity)
-        neighbor_check = ""
-        for i, (dz, dy, dx) in enumerate(neighbors):
-            neighbor_check += f"""
-        {{
-            int nz = z + ({dz});
-            int ny = y + ({dy});
-            int nx = x + ({dx});
-            if (nz >= 0 && nz < depth && ny >= 0 && ny < height && nx >= 0 && nx < width) {{
-                int nidx = (nz * height + ny) * width + nx;
-                int nlabel = labels_in[nidx];
-                if (nlabel != 0 && nlabel != my_label) {{
-                    float npri = priority[nidx];
-                    if (npri < my_pri ||
-                        (npri == my_pri && nlabel < my_label)) {{
-                        is_boundary = 1;
-                    }}
-                }}
-            }}
-        }}
-"""  # noqa: E501
 
     kernel_code = f"""
 extern "C" __global__
