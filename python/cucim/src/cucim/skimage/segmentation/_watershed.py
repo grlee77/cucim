@@ -1095,12 +1095,12 @@ void watershed_compact_step_2d(
     return cp.RawKernel(kernel_code, "watershed_compact_step_2d")
 
 
-# --- Watershed line post-processing kernels ---
+# --- Watershed line post-processing kernel ---
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_line_kernel_2d(connectivity=1):
-    """Get post-processing kernel to create 1-pixel watershed lines (2D).
+def _get_watershed_line_kernel(ndim, connectivity=1):
+    """Get post-processing kernel to create 1-pixel watershed lines.
 
     After the CA iteration has converged and all pixels have final labels,
     this kernel identifies boundary pixels. To produce 1-pixel-wide lines
@@ -1109,17 +1109,49 @@ def _get_watershed_line_kernel_2d(connectivity=1):
     pixel with the higher label value is zeroed as a consistent
     tie-breaker.
 
-    A pixel becomes a boundary (label=0) if any differently-labeled
-    neighbor has strictly lower priority, or has equal priority with a
-    lower label value.
+    Uses a 1D grid for all dimensionalities. The kernel takes flat
+    arrays (labels_in, priority, labels_out) plus dimension sizes to
+    recover coordinates for neighbor bounds checking.
 
-    Reads from labels_in/priority and writes to labels_out.
+    Parameters
+    ----------
+    ndim : int
+        Number of dimensions (1, 2, or 3).
+    connectivity : int
+        Neighborhood connectivity.
     """
-    neighbors = _get_neighbor_offsets_2d(connectivity)
-
-    neighbor_check = ""
-    for i, (dy, dx) in enumerate(neighbors):
-        neighbor_check += f"""
+    # Generate coordinate extraction and neighbor check code
+    if ndim == 1:
+        coord_code = "int x = idx;"
+        dim_params = "int size"
+        size_expr = "size"
+        neighbors = _get_neighbor_offsets_1d()
+        neighbor_check = ""
+        for i, (dx,) in enumerate(neighbors):
+            neighbor_check += f"""
+        {{
+            int nx = x + ({dx});
+            if (nx >= 0 && nx < size) {{
+                int nidx = nx;
+                int nlabel = labels_in[nidx];
+                if (nlabel != 0 && nlabel != my_label) {{
+                    float npri = priority[nidx];
+                    if (npri < my_pri ||
+                        (npri == my_pri && nlabel < my_label)) {{
+                        is_boundary = 1;
+                    }}
+                }}
+            }}
+        }}
+"""
+    elif ndim == 2:
+        coord_code = "int x = idx % width;\n    int y = idx / width;"
+        dim_params = "int width, int height"
+        size_expr = "width * height"
+        neighbors = _get_neighbor_offsets_2d(connectivity)
+        neighbor_check = ""
+        for i, (dy, dx) in enumerate(neighbors):
+            neighbor_check += f"""
         {{
             int ny = y + ({dy});
             int nx = x + ({dx});
@@ -1128,9 +1160,6 @@ def _get_watershed_line_kernel_2d(connectivity=1):
                 int nlabel = labels_in[nidx];
                 if (nlabel != 0 && nlabel != my_label) {{
                     float npri = priority[nidx];
-                    // This pixel is the "later" arrival if the neighbor
-                    // has strictly lower priority, or same priority but
-                    // lower label (consistent tie-breaker).
                     if (npri < my_pri ||
                         (npri == my_pri && nlabel < my_label)) {{
                         is_boundary = 1;
@@ -1139,100 +1168,18 @@ def _get_watershed_line_kernel_2d(connectivity=1):
             }}
         }}
 """
-
-    kernel_code = f"""
-extern "C" __global__
-void watershed_line_2d(
-    const int* __restrict__ labels_in,
-    const float* __restrict__ priority,
-    int* __restrict__ labels_out,
-    int width,
-    int height
-) {{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-
-    int idx = y * width + x;
-    int my_label = labels_in[idx];
-
-    // Non-labeled pixels (masked out) stay as 0
-    if (my_label == 0) {{
-        labels_out[idx] = 0;
-        return;
-    }}
-
-    float my_pri = priority[idx];
-    int is_boundary = 0;
-    {neighbor_check}
-
-    labels_out[idx] = is_boundary ? 0 : my_label;
-}}
-"""
-    return cp.RawKernel(kernel_code, "watershed_line_2d")
-
-
-@cp.memoize(for_each_device=True)
-def _get_watershed_line_kernel_1d():
-    """Get post-processing kernel to create 1-pixel watershed lines (1D)."""
-    neighbors = _get_neighbor_offsets_1d()
-
-    neighbor_check = ""
-    for i, (dx,) in enumerate(neighbors):
-        neighbor_check += f"""
-        {{
-            int nx = x + ({dx});
-            if (nx >= 0 && nx < size) {{
-                int nlabel = labels_in[nx];
-                if (nlabel != 0 && nlabel != my_label) {{
-                    float npri = priority[nx];
-                    if (npri < my_pri ||
-                        (npri == my_pri && nlabel < my_label)) {{
-                        is_boundary = 1;
-                    }}
-                }}
-            }}
-        }}
-"""
-
-    kernel_code = f"""
-extern "C" __global__
-void watershed_line_1d(
-    const int* __restrict__ labels_in,
-    const float* __restrict__ priority,
-    int* __restrict__ labels_out,
-    int size
-) {{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x >= size) return;
-
-    int my_label = labels_in[x];
-    if (my_label == 0) {{
-        labels_out[x] = 0;
-        return;
-    }}
-
-    float my_pri = priority[x];
-    int is_boundary = 0;
-    {neighbor_check}
-
-    labels_out[x] = is_boundary ? 0 : my_label;
-}}
-"""
-    return cp.RawKernel(kernel_code, "watershed_line_1d")
-
-
-@cp.memoize(for_each_device=True)
-def _get_watershed_line_kernel_3d(connectivity=1):
-    """Get post-processing kernel to create 1-pixel watershed lines (3D).
-
-    Same priority-based logic as the 2D variant but for volumetric data.
-    """
-    neighbors = _get_neighbor_offsets_3d(connectivity)
-
-    neighbor_check = ""
-    for i, (dz, dy, dx) in enumerate(neighbors):
-        neighbor_check += f"""
+    else:  # ndim == 3
+        coord_code = (
+            "int x = idx % width;\n"
+            "    int y = (idx / width) % height;\n"
+            "    int z = idx / (width * height);"
+        )
+        dim_params = "int width, int height, int depth"
+        size_expr = "width * height * depth"
+        neighbors = _get_neighbor_offsets_3d(connectivity)
+        neighbor_check = ""
+        for i, (dz, dy, dx) in enumerate(neighbors):
+            neighbor_check += f"""
         {{
             int nz = z + ({dz});
             int ny = y + ({dy});
@@ -1253,24 +1200,19 @@ def _get_watershed_line_kernel_3d(connectivity=1):
 
     kernel_code = f"""
 extern "C" __global__
-void watershed_line_3d(
+void watershed_line(
     const int* __restrict__ labels_in,
     const float* __restrict__ priority,
     int* __restrict__ labels_out,
-    int width,
-    int height,
-    int depth
+    {dim_params}
 ) {{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = width * height * depth;
+    int size = {size_expr};
     if (idx >= size) return;
 
-    int x = idx % width;
-    int y = (idx / width) % height;
-    int z = idx / (width * height);
+    {coord_code}
 
     int my_label = labels_in[idx];
-
     if (my_label == 0) {{
         labels_out[idx] = 0;
         return;
@@ -1283,7 +1225,7 @@ void watershed_line_3d(
     labels_out[idx] = is_boundary ? 0 : my_label;
 }}
 """
-    return cp.RawKernel(kernel_code, "watershed_line_3d")
+    return cp.RawKernel(kernel_code, "watershed_line")
 
 
 def _validate_inputs(image, markers, mask, connectivity):
@@ -1391,326 +1333,6 @@ def _validate_inputs(image, markers, mask, connectivity):
             markers = markers.astype(cp.int32)
 
     return image, markers, mask, connectivity
-
-
-def watershed(
-    image,
-    markers=None,
-    connectivity=1,
-    mask=None,
-    compactness=0,
-    watershed_line=False,
-    *,
-    use_block_async=None,
-    use_age=False,
-):
-    """Watershed segmentation using cellular automaton algorithm.
-
-    This function implements a GPU-accelerated watershed transform using
-    a cellular automaton approach. The algorithm is particularly efficient
-    for seeded watershed segmentation on 2D and 3D images.
-
-    Parameters
-    ----------
-    image : cupy.ndarray, shape (M, N) or (D, M, N)
-        Input image (typically a gradient magnitude or distance transform).
-        Lower values have higher priority for watershed expansion.
-        Supports both 2D and 3D images.
-    markers : int, cupy.ndarray of int, or None, optional
-        The desired number of basins, or an array marking the basins with
-        the values to be assigned in the label matrix. Zero means not a
-        marker. If None (default), markers are determined as the local
-        minima of the image, using
-        :func:`cucim.skimage.morphology.local_minima` followed by
-        :func:`cupyx.scipy.ndimage.label` (with the same given
-        `connectivity`). If an int, that many regularly-spaced markers
-        are generated using :func:`cucim.skimage.util.regular_seeds`.
-        If an array, non-zero values represent different regions to grow
-        from. Negative markers are supported (e.g., -1 for background).
-    connectivity : int, optional
-        Neighborhood connectivity as integer:
-        - For 2D images:
-          - 1: 4-connectivity (von Neumann neighborhood - orthogonal neighbors)
-          - 2: 8-connectivity (Moore neighborhood - includes diagonals)
-        - For 3D images:
-          - 1: 6-connectivity (face neighbors)
-          - 2: 18-connectivity (face + edge neighbors)
-          - 3: 26-connectivity (face + edge + corner neighbors)
-        Default is 1.
-    mask : cupy.ndarray of bool, shape (M, N) or (D, M, N), optional
-        If provided, only pixels/voxels where mask is True will be segmented.
-        Useful for restricting watershed to regions of interest.
-    compactness : float, optional
-        Use compact watershed with given compactness parameter (2D only).
-        Higher values give more regularly-shaped basins. When compactness
-        is non-zero, the priority is computed as:
-            priority = (
-                image[pixel] + compactness * euclidean_distance(pixel, marker)
-            )
-        Typical values range from 0.001 to 1.0. Default is 0 (standard
-        watershed based purely on image values).
-    watershed_line : bool, optional
-        If True, a one-pixel wide line separates the regions obtained by
-        the watershed algorithm. The line has the label 0. This is
-        implemented as a post-processing step after the CA iteration
-        converges (see Notes). Default is False.
-    use_block_async : bool or None, optional
-        Parameter to control algorithm variant for standard watershed.
-        If None (default), automatically chooses based on image size.
-        If True, uses block-asynchronous algorithm with shared memory tiling.
-        If False, uses synchronous algorithm.
-        This variant is only implemented for 2D images and only affects the
-        standard watershed (compactness=0). Not used when use_age=True.
-    use_age : bool, optional
-        If True (default), use an age (hop distance) counter as a
-        tie-breaker when two labels arrive at a pixel with equal priority.
-        This more closely matches scikit-image's age-based tie-breaking
-        behavior, producing fairer splits on plateau regions. If False,
-        ties are broken by neighbor iteration order (less deterministic).
-        Only affects the standard watershed (compactness=0).
-
-    Returns
-    -------
-    labels : cupy.ndarray of int, shape (M, N) or (D, M, N)
-        Labeled array, where each basin is assigned a unique positive
-        integer label matching the input markers.
-
-    Raises
-    ------
-    ValueError
-        If input arrays have incompatible shapes or invalid parameters.
-    NotImplementedError
-        If watershed_line is used, or if compactness is used with 3D images.
-
-    Notes
-    -----
-    This implementation uses a cellular automaton (CA) approach, which is
-    well-suited for GPU parallelization. The algorithm iteratively propagates
-    labels from seed points (markers) to neighboring pixels based on their
-    values in the input image.
-
-    The algorithm is based on the CA-watershed method described in [1]_.
-    Unlike the classical priority queue-based watershed, this approach
-    processes all pixels in parallel during each iteration, making it
-    highly efficient on GPU architectures.
-
-    The compact watershed extension follows the approach from scikit-image [2]_,
-    which adds a distance penalty to encourage more regularly-shaped regions.
-    This is useful for superpixel generation (2D only).
-
-    Current limitations:
-    - watershed_line parameter is not yet implemented
-    - compactness parameter is only supported for 2D images
-    - block-async optimization is only available for 2D images
-
-    References
-    ----------
-    .. [1] Kauffmann, C., & Piche, N. (2010). Cellular automaton for
-           ultra-fast watershed transform on GPU. In Pattern Recognition
-           (ICPR), 2010 20th International Conference on (pp. 447-450). IEEE.
-
-    .. [2] Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive
-           SLIC: On Improving Trade-offs of Superpixel Segmentation Algorithms.
-           In Pattern Recognition (ICPR), 2014 22nd International Conference on.
-
-    Examples
-    --------
-    >>> import cupy as cp
-    >>> from cucim.skimage import segmentation
-    >>> from cupyx.scipy import ndimage as ndi
-
-    Create a simple test image with two peaks:
-
-    >>> image = cp.zeros((10, 10), dtype=cp.float32)
-    >>> image[2, 2] = 1
-    >>> image[7, 7] = 1
-    >>> image = ndi.gaussian_filter(image, sigma=1.0)
-
-    Create markers at the peaks:
-
-    >>> markers = cp.zeros((10, 10), dtype=cp.int32)
-    >>> markers[2, 2] = 1
-    >>> markers[7, 7] = 2
-
-    Apply watershed:
-
-    >>> labels = segmentation.watershed(-image, markers)
-    >>> labels.shape
-    (10, 10)
-    >>> cp.unique(labels)
-    array([1, 2])
-
-    Apply compact watershed for more regular regions:
-
-    >>> labels_compact = segmentation.watershed(-image,
-    >>>                                         markers, compactness=0.1)
-    """
-    # Save original marker dtype for output casting
-    if isinstance(markers, (cp.ndarray, np.ndarray)):
-        out_dtype = markers.dtype
-    else:
-        out_dtype = cp.int32
-
-    # Validate and prepare inputs
-    image, markers, mask, connectivity = _validate_inputs(
-        image, markers, mask, connectivity
-    )
-
-    ndim = image.ndim
-
-    # Check dimensionality
-    if ndim not in (1, 2, 3):
-        raise NotImplementedError(
-            f"Only 1D, 2D and 3D images are supported, got {ndim}D"
-        )
-
-    # Check compactness support
-    if compactness != 0 and ndim != 2:
-        raise NotImplementedError(
-            "compactness parameter is only supported for 2D images"
-        )
-
-    # Get dimensions
-    if ndim == 1:
-        (size,) = image.shape
-        height = width = depth = None
-    elif ndim == 2:
-        height, width = image.shape
-        depth = None
-        size = height * width
-    else:  # ndim == 3
-        depth, height, width = image.shape
-        size = depth * height * width
-
-    # Prepare mask
-    if mask is not None:
-        mask_flat = cp.ascontiguousarray(mask.ravel())
-        has_mask = cp.int32(1)
-    else:
-        # Create a dummy array filled with 1s (all pixels valid)
-        mask_flat = cp.ones(size, dtype=cp.uint8)
-        has_mask = cp.int32(0)
-
-    # Thread/block configuration
-    threads_per_block = 256
-    blocks = (size + threads_per_block - 1) // threads_per_block
-
-    # 2D block and grid configuration for step kernel (only used for 2D)
-    if ndim == 2:
-        block_size_2d = (16, 16)
-        grid_size_2d = (
-            (width + block_size_2d[0] - 1) // block_size_2d[0],
-            (height + block_size_2d[1] - 1) // block_size_2d[1],
-        )
-    else:
-        block_size_2d = None
-        grid_size_2d = None
-
-    # Upper bound on iterations (shouldn't need this many)
-    max_iterations = max(image.shape) * 2
-
-    # Ensure image is contiguous and flat for kernel
-    image_flat = cp.ascontiguousarray(image.ravel())
-
-    # Use different code paths for standard vs compact watershed
-    if compactness == 0:
-        # Determine whether to use block-async algorithm (2D only)
-        # Block-async does not support age tie-breaking yet
-        if use_block_async is None:
-            use_block_async = (
-                ndim == 2 and min(height, width) >= 128 and not use_age
-            )
-
-    # common kwargs regardless of which watershed implementation is called
-    common_kwargs = dict(
-        image_flat=image_flat,
-        markers=markers,
-        mask_flat=mask_flat,
-        has_mask=has_mask,
-        connectivity=connectivity,
-        size=size,
-        width=width,
-        height=height,
-        blocks=blocks,
-        threads_per_block=threads_per_block,
-        max_iterations=max_iterations,
-    )
-
-    if compactness == 0:
-        if use_block_async and ndim == 2 and not use_age:
-            labels, state, priority, changed = _watershed_standard_block_async(
-                **common_kwargs,
-                inner_iterations=16,
-            )
-        else:
-            labels, state, priority, changed = _watershed_standard(
-                **common_kwargs,
-                ndim=ndim,
-                depth=depth,
-                grid_size_2d=grid_size_2d,
-                block_size_2d=block_size_2d,
-                use_age=use_age,
-            )
-    else:
-        (
-            labels,
-            state,
-            priority,
-            source_x,
-            source_y,
-            changed,
-        ) = _watershed_compact(
-            **common_kwargs,
-            compactness=compactness,
-            grid_size=grid_size_2d,
-            block_size=block_size_2d,
-        )
-
-    # Post-processing: create watershed lines if requested
-    if watershed_line:
-        labels_out = cp.empty_like(labels)
-        if ndim == 1:
-            wl_kernel = _get_watershed_line_kernel_1d()
-            wl_kernel(
-                (blocks,),
-                (threads_per_block,),
-                (labels, priority, labels_out, int(size)),
-            )
-        elif ndim == 2:
-            wl_kernel = _get_watershed_line_kernel_2d(connectivity)
-            wl_kernel(
-                grid_size_2d,
-                block_size_2d,
-                (labels, priority, labels_out, int(width), int(height)),
-            )
-        else:  # ndim == 3
-            wl_kernel = _get_watershed_line_kernel_3d(connectivity)
-            wl_kernel(
-                (blocks,),
-                (threads_per_block,),
-                (
-                    labels,
-                    priority,
-                    labels_out,
-                    int(width),
-                    int(height),
-                    int(depth),
-                ),
-            )
-        labels = labels_out
-
-    # Reshape back to original dimensions
-    if ndim == 1:
-        result = labels.reshape(size)
-    elif ndim == 2:
-        result = labels.reshape(height, width)
-    else:
-        result = labels.reshape(depth, height, width)
-
-    # Cast to original marker dtype
-    if result.dtype != out_dtype:
-        result = result.astype(out_dtype)
-    return result
 
 
 def _watershed_standard(
@@ -1990,3 +1612,298 @@ def _watershed_compact(
             break
 
     return labels, state, priority, source_x, source_y, changed
+
+
+def watershed(
+    image,
+    markers=None,
+    connectivity=1,
+    mask=None,
+    compactness=0,
+    watershed_line=False,
+    *,
+    use_block_async=None,
+    use_age=False,
+):
+    """Watershed segmentation using cellular automaton algorithm.
+
+    This function implements a GPU-accelerated watershed transform using
+    a cellular automaton approach. The algorithm is particularly efficient
+    for seeded watershed segmentation on 2D and 3D images.
+
+    Parameters
+    ----------
+    image : cupy.ndarray, shape (M, N) or (D, M, N)
+        Input image (typically a gradient magnitude or distance transform).
+        Lower values have higher priority for watershed expansion.
+        Supports both 2D and 3D images.
+    markers : int, cupy.ndarray of int, or None, optional
+        The desired number of basins, or an array marking the basins with
+        the values to be assigned in the label matrix. Zero means not a
+        marker. If None (default), markers are determined as the local
+        minima of the image, using
+        :func:`cucim.skimage.morphology.local_minima` followed by
+        :func:`cupyx.scipy.ndimage.label` (with the same given
+        `connectivity`). If an int, that many regularly-spaced markers
+        are generated using :func:`cucim.skimage.util.regular_seeds`.
+        If an array, non-zero values represent different regions to grow
+        from. Negative markers are supported (e.g., -1 for background).
+    connectivity : int, optional
+        Neighborhood connectivity as integer:
+        - For 2D images:
+          - 1: 4-connectivity (von Neumann neighborhood - orthogonal neighbors)
+          - 2: 8-connectivity (Moore neighborhood - includes diagonals)
+        - For 3D images:
+          - 1: 6-connectivity (face neighbors)
+          - 2: 18-connectivity (face + edge neighbors)
+          - 3: 26-connectivity (face + edge + corner neighbors)
+        Default is 1.
+    mask : cupy.ndarray of bool, shape (M, N) or (D, M, N), optional
+        If provided, only pixels/voxels where mask is True will be segmented.
+        Useful for restricting watershed to regions of interest.
+    compactness : float, optional
+        Use compact watershed with given compactness parameter (2D only).
+        Higher values give more regularly-shaped basins. When compactness
+        is non-zero, the priority is computed as:
+            priority = (
+                image[pixel] + compactness * euclidean_distance(pixel, marker)
+            )
+        Typical values range from 0.001 to 1.0. Default is 0 (standard
+        watershed based purely on image values).
+    watershed_line : bool, optional
+        If True, a one-pixel wide line separates the regions obtained by
+        the watershed algorithm. The line has the label 0. This is
+        implemented as a post-processing step after the CA iteration
+        converges (see Notes). Default is False.
+    use_block_async : bool or None, optional
+        Parameter to control algorithm variant for standard watershed.
+        If None (default), automatically chooses based on image size.
+        If True, uses block-asynchronous algorithm with shared memory tiling.
+        If False, uses synchronous algorithm.
+        This variant is only implemented for 2D images and only affects the
+        standard watershed (compactness=0). Not used when use_age=True.
+    use_age : bool, optional
+        If True (default), use an age (hop distance) counter as a
+        tie-breaker when two labels arrive at a pixel with equal priority.
+        This more closely matches scikit-image's age-based tie-breaking
+        behavior, producing fairer splits on plateau regions. If False,
+        ties are broken by neighbor iteration order (less deterministic).
+        Only affects the standard watershed (compactness=0).
+
+    Returns
+    -------
+    labels : cupy.ndarray of int, shape (M, N) or (D, M, N)
+        Labeled array, where each basin is assigned a unique positive
+        integer label matching the input markers.
+
+    Raises
+    ------
+    ValueError
+        If input arrays have incompatible shapes or invalid parameters.
+    NotImplementedError
+        If watershed_line is used, or if compactness is used with 3D images.
+
+    Notes
+    -----
+    This implementation uses a cellular automaton (CA) approach, which is
+    well-suited for GPU parallelization. The algorithm iteratively propagates
+    labels from seed points (markers) to neighboring pixels based on their
+    values in the input image.
+
+    The algorithm is based on the CA-watershed method described in [1]_.
+    Unlike the classical priority queue-based watershed, this approach
+    processes all pixels in parallel during each iteration, making it
+    highly efficient on GPU architectures.
+
+    The compact watershed extension follows the approach from scikit-image [2]_,
+    which adds a distance penalty to encourage more regularly-shaped regions.
+    This is useful for superpixel generation (2D only).
+
+    Current limitations:
+    - watershed_line parameter is not yet implemented
+    - compactness parameter is only supported for 2D images
+    - block-async optimization is only available for 2D images
+
+    References
+    ----------
+    .. [1] Kauffmann, C., & Piche, N. (2010). Cellular automaton for
+           ultra-fast watershed transform on GPU. In Pattern Recognition
+           (ICPR), 2010 20th International Conference on (pp. 447-450). IEEE.
+
+    .. [2] Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive
+           SLIC: On Improving Trade-offs of Superpixel Segmentation Algorithms.
+           In Pattern Recognition (ICPR), 2014 22nd International Conference on.
+
+    Examples
+    --------
+    >>> import cupy as cp
+    >>> from cucim.skimage import segmentation
+    >>> from cupyx.scipy import ndimage as ndi
+
+    Create a simple test image with two peaks:
+
+    >>> image = cp.zeros((10, 10), dtype=cp.float32)
+    >>> image[2, 2] = 1
+    >>> image[7, 7] = 1
+    >>> image = ndi.gaussian_filter(image, sigma=1.0)
+
+    Create markers at the peaks:
+
+    >>> markers = cp.zeros((10, 10), dtype=cp.int32)
+    >>> markers[2, 2] = 1
+    >>> markers[7, 7] = 2
+
+    Apply watershed:
+
+    >>> labels = segmentation.watershed(-image, markers)
+    >>> labels.shape
+    (10, 10)
+    >>> cp.unique(labels)
+    array([1, 2])
+
+    Apply compact watershed for more regular regions:
+
+    >>> labels_compact = segmentation.watershed(-image,
+    >>>                                         markers, compactness=0.1)
+    """
+    # Save original marker dtype for output casting
+    if isinstance(markers, (cp.ndarray, np.ndarray)):
+        out_dtype = markers.dtype
+    else:
+        out_dtype = cp.int32
+
+    # Validate and prepare inputs
+    image, markers, mask, connectivity = _validate_inputs(
+        image, markers, mask, connectivity
+    )
+
+    ndim = image.ndim
+
+    # Check dimensionality
+    if ndim not in (1, 2, 3):
+        raise NotImplementedError(
+            f"Only 1D, 2D and 3D images are supported, got {ndim}D"
+        )
+
+    # Check compactness support
+    if compactness != 0 and ndim != 2:
+        raise NotImplementedError(
+            "compactness parameter is only supported for 2D images"
+        )
+
+    # Get dimensions
+    if ndim == 1:
+        (size,) = image.shape
+        height = width = depth = None
+    elif ndim == 2:
+        height, width = image.shape
+        depth = None
+        size = height * width
+    else:  # ndim == 3
+        depth, height, width = image.shape
+        size = depth * height * width
+
+    # Prepare mask
+    if mask is not None:
+        mask_flat = cp.ascontiguousarray(mask.ravel())
+        has_mask = cp.int32(1)
+    else:
+        # Create a dummy array filled with 1s (all pixels valid)
+        mask_flat = cp.ones(size, dtype=cp.uint8)
+        has_mask = cp.int32(0)
+
+    # Thread/block configuration
+    threads_per_block = 256
+    blocks = (size + threads_per_block - 1) // threads_per_block
+
+    # 2D block and grid configuration for step kernel (only used for 2D)
+    if ndim == 2:
+        block_size_2d = (16, 16)
+        grid_size_2d = (
+            (width + block_size_2d[0] - 1) // block_size_2d[0],
+            (height + block_size_2d[1] - 1) // block_size_2d[1],
+        )
+    else:
+        block_size_2d = None
+        grid_size_2d = None
+
+    # Upper bound on iterations (shouldn't need this many)
+    max_iterations = max(image.shape) * 2
+
+    # Ensure image is contiguous and flat for kernel
+    image_flat = cp.ascontiguousarray(image.ravel())
+
+    # Use different code paths for standard vs compact watershed
+    if compactness == 0:
+        # Determine whether to use block-async algorithm (2D only)
+        # Block-async does not support age tie-breaking yet
+        if use_block_async is None:
+            use_block_async = (
+                ndim == 2 and min(height, width) >= 128 and not use_age
+            )
+
+    # common kwargs regardless of which watershed implementation is called
+    common_kwargs = dict(
+        image_flat=image_flat,
+        markers=markers,
+        mask_flat=mask_flat,
+        has_mask=has_mask,
+        connectivity=connectivity,
+        size=size,
+        width=width,
+        height=height,
+        blocks=blocks,
+        threads_per_block=threads_per_block,
+        max_iterations=max_iterations,
+    )
+
+    if compactness == 0:
+        if use_block_async and ndim == 2 and not use_age:
+            labels, state, priority, changed = _watershed_standard_block_async(
+                **common_kwargs,
+                inner_iterations=16,
+            )
+        else:
+            labels, state, priority, changed = _watershed_standard(
+                **common_kwargs,
+                ndim=ndim,
+                depth=depth,
+                grid_size_2d=grid_size_2d,
+                block_size_2d=block_size_2d,
+                use_age=use_age,
+            )
+    else:
+        (
+            labels,
+            state,
+            priority,
+            source_x,
+            source_y,
+            changed,
+        ) = _watershed_compact(
+            **common_kwargs,
+            compactness=compactness,
+            grid_size=grid_size_2d,
+            block_size=block_size_2d,
+        )
+
+    # Post-processing: create watershed lines if requested
+    if watershed_line:
+        labels_out = cp.empty_like(labels)
+        wl_kernel = _get_watershed_line_kernel(ndim, connectivity)
+        # Kernel expects (width, height[, depth]) = reversed shape order
+        dim_args = tuple(int(s) for s in reversed(image.shape))
+        wl_kernel(
+            (blocks,),
+            (threads_per_block,),
+            (labels, priority, labels_out, *dim_args),
+        )
+        labels = labels_out
+
+    # Reshape back to original dimensions
+    result = labels.reshape(image.shape)
+
+    # Cast to original marker dtype
+    if result.dtype != out_dtype:
+        result = result.astype(out_dtype)
+    return result
