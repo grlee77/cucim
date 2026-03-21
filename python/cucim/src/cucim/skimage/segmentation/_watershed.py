@@ -1170,6 +1170,12 @@ def watershed(
             "watershed_line parameter is not yet implemented"
         )
 
+    # Save original marker dtype for output casting
+    if isinstance(markers, (cp.ndarray, np.ndarray)):
+        out_dtype = markers.dtype
+    else:
+        out_dtype = cp.int32
+
     # Validate and prepare inputs
     image, markers, mask, connectivity = _validate_inputs(
         image, markers, mask, connectivity
@@ -1304,9 +1310,14 @@ def watershed(
 
     # Reshape back to original dimensions
     if ndim == 2:
-        return labels.reshape(height, width)
+        result = labels.reshape(height, width)
     else:
-        return labels.reshape(depth, height, width)
+        result = labels.reshape(depth, height, width)
+
+    # Cast to original marker dtype
+    if result.dtype != out_dtype:
+        result = result.astype(out_dtype)
+    return result
 
 
 def _watershed_standard(
