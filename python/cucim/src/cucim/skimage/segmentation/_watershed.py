@@ -153,6 +153,11 @@ void watershed_compact_init(
     )
 
 
+def _get_neighbor_offsets_1d():
+    """Get 1D neighbor offsets (left and right)."""
+    return [(-1,), (1,)]
+
+
 def _get_neighbor_offsets_2d(connectivity):
     """Get 2D neighbor offsets based on connectivity.
 
@@ -384,6 +389,108 @@ void watershed_step_2d(
 """
 
     return cp.RawKernel(kernel_code, "watershed_step_2d")
+
+
+@cp.memoize(for_each_device=True)
+def _get_watershed_step_kernel_1d(use_age=False):
+    """Get iteration kernel for 1D CA-watershed.
+
+    Uses 1D grid with left/right neighbors only (connectivity=1).
+    """
+    neighbors = _get_neighbor_offsets_1d()
+
+    neighbor_code = ""
+    for i, (dx,) in enumerate(neighbors):
+        age_read = "int nage = age[nidx];" if use_age else ""
+        age_new = "int new_age = nage + 1;" if use_age else ""
+        if use_age:
+            better_path_cmp = (
+                "if (new_priority < best_priority ||\n"
+                "                    (new_priority == best_priority "
+                "&& new_age < best_age))"
+            )
+            age_update = "best_age = new_age;"
+        else:
+            better_path_cmp = "if (new_priority < best_priority)"
+            age_update = ""
+
+        neighbor_code += f"""
+    {{
+        int nx = x + ({dx});
+        if (nx >= 0 && nx < size) {{
+            int nidx = nx;
+            int nlabel = labels[nidx];
+            float npriority = priority[nidx];
+            {age_read}
+
+            if (nlabel != 0) {{
+                float new_priority = image[idx];
+                if (new_priority < npriority) {{
+                    new_priority = npriority;
+                }}
+
+                {age_new}
+
+                {better_path_cmp} {{
+                    best_priority = new_priority;
+                    {age_update}
+                    best_label = nlabel;
+                    found_label = 1;
+                }}
+            }}
+        }}
+    }}
+"""
+
+    age_param = "int* __restrict__ age," if use_age else ""
+    age_best_init = "int best_age = age[idx];" if use_age else ""
+    if use_age:
+        better_path_final_cmp = (
+            "if (best_priority < priority[idx] ||\n"
+            "            (best_priority == priority[idx] "
+            "&& best_age < age[idx]))"
+        )
+        age_final_update = "age[idx] = best_age;"
+    else:
+        better_path_final_cmp = "if (best_priority < priority[idx])"
+        age_final_update = ""
+
+    kernel_code = f"""
+extern "C" __global__
+void watershed_step_1d(
+    const float* __restrict__ image,
+    int* __restrict__ labels,
+    unsigned char* __restrict__ state,
+    float* __restrict__ priority,
+    {age_param}
+    int* __restrict__ changed,
+    int size
+) {{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= size) return;
+
+    int idx = x;
+    if (state[idx] != 2) return;
+
+    float best_priority = priority[idx];
+    {age_best_init}
+    int best_label = 0;
+    int found_label = 0;
+
+    {neighbor_code}
+
+    if (found_label && best_label != 0) {{
+        {better_path_final_cmp} {{
+            labels[idx] = best_label;
+            priority[idx] = best_priority;
+            {age_final_update}
+
+            atomicAdd(changed, 1);
+        }}
+    }}
+}}
+"""
+    return cp.RawKernel(kernel_code, "watershed_step_1d")
 
 
 @cp.memoize(for_each_device=True)
@@ -1066,6 +1173,56 @@ void watershed_line_2d(
 
 
 @cp.memoize(for_each_device=True)
+def _get_watershed_line_kernel_1d():
+    """Get post-processing kernel to create 1-pixel watershed lines (1D)."""
+    neighbors = _get_neighbor_offsets_1d()
+
+    neighbor_check = ""
+    for i, (dx,) in enumerate(neighbors):
+        neighbor_check += f"""
+        {{
+            int nx = x + ({dx});
+            if (nx >= 0 && nx < size) {{
+                int nlabel = labels_in[nx];
+                if (nlabel != 0 && nlabel != my_label) {{
+                    float npri = priority[nx];
+                    if (npri < my_pri ||
+                        (npri == my_pri && nlabel < my_label)) {{
+                        is_boundary = 1;
+                    }}
+                }}
+            }}
+        }}
+"""
+
+    kernel_code = f"""
+extern "C" __global__
+void watershed_line_1d(
+    const int* __restrict__ labels_in,
+    const float* __restrict__ priority,
+    int* __restrict__ labels_out,
+    int size
+) {{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= size) return;
+
+    int my_label = labels_in[x];
+    if (my_label == 0) {{
+        labels_out[x] = 0;
+        return;
+    }}
+
+    float my_pri = priority[x];
+    int is_boundary = 0;
+    {neighbor_check}
+
+    labels_out[x] = is_boundary ? 0 : my_label;
+}}
+"""
+    return cp.RawKernel(kernel_code, "watershed_line_1d")
+
+
+@cp.memoize(for_each_device=True)
 def _get_watershed_line_kernel_3d(connectivity=1):
     """Get post-processing kernel to create 1-pixel watershed lines (3D).
 
@@ -1173,17 +1330,11 @@ def _validate_inputs(image, markers, mask, connectivity):
     connectivity = int(connectivity)
 
     # Check connectivity value based on dimensionality
-    if ndim == 2:
-        if connectivity not in (1, 2):
-            raise ValueError(
-                f"connectivity must be 1 or 2 for 2D images, got {connectivity}"
-            )
-    elif ndim == 3:
-        if connectivity not in (1, 2, 3):
-            raise ValueError(
-                f"connectivity must be 1, 2, or 3 for 3D images, "
-                f"got {connectivity}"
-            )
+    if connectivity not in range(1, ndim + 1):
+        raise ValueError(
+            f"connectivity must be in [1, {ndim}] for {ndim}D images, "
+            f"got {connectivity}"
+        )
 
     # Convert image to float32 for processing
     if image.dtype != cp.float32:
@@ -1408,9 +1559,9 @@ def watershed(
     ndim = image.ndim
 
     # Check dimensionality
-    if ndim not in (2, 3):
+    if ndim not in (1, 2, 3):
         raise NotImplementedError(
-            f"Only 2D and 3D images are supported, got {ndim}D"
+            f"Only 1D, 2D and 3D images are supported, got {ndim}D"
         )
 
     # Check compactness support
@@ -1420,7 +1571,10 @@ def watershed(
         )
 
     # Get dimensions
-    if ndim == 2:
+    if ndim == 1:
+        (size,) = image.shape
+        height = width = depth = None
+    elif ndim == 2:
         height, width = image.shape
         depth = None
         size = height * width
@@ -1453,10 +1607,7 @@ def watershed(
         grid_size_2d = None
 
     # Upper bound on iterations (shouldn't need this many)
-    if ndim == 2:
-        max_iterations = max(height, width) * 2
-    else:
-        max_iterations = max(depth, height, width) * 2
+    max_iterations = max(image.shape) * 2
 
     # Ensure image is contiguous and flat for kernel
     image_flat = cp.ascontiguousarray(image.ravel())
@@ -1470,45 +1621,37 @@ def watershed(
                 ndim == 2 and min(height, width) >= 128 and not use_age
             )
 
+    # common kwargs regardless of which watershed implementation is called
+    common_kwargs = dict(
+        image_flat=image_flat,
+        markers=markers,
+        mask_flat=mask_flat,
+        has_mask=has_mask,
+        connectivity=connectivity,
+        size=size,
+        width=width,
+        height=height,
+        blocks=blocks,
+        threads_per_block=threads_per_block,
+        max_iterations=max_iterations,
+    )
+
+    if compactness == 0:
         if use_block_async and ndim == 2 and not use_age:
-            # Block-asynchronous watershed with shared memory tiling (2D only)
             labels, state, priority, changed = _watershed_standard_block_async(
-                image_flat,
-                markers,
-                mask_flat,
-                has_mask,
-                connectivity,
-                size,
-                width,
-                height,
-                blocks,
-                threads_per_block,
-                max_iterations,
+                **common_kwargs,
                 inner_iterations=16,
             )
         else:
-            # Standard synchronous watershed (2D or 3D)
             labels, state, priority, changed = _watershed_standard(
-                image_flat,
-                markers,
-                mask_flat,
-                has_mask,
-                connectivity,
-                ndim,
-                size,
-                width,
-                height,
-                depth,
-                blocks,
-                threads_per_block,
-                grid_size_2d,
-                block_size_2d,
-                max_iterations,
+                **common_kwargs,
+                ndim=ndim,
+                depth=depth,
+                grid_size_2d=grid_size_2d,
+                block_size_2d=block_size_2d,
                 use_age=use_age,
             )
     else:
-        # Compact watershed (floating-point priority with distance penalty)
-        # Only 2D is supported for compact watershed
         (
             labels,
             state,
@@ -1517,26 +1660,23 @@ def watershed(
             source_y,
             changed,
         ) = _watershed_compact(
-            image_flat,
-            markers,
-            mask_flat,
-            has_mask,
-            connectivity,
-            compactness,
-            size,
-            width,
-            height,
-            blocks,
-            threads_per_block,
-            grid_size_2d,
-            block_size_2d,
-            max_iterations,
+            **common_kwargs,
+            compactness=compactness,
+            grid_size=grid_size_2d,
+            block_size=block_size_2d,
         )
 
     # Post-processing: create watershed lines if requested
     if watershed_line:
         labels_out = cp.empty_like(labels)
-        if ndim == 2:
+        if ndim == 1:
+            wl_kernel = _get_watershed_line_kernel_1d()
+            wl_kernel(
+                (blocks,),
+                (threads_per_block,),
+                (labels, priority, labels_out, int(size)),
+            )
+        elif ndim == 2:
             wl_kernel = _get_watershed_line_kernel_2d(connectivity)
             wl_kernel(
                 grid_size_2d,
@@ -1560,7 +1700,9 @@ def watershed(
         labels = labels_out
 
     # Reshape back to original dimensions
-    if ndim == 2:
+    if ndim == 1:
+        result = labels.reshape(size)
+    elif ndim == 2:
         result = labels.reshape(height, width)
     else:
         result = labels.reshape(depth, height, width)
@@ -1627,7 +1769,21 @@ def _watershed_standard(
     )
 
     # Iteratively propagate labels
-    if ndim == 2:
+    if ndim == 1:
+        step_kernel = _get_watershed_step_kernel_1d(use_age=use_age)
+
+        step_args_base = [image_flat, labels, state, priority]
+        if use_age:
+            step_args_base.append(age)
+        step_args_base.extend([changed, int(size)])
+        step_args = tuple(step_args_base)
+
+        for iteration in range(max_iterations):
+            changed[0] = 0
+            step_kernel((blocks,), (threads_per_block,), step_args)
+            if changed[0] == 0:
+                break
+    elif ndim == 2:
         step_kernel = _get_watershed_step_kernel_2d(
             connectivity, use_age=use_age
         )
