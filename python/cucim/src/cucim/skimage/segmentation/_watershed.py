@@ -988,6 +988,147 @@ void watershed_compact_step_2d(
     return cp.RawKernel(kernel_code, "watershed_compact_step_2d")
 
 
+# --- Watershed line post-processing kernels ---
+
+
+@cp.memoize(for_each_device=True)
+def _get_watershed_line_kernel_2d(connectivity=1):
+    """Get post-processing kernel to create 1-pixel watershed lines (2D).
+
+    After the CA iteration has converged and all pixels have final labels,
+    this kernel identifies boundary pixels. To produce 1-pixel-wide lines
+    (rather than 2-pixel), only the pixel that arrived "later" in the
+    flooding (higher priority) is set to 0. For equal priorities, the
+    pixel with the higher label value is zeroed as a consistent
+    tie-breaker.
+
+    A pixel becomes a boundary (label=0) if any differently-labeled
+    neighbor has strictly lower priority, or has equal priority with a
+    lower label value.
+
+    Reads from labels_in/priority and writes to labels_out.
+    """
+    neighbors = _get_neighbor_offsets_2d(connectivity)
+
+    neighbor_check = ""
+    for i, (dy, dx) in enumerate(neighbors):
+        neighbor_check += f"""
+        {{
+            int ny = y + ({dy});
+            int nx = x + ({dx});
+            if (ny >= 0 && ny < height && nx >= 0 && nx < width) {{
+                int nidx = ny * width + nx;
+                int nlabel = labels_in[nidx];
+                if (nlabel != 0 && nlabel != my_label) {{
+                    float npri = priority[nidx];
+                    // This pixel is the "later" arrival if the neighbor
+                    // has strictly lower priority, or same priority but
+                    // lower label (consistent tie-breaker).
+                    if (npri < my_pri ||
+                        (npri == my_pri && nlabel < my_label)) {{
+                        is_boundary = 1;
+                    }}
+                }}
+            }}
+        }}
+"""
+
+    kernel_code = f"""
+extern "C" __global__
+void watershed_line_2d(
+    const int* __restrict__ labels_in,
+    const float* __restrict__ priority,
+    int* __restrict__ labels_out,
+    int width,
+    int height
+) {{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    int my_label = labels_in[idx];
+
+    // Non-labeled pixels (masked out) stay as 0
+    if (my_label == 0) {{
+        labels_out[idx] = 0;
+        return;
+    }}
+
+    float my_pri = priority[idx];
+    int is_boundary = 0;
+    {neighbor_check}
+
+    labels_out[idx] = is_boundary ? 0 : my_label;
+}}
+"""
+    return cp.RawKernel(kernel_code, "watershed_line_2d")
+
+
+@cp.memoize(for_each_device=True)
+def _get_watershed_line_kernel_3d(connectivity=1):
+    """Get post-processing kernel to create 1-pixel watershed lines (3D).
+
+    Same priority-based logic as the 2D variant but for volumetric data.
+    """
+    neighbors = _get_neighbor_offsets_3d(connectivity)
+
+    neighbor_check = ""
+    for i, (dz, dy, dx) in enumerate(neighbors):
+        neighbor_check += f"""
+        {{
+            int nz = z + ({dz});
+            int ny = y + ({dy});
+            int nx = x + ({dx});
+            if (nz >= 0 && nz < depth && ny >= 0 && ny < height && nx >= 0 && nx < width) {{
+                int nidx = (nz * height + ny) * width + nx;
+                int nlabel = labels_in[nidx];
+                if (nlabel != 0 && nlabel != my_label) {{
+                    float npri = priority[nidx];
+                    if (npri < my_pri ||
+                        (npri == my_pri && nlabel < my_label)) {{
+                        is_boundary = 1;
+                    }}
+                }}
+            }}
+        }}
+"""  # noqa: E501
+
+    kernel_code = f"""
+extern "C" __global__
+void watershed_line_3d(
+    const int* __restrict__ labels_in,
+    const float* __restrict__ priority,
+    int* __restrict__ labels_out,
+    int width,
+    int height,
+    int depth
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int size = width * height * depth;
+    if (idx >= size) return;
+
+    int x = idx % width;
+    int y = (idx / width) % height;
+    int z = idx / (width * height);
+
+    int my_label = labels_in[idx];
+
+    if (my_label == 0) {{
+        labels_out[idx] = 0;
+        return;
+    }}
+
+    float my_pri = priority[idx];
+    int is_boundary = 0;
+    {neighbor_check}
+
+    labels_out[idx] = is_boundary ? 0 : my_label;
+}}
+"""
+    return cp.RawKernel(kernel_code, "watershed_line_3d")
+
+
 def _validate_inputs(image, markers, mask, connectivity):
     """Validate and prepare inputs for watershed algorithm.
 
@@ -1158,8 +1299,10 @@ def watershed(
         Typical values range from 0.001 to 1.0. Default is 0 (standard
         watershed based purely on image values).
     watershed_line : bool, optional
-        Not yet implemented. Use False (default). In future versions, if
-        True, a one-pixel wide line will separate the basins.
+        If True, a one-pixel wide line separates the regions obtained by
+        the watershed algorithm. The line has the label 0. This is
+        implemented as a post-processing step after the CA iteration
+        converges (see Notes). Default is False.
     use_block_async : bool or None, optional
         Parameter to control algorithm variant for standard watershed.
         If None (default), automatically chooses based on image size.
@@ -1251,12 +1394,6 @@ def watershed(
     >>> labels_compact = segmentation.watershed(-image,
     >>>                                         markers, compactness=0.1)
     """
-    # Check for unsupported features
-    if watershed_line:
-        raise NotImplementedError(
-            "watershed_line parameter is not yet implemented"
-        )
-
     # Save original marker dtype for output casting
     if isinstance(markers, (cp.ndarray, np.ndarray)):
         out_dtype = markers.dtype
@@ -1395,6 +1532,32 @@ def watershed(
             block_size_2d,
             max_iterations,
         )
+
+    # Post-processing: create watershed lines if requested
+    if watershed_line:
+        labels_out = cp.empty_like(labels)
+        if ndim == 2:
+            wl_kernel = _get_watershed_line_kernel_2d(connectivity)
+            wl_kernel(
+                grid_size_2d,
+                block_size_2d,
+                (labels, priority, labels_out, int(width), int(height)),
+            )
+        else:  # ndim == 3
+            wl_kernel = _get_watershed_line_kernel_3d(connectivity)
+            wl_kernel(
+                (blocks,),
+                (threads_per_block,),
+                (
+                    labels,
+                    priority,
+                    labels_out,
+                    int(width),
+                    int(height),
+                    int(depth),
+                ),
+            )
+        labels = labels_out
 
     # Reshape back to original dimensions
     if ndim == 2:
