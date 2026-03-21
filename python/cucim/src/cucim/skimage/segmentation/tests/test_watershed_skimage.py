@@ -532,6 +532,25 @@ class TestWatershed(unittest.TestCase):
         markerbin = data == 0
         marker = label(markerbin)
         ws = watershed(data, marker, connectivity=2, watershed_line=True)
+
+        visualize = False
+        if visualize:
+            import matplotlib.pyplot as plt
+            from skimage.segmentation import watershed as watershed_cpu
+
+            data_cpu = cp.asnumpy(data)
+            marker_cpu = cp.asnumpy(marker)
+            ws_cpu = watershed_cpu(
+                data_cpu, marker_cpu, connectivity=2, watershed_line=True
+            )
+
+            fig, axes = plt.subplots(1, 2)
+            axes[0].imshow(cp.asnumpy(ws))
+            axes[0].set_title("cuCIM result")
+            axes[1].imshow(ws_cpu)
+            axes[1].set_title("skimage result")
+            plt.show()
+
         for lab, area in zip(range(4), [34, 74, 74, 74]):
             self.assertTrue(cp.sum(ws == lab) == area)
 
