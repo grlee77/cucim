@@ -15,6 +15,8 @@ On Improving Trade-offs of Superpixel Segmentation Algorithms.
 In Pattern Recognition (ICPR), 2014 22nd International Conference on.
 """
 
+import itertools
+
 import cupy as cp
 import numpy as np
 from cupyx.scipy import ndimage as ndi
@@ -160,17 +162,81 @@ def _get_neighbor_offsets(ndim, connectivity):
     elif ndim == 3:
         return _get_neighbor_offsets_3d(connectivity)
 
-    # General nD case: enumerate all offsets in {-1, 0, 1}^ndim,
-    # keep those with 1..connectivity non-zero components.
-    offsets = (
-        np.array(np.meshgrid(*([(-1, 0, 1)] * ndim), indexing="ij"))
-        .reshape(ndim, -1)
-        .T
-    )
-    n_nonzero = np.sum(offsets != 0, axis=1)
-    mask = (n_nonzero > 0) & (n_nonzero <= connectivity)
-    order = np.argsort(n_nonzero[mask])
-    return [tuple(int(x) for x in row) for row in offsets[mask][order]]
+    # General nD case
+
+    # All offsets in {-1, 0, 1}^ndim, excluding the origin, filtered by
+    # connectivity (number of non-zero components), sorted by level.
+    offsets = []
+    for off in itertools.product((-1, 0, 1), repeat=ndim):
+        n_nonzero = sum(c != 0 for c in off)
+        if 0 < n_nonzero <= connectivity:
+            offsets.append((n_nonzero, off))
+    offsets.sort(key=lambda x: x[0])
+    return [off for _, off in offsets]
+
+
+@cp.memoize(for_each_device=True)
+def _generate_coord_code(ndim):
+    """Generate CUDA code to extract nD coordinates from a flat index.
+
+    Returns (dim_names, dim_params, size_expr, coord_code) where:
+    - dim_names: list of dimension size variable names in C-order
+    - dim_params: kernel parameter declaration string
+    - size_expr: C expression for total size
+    - coord_code: C code to compute c_0..c_{ndim-1} from idx
+    """
+    dim_names = [f"dim_{j}" for j in range(ndim)]
+    dim_params = ", ".join(f"int {d}" for d in dim_names)
+    size_expr = " * ".join(dim_names)
+
+    coord_lines = []
+    for j in range(ndim - 1, -1, -1):
+        if j == ndim - 1:
+            coord_lines.append(f"int c_{j} = idx % {dim_names[j]};")
+            if ndim > 1:
+                coord_lines.append(f"int _rem_{j} = idx / {dim_names[j]};")
+        elif j == 0:
+            coord_lines.append(f"int c_0 = _rem_{j + 1};")
+        else:
+            coord_lines.append(f"int c_{j} = _rem_{j + 1} % {dim_names[j]};")
+            coord_lines.append(f"int _rem_{j} = _rem_{j + 1} / {dim_names[j]};")
+    coord_code = "\n    ".join(coord_lines)
+
+    return dim_names, dim_params, size_expr, coord_code
+
+
+def _generate_neighbor_nidx(ndim, dim_names, offsets):
+    """Generate CUDA code for neighbor coordinate + flat index computation.
+
+    For each neighbor offset, generates:
+    - nc_0..nc_{ndim-1} neighbor coordinate declarations
+    - bounds check expression
+    - nidx flat index expression
+
+    Returns (nc_decl_str, bounds_str, nidx_expr) for each offset.
+    """
+    results = []
+    for offset in offsets:
+        nc_decls = []
+        bounds = []
+        for j, off in enumerate(offset):
+            nc_decls.append(f"int nc_{j} = c_{j} + ({off});")
+            bounds.append(f"nc_{j} >= 0 && nc_{j} < {dim_names[j]}")
+
+        nc_decl_str = "\n        ".join(nc_decls)
+        bounds_str = " && ".join(bounds)
+
+        nidx_parts = [f"nc_{j}" for j in range(ndim)]
+        nidx_expr = nidx_parts[0]
+        for j in range(1, ndim):
+            nidx_expr = f"({nidx_expr}) * {dim_names[j]} + {nidx_parts[j]}"
+        results.append((nc_decl_str, bounds_str, nidx_expr))
+    return results
+
+
+##############################################
+# Non-compact n-dimensional seeded watershed #
+##############################################
 
 
 # CUDA kernel for initialization (standard watershed)
@@ -234,73 +300,6 @@ void watershed_init(
 }}
 """
     return cp.RawKernel(kernel_code, "watershed_init")
-
-
-# CUDA kernel for initialization (compact watershed)
-@cp.memoize(for_each_device=True)
-def _get_watershed_compact_init_kernel():
-    """Get initialization kernel for compact CA-watershed.
-
-    This kernel initializes the label, state, priority, and source arrays
-    from the marker image. The source arrays track the original marker
-    location for each pixel, needed for Euclidean distance computation.
-    """
-    return cp.RawKernel(
-        r"""
-extern "C" __global__
-void watershed_compact_init(
-    const int* markers,
-    int* labels,
-    unsigned char* state,
-    float* priority,
-    int* source_x,
-    int* source_y,
-    const unsigned char* mask,
-    int has_mask,
-    int width,
-    int size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx >= size) return;
-
-    // Compute 2D coordinates from flat index
-    int x = idx % width;
-    int y = idx / width;
-
-    // Check if pixel is in the mask
-    if (has_mask && !mask[idx]) {
-        labels[idx] = 0;
-        state[idx] = 0;  // WATERSHED (background)
-        priority[idx] = 0.0f;
-        source_x[idx] = -1;
-        source_y[idx] = -1;
-        return;
-    }
-
-    // Initialize from markers
-    int marker_label = markers[idx];
-
-    if (marker_label != 0) {
-        // Seed pixel - already labeled (can be positive or negative)
-        labels[idx] = marker_label;
-        state[idx] = 1;  // LABELED (will not change)
-        priority[idx] = 0.0f;
-        // Source is the marker's own location
-        source_x[idx] = x;
-        source_y[idx] = y;
-    } else {
-        // Unlabeled pixel - to be processed
-        labels[idx] = 0;
-        state[idx] = 2;  // UNLABELED (needs processing)
-        priority[idx] = 3.4028235e+38f;  // FLT_MAX
-        source_x[idx] = -1;
-        source_y[idx] = -1;
-    }
-}
-""",
-        "watershed_compact_init",
-    )
 
 
 @cp.memoize(for_each_device=True)
@@ -431,6 +430,79 @@ void watershed_step(
     return cp.RawKernel(kernel_code, "watershed_step")
 
 
+def _watershed_standard(
+    image_flat,
+    markers,
+    mask_flat,
+    has_mask,
+    connectivity,
+    ndim,
+    image_shape,
+    size,
+    blocks,
+    threads_per_block,
+    max_iterations,
+    use_age=True,
+    **kwargs,
+):
+    """Run standard watershed algorithm (compactness=0).
+
+    Uses image intensity as priority (like scikit-image) to produce
+    regions that follow image gradients rather than compact shapes.
+    """
+    # Initialize state arrays (as contiguous flat arrays)
+    labels = cp.zeros(size, dtype=cp.int32)
+    state = cp.zeros(size, dtype=cp.uint8)
+    priority = cp.zeros(size, dtype=cp.float32)
+    changed = cp.zeros(1, dtype=cp.int32)
+
+    if use_age:
+        age = cp.zeros(size, dtype=cp.int32)
+    else:
+        age = None
+
+    # Initialize from markers
+    init_kernel = _get_watershed_init_kernel(use_age=use_age)
+
+    init_args = [image_flat, markers.ravel(), labels, state, priority]
+    if use_age:
+        init_args.append(age)
+    init_args.extend([mask_flat, has_mask, int(size)])
+
+    init_kernel(
+        (blocks,),
+        (threads_per_block,),
+        tuple(init_args),
+    )
+
+    # Iteratively propagate labels using unified nD kernel
+    step_kernel = _get_watershed_step_kernel(
+        ndim, connectivity, use_age=use_age
+    )
+
+    # Kernel takes dimension sizes in C-order (same as image.shape)
+    dim_args = tuple(int(s) for s in image_shape)
+    step_args_base = [image_flat, labels, state, priority]
+    if use_age:
+        step_args_base.append(age)
+    step_args_base.append(changed)
+    step_args_base.extend(dim_args)
+    step_args = tuple(step_args_base)
+
+    for iteration in range(max_iterations):
+        changed[0] = 0
+        step_kernel((blocks,), (threads_per_block,), step_args)
+        if changed[0] == 0:
+            break
+
+    return labels, state, priority, changed
+
+
+######################################################
+# Block-asynchronous 2D Non-compact seeded watershed #
+######################################################
+
+
 # Block-asynchronous watershed kernel constants
 TILE_W = 32  # Tile width (must match block size)
 TILE_H = 32  # Tile height (must match block size)
@@ -460,7 +532,7 @@ def _get_watershed_block_async_kernel_2d(connectivity=1, inner_iterations=16):
     kernel : cupy.RawKernel
         Compiled CUDA kernel
     """
-    neighbors = _get_neighbor_offsets_2d(connectivity)
+    neighbors = _get_neighbor_offsets(2, connectivity)
 
     # Shared memory dimensions (tile + halo on each side)
     shared_w = TILE_W + 2 * HALO
@@ -769,438 +841,6 @@ void watershed_block_async_2d(
     return cp.RawKernel(kernel_code, "watershed_block_async_2d")
 
 
-@cp.memoize(for_each_device=True)
-def _get_watershed_compact_step_kernel_2d(connectivity=1):
-    """Get iteration kernel for 2D compact CA-watershed.
-
-    This kernel implements the compact watershed variant, which adds a
-    distance penalty to encourage more regularly-shaped regions.
-
-    The priority for each pixel is:
-        priority = image[pixel] + compactness * euclidean_distance(pixel, source)
-
-    where source is the original marker location for that basin.
-
-    Parameters
-    ----------
-    connectivity : int
-        1 for 4-connectivity, 2 for 8-connectivity
-
-    Returns
-    -------
-    kernel : cupy.RawKernel
-        Compiled CUDA kernel
-    """  # noqa: E501
-    neighbors = _get_neighbor_offsets_2d(connectivity)
-
-    # Generate neighbor checking code for compact watershed
-    neighbor_code = ""
-    for i, (dy, dx) in enumerate(neighbors):
-        neighbor_code += f"""
-    // Neighbor {i}: dy={dy}, dx={dx}
-    {{
-        int ny = y + ({dy});
-        int nx = x + ({dx});
-        if (ny >= 0 && ny < height && nx >= 0 && nx < width) {{
-            int nidx = ny * width + nx;
-            int nlabel = labels[nidx];
-
-            // If neighbor has a label (non-zero), it can propagate to current
-            // pixel
-            if (nlabel != 0) {{
-                // Get the source marker location for this neighbor's basin
-                int src_x = source_x[nidx];
-                int src_y = source_y[nidx];
-
-                // Compute Euclidean distance from current pixel to source
-                float dx_dist = (float)(x - src_x);
-                float dy_dist = (float)(y - src_y);
-                float euclidean_dist = sqrtf(dx_dist * dx_dist + dy_dist * dy_dist);
-
-                // Compute priority: image value + compactness * distance
-                float new_priority = image[idx] + compactness * euclidean_dist;
-
-                // Enforce monotonicity: priority must not decrease
-                // (matches scikit-image behavior for fair tie-breaking)
-                float neighbor_priority = priority[nidx];
-                if (new_priority < neighbor_priority) {{
-                    new_priority = neighbor_priority;
-                }}
-
-                // Update if this is a better path (lower priority)
-                if (new_priority < best_priority) {{
-                    best_priority = new_priority;
-                    best_label = nlabel;
-                    best_src_x = src_x;
-                    best_src_y = src_y;
-                    found_label = 1;
-                }}
-            }}
-        }}
-    }}
-"""  # noqa: E501
-
-    kernel_code = f"""
-extern "C" __global__
-void watershed_compact_step_2d(
-    const float* __restrict__ image,
-    int* __restrict__ labels,
-    unsigned char* __restrict__ state,
-    float* __restrict__ priority,
-    int* __restrict__ source_x,
-    int* __restrict__ source_y,
-    int* __restrict__ changed,
-    float compactness,
-    int width,
-    int height
-) {{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height) return;
-
-    int idx = y * width + x;
-
-    // Only process unlabeled pixels
-    if (state[idx] != 2) return;
-
-    // Check all neighbors
-    float best_priority = priority[idx];
-    int best_label = 0;
-    int best_src_x = -1;
-    int best_src_y = -1;
-    int found_label = 0;
-
-    {neighbor_code}
-
-    // Update pixel if we found a better label
-    if (found_label && best_label != 0) {{
-        if (best_priority < priority[idx]) {{
-            labels[idx] = best_label;
-            priority[idx] = best_priority;
-            source_x[idx] = best_src_x;
-            source_y[idx] = best_src_y;
-
-            // Signal that a change occurred
-            atomicAdd(changed, 1);
-        }}
-    }}
-}}
-"""
-
-    return cp.RawKernel(kernel_code, "watershed_compact_step_2d")
-
-
-# --- Watershed line post-processing kernel ---
-
-
-@cp.memoize(for_each_device=True)
-def _generate_coord_code(ndim):
-    """Generate CUDA code to extract nD coordinates from a flat index.
-
-    Returns (dim_names, dim_params, size_expr, coord_code) where:
-    - dim_names: list of dimension size variable names in C-order
-    - dim_params: kernel parameter declaration string
-    - size_expr: C expression for total size
-    - coord_code: C code to compute c_0..c_{ndim-1} from idx
-    """
-    dim_names = [f"dim_{j}" for j in range(ndim)]
-    dim_params = ", ".join(f"int {d}" for d in dim_names)
-    size_expr = " * ".join(dim_names)
-
-    coord_lines = []
-    for j in range(ndim - 1, -1, -1):
-        if j == ndim - 1:
-            coord_lines.append(f"int c_{j} = idx % {dim_names[j]};")
-            if ndim > 1:
-                coord_lines.append(f"int _rem_{j} = idx / {dim_names[j]};")
-        elif j == 0:
-            coord_lines.append(f"int c_0 = _rem_{j + 1};")
-        else:
-            coord_lines.append(f"int c_{j} = _rem_{j + 1} % {dim_names[j]};")
-            coord_lines.append(f"int _rem_{j} = _rem_{j + 1} / {dim_names[j]};")
-    coord_code = "\n    ".join(coord_lines)
-
-    return dim_names, dim_params, size_expr, coord_code
-
-
-def _generate_neighbor_nidx(ndim, dim_names, offsets):
-    """Generate CUDA code for neighbor coordinate + flat index computation.
-
-    For each neighbor offset, generates:
-    - nc_0..nc_{ndim-1} neighbor coordinate declarations
-    - bounds check expression
-    - nidx flat index expression
-
-    Returns (nc_decl_str, bounds_str, nidx_expr) for each offset.
-    """
-    results = []
-    for offset in offsets:
-        nc_decls = []
-        bounds = []
-        for j, off in enumerate(offset):
-            nc_decls.append(f"int nc_{j} = c_{j} + ({off});")
-            bounds.append(f"nc_{j} >= 0 && nc_{j} < {dim_names[j]}")
-
-        nc_decl_str = "\n        ".join(nc_decls)
-        bounds_str = " && ".join(bounds)
-
-        nidx_parts = [f"nc_{j}" for j in range(ndim)]
-        nidx_expr = nidx_parts[0]
-        for j in range(1, ndim):
-            nidx_expr = f"({nidx_expr}) * {dim_names[j]} + {nidx_parts[j]}"
-        results.append((nc_decl_str, bounds_str, nidx_expr))
-    return results
-
-
-@cp.memoize(for_each_device=True)
-def _get_watershed_line_kernel(ndim, connectivity=1):
-    """Get post-processing kernel to create 1-pixel watershed lines.
-
-    After the CA iteration has converged and all pixels have final labels,
-    this kernel identifies boundary pixels. To produce 1-pixel-wide lines
-    (rather than 2-pixel), only the pixel that arrived "later" in the
-    flooding (higher priority) is set to 0. For equal priorities, the
-    pixel with the higher label value is zeroed as a consistent
-    tie-breaker.
-
-    Uses a 1D grid for all dimensionalities.
-
-    Parameters
-    ----------
-    ndim : int
-        Number of dimensions.
-    connectivity : int
-        Neighborhood connectivity.
-    """
-    dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
-    neighbors = _get_neighbor_offsets(ndim, connectivity)
-    neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
-
-    neighbor_check = ""
-    for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
-        neighbor_check += f"""
-        {{
-            {nc_decl_str}
-            if ({bounds_str}) {{
-                int nidx = {nidx_expr};
-                int nlabel = labels_in[nidx];
-                if (nlabel != 0 && nlabel != my_label) {{
-                    float npri = priority[nidx];
-                    if (npri < my_pri ||
-                        (npri == my_pri && nlabel < my_label)) {{
-                        is_boundary = 1;
-                    }}
-                }}
-            }}
-        }}
-"""
-
-    kernel_code = f"""
-extern "C" __global__
-void watershed_line(
-    const int* __restrict__ labels_in,
-    const float* __restrict__ priority,
-    int* __restrict__ labels_out,
-    {dim_params}
-) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = {size_expr};
-    if (idx >= size) return;
-
-    {coord_code}
-
-    int my_label = labels_in[idx];
-    if (my_label == 0) {{
-        labels_out[idx] = 0;
-        return;
-    }}
-
-    float my_pri = priority[idx];
-    int is_boundary = 0;
-    {neighbor_check}
-
-    labels_out[idx] = is_boundary ? 0 : my_label;
-}}
-"""
-    return cp.RawKernel(kernel_code, "watershed_line")
-
-
-def _validate_inputs(image, markers, mask, connectivity):
-    """Validate and prepare inputs for watershed algorithm.
-
-    Parameters
-    ----------
-    image : cupy.ndarray
-        Input image (gradient magnitude or similar), 2D or 3D
-    markers : int, cupy.ndarray, or None
-        The marker image. If None, markers are determined as the local
-        minima of the image. If int, that many regularly-spaced markers
-        are generated. If array, used as-is.
-    mask : cupy.ndarray or None
-        Optional mask array
-    connectivity : int
-        Neighborhood connectivity as integer.
-        For 2D: 1 (4-connectivity) or 2 (8-connectivity)
-        For 3D: 1 (6-connectivity), 2 (18-connectivity), or 3
-        (26-connectivity)
-
-    Returns
-    -------
-    image : cupy.ndarray
-        Validated image as float32
-    markers : cupy.ndarray
-        Validated markers as int32
-    mask : cupy.ndarray or None
-        Validated mask as uint8
-    connectivity : int
-        Connectivity as integer
-    """
-    # Check image first to get ndim
-    if not isinstance(image, cp.ndarray):
-        image = cp.asarray(image)
-
-    ndim = image.ndim
-
-    # Check connectivity - must be an integer
-    if not isinstance(connectivity, (int, np.integer, cp.integer)):
-        raise TypeError(
-            f"connectivity must be an integer, got {type(connectivity)}"
-        )
-    connectivity = int(connectivity)
-
-    # Check connectivity value based on dimensionality
-    if connectivity not in range(1, ndim + 1):
-        raise ValueError(
-            f"connectivity must be in [1, {ndim}] for {ndim}D images, "
-            f"got {connectivity}"
-        )
-
-    # Convert image to float32 for processing
-    if image.dtype != cp.float32:
-        image = image.astype(cp.float32)
-
-    # Validate mask before markers (needed for marker generation)
-    n_pixels = image.size
-    if mask is not None:
-        if not isinstance(mask, cp.ndarray):
-            mask = cp.asarray(mask)
-
-        if mask.shape != image.shape:
-            raise ValueError(
-                f"mask shape {mask.shape} must match image shape {image.shape}"
-            )
-
-        mask = mask.astype(cp.uint8)
-        n_pixels = int(cp.sum(mask))
-
-    # Handle markers
-    if markers is None:
-        # Auto-detect markers from local minima (matching scikit-image)
-        markers_bool = local_minima(image, connectivity=connectivity)
-        if mask is not None:
-            markers_bool = markers_bool * mask.astype(bool)
-        footprint = ndi.generate_binary_structure(ndim, connectivity)
-        markers = ndi.label(markers_bool, structure=footprint)[0]
-        markers = markers.astype(cp.int32)
-    elif not isinstance(markers, (cp.ndarray, np.ndarray, list, tuple)):
-        # Assume int: generate that many regularly-spaced markers
-        n_markers = int(markers)
-        # Scale n_markers by fraction of masked pixels (like scikit-image)
-        markers = regular_seeds(
-            image.shape, int(n_markers / (n_pixels / image.size))
-        )
-        if mask is not None:
-            markers *= mask.astype(markers.dtype)
-        markers = markers.astype(cp.int32)
-    else:
-        if not isinstance(markers, cp.ndarray):
-            markers = cp.asarray(markers)
-
-        if mask is not None:
-            markers = markers * mask.astype(markers.dtype)
-
-        if markers.shape != image.shape:
-            raise ValueError(
-                f"markers shape {markers.shape} must match "
-                f"image shape {image.shape}"
-            )
-
-        # Convert markers to int32
-        if markers.dtype != cp.int32:
-            markers = markers.astype(cp.int32)
-
-    return image, markers, mask, connectivity
-
-
-def _watershed_standard(
-    image_flat,
-    markers,
-    mask_flat,
-    has_mask,
-    connectivity,
-    ndim,
-    image_shape,
-    size,
-    blocks,
-    threads_per_block,
-    max_iterations,
-    use_age=True,
-    **kwargs,
-):
-    """Run standard watershed algorithm (compactness=0).
-
-    Uses image intensity as priority (like scikit-image) to produce
-    regions that follow image gradients rather than compact shapes.
-    """
-    # Initialize state arrays (as contiguous flat arrays)
-    labels = cp.zeros(size, dtype=cp.int32)
-    state = cp.zeros(size, dtype=cp.uint8)
-    priority = cp.zeros(size, dtype=cp.float32)
-    changed = cp.zeros(1, dtype=cp.int32)
-
-    if use_age:
-        age = cp.zeros(size, dtype=cp.int32)
-    else:
-        age = None
-
-    # Initialize from markers
-    init_kernel = _get_watershed_init_kernel(use_age=use_age)
-
-    init_args = [image_flat, markers.ravel(), labels, state, priority]
-    if use_age:
-        init_args.append(age)
-    init_args.extend([mask_flat, has_mask, int(size)])
-
-    init_kernel(
-        (blocks,),
-        (threads_per_block,),
-        tuple(init_args),
-    )
-
-    # Iteratively propagate labels using unified nD kernel
-    step_kernel = _get_watershed_step_kernel(
-        ndim, connectivity, use_age=use_age
-    )
-
-    # Kernel takes dimension sizes in C-order (same as image.shape)
-    dim_args = tuple(int(s) for s in image_shape)
-    step_args_base = [image_flat, labels, state, priority]
-    if use_age:
-        step_args_base.append(age)
-    step_args_base.append(changed)
-    step_args_base.extend(dim_args)
-    step_args = tuple(step_args_base)
-
-    for iteration in range(max_iterations):
-        changed[0] = 0
-        step_kernel((blocks,), (threads_per_block,), step_args)
-        if changed[0] == 0:
-            break
-
-    return labels, state, priority, changed
-
-
 def _watershed_standard_block_async(
     image_flat,
     markers,
@@ -1293,6 +933,208 @@ def _watershed_standard_block_async(
     return labels, state, priority, changed
 
 
+##############################################
+# Compact n-dimensional seeded watershed #
+##############################################
+
+
+# CUDA kernel for initialization (compact watershed)
+@cp.memoize(for_each_device=True)
+@cp.memoize(for_each_device=True)
+def _get_watershed_compact_init_kernel(ndim):
+    """Get initialization kernel for nD compact CA-watershed.
+
+    This kernel initializes the label, state, priority, and source
+    coordinate arrays from the marker image. Source arrays track the
+    original marker location for each pixel (one int array per
+    dimension), needed for Euclidean distance computation.
+    """
+    dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
+    src_names = [f"source_{j}" for j in range(ndim)]
+
+    src_params = ", ".join(f"int* {s}" for s in src_names)
+    src_init_mask = "\n        ".join(f"{s}[idx] = -1;" for s in src_names)
+    src_init_marker = "\n        ".join(
+        f"{s}[idx] = c_{j};" for j, s in enumerate(src_names)
+    )
+    src_init_unlabeled = "\n        ".join(f"{s}[idx] = -1;" for s in src_names)
+
+    kernel_code = f"""
+extern "C" __global__
+void watershed_compact_init(
+    const int* markers,
+    int* labels,
+    unsigned char* state,
+    float* priority,
+    {src_params},
+    const unsigned char* mask,
+    int has_mask,
+    {dim_params}
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int size = {size_expr};
+
+    if (idx >= size) return;
+
+    {coord_code}
+
+    // Check if pixel is in the mask
+    if (has_mask && !mask[idx]) {{
+        labels[idx] = 0;
+        state[idx] = 0;
+        priority[idx] = 0.0f;
+        {src_init_mask}
+        return;
+    }}
+
+    int marker_label = markers[idx];
+
+    if (marker_label != 0) {{
+        labels[idx] = marker_label;
+        state[idx] = 1;
+        priority[idx] = 0.0f;
+        {src_init_marker}
+    }} else {{
+        labels[idx] = 0;
+        state[idx] = 2;
+        priority[idx] = 3.4028235e+38f;
+        {src_init_unlabeled}
+    }}
+}}
+"""
+    return cp.RawKernel(kernel_code, "watershed_compact_init")
+
+
+@cp.memoize(for_each_device=True)
+@cp.memoize(for_each_device=True)
+def _get_watershed_compact_step_kernel(ndim, connectivity=1):
+    """Get iteration kernel for nD compact CA-watershed.
+
+    This kernel implements the compact watershed variant, which adds a
+    distance penalty to encourage more regularly-shaped regions.
+
+    The priority for each pixel is:
+        priority = image[pixel] + compactness * euclidean_distance(pixel, source)
+
+    where source is the original marker location for that basin.
+
+    Parameters
+    ----------
+    ndim : int
+        Number of dimensions.
+    connectivity : int
+        Neighborhood connectivity (1 to ndim).
+
+    Returns
+    -------
+    kernel : cupy.RawKernel
+        Compiled CUDA kernel
+    """  # noqa: E501
+    dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
+    neighbors = _get_neighbor_offsets(ndim, connectivity)
+    neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
+
+    src_names = [f"source_{j}" for j in range(ndim)]
+    src_params = ", ".join(f"int* __restrict__ {s}" for s in src_names)
+    best_src_decls = "\n    ".join(
+        f"int best_src_{j} = -1;" for j in range(ndim)
+    )
+
+    # Generate neighbor checking code
+    neighbor_code = ""
+    for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
+        # Read source coordinates from neighbor
+        src_reads = "\n                ".join(
+            f"int nsrc_{j} = {s}[nidx];" for j, s in enumerate(src_names)
+        )
+        # Euclidean distance: sqrt(sum((c_j - nsrc_j)^2))
+        dist_terms = " + ".join(f"d_{j} * d_{j}" for j in range(ndim))
+        dist_decls = "\n                ".join(
+            f"float d_{j} = (float)(c_{j} - nsrc_{j});" for j in range(ndim)
+        )
+        # Update best source coordinates
+        best_src_updates = "\n                    ".join(
+            f"best_src_{j} = nsrc_{j};" for j in range(ndim)
+        )
+
+        neighbor_code += f"""
+    {{
+        {nc_decl_str}
+        if ({bounds_str}) {{
+            int nidx = {nidx_expr};
+            int nlabel = labels[nidx];
+
+            if (nlabel != 0) {{
+                {src_reads}
+
+                {dist_decls}
+                float euclidean_dist = sqrtf({dist_terms});
+
+                float new_priority = image[idx] + compactness * euclidean_dist;
+
+                float neighbor_priority = priority[nidx];
+                if (new_priority < neighbor_priority) {{
+                    new_priority = neighbor_priority;
+                }}
+
+                if (new_priority < best_priority) {{
+                    best_priority = new_priority;
+                    best_label = nlabel;
+                    {best_src_updates}
+                    found_label = 1;
+                }}
+            }}
+        }}
+    }}
+"""
+
+    # Final update: write best source coordinates
+    final_src_updates = "\n            ".join(
+        f"{s}[idx] = best_src_{j};" for j, s in enumerate(src_names)
+    )
+
+    kernel_code = f"""
+extern "C" __global__
+void watershed_compact_step(
+    const float* __restrict__ image,
+    int* __restrict__ labels,
+    unsigned char* __restrict__ state,
+    float* __restrict__ priority,
+    {src_params},
+    int* __restrict__ changed,
+    float compactness,
+    {dim_params}
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int size = {size_expr};
+    if (idx >= size) return;
+
+    {coord_code}
+
+    if (state[idx] != 2) return;
+
+    float best_priority = priority[idx];
+    int best_label = 0;
+    {best_src_decls}
+    int found_label = 0;
+
+    {neighbor_code}
+
+    if (found_label && best_label != 0) {{
+        if (best_priority < priority[idx]) {{
+            labels[idx] = best_label;
+            priority[idx] = best_priority;
+            {final_src_updates}
+
+            atomicAdd(changed, 1);
+        }}
+    }}
+}}
+"""
+
+    return cp.RawKernel(kernel_code, "watershed_compact_step")
+
+
 def _watershed_compact(
     image_flat,
     markers,
@@ -1300,14 +1142,13 @@ def _watershed_compact(
     has_mask,
     connectivity,
     compactness,
+    ndim,
+    image_shape,
     size,
-    width,
-    height,
     blocks,
     threads_per_block,
-    grid_size,
-    block_size,
     max_iterations,
+    **kwargs,
 ):
     """Run compact watershed algorithm (compactness > 0).
 
@@ -1318,60 +1159,200 @@ def _watershed_compact(
     labels = cp.zeros(size, dtype=cp.int32)
     state = cp.zeros(size, dtype=cp.uint8)
     priority = cp.zeros(size, dtype=cp.float32)
-    source_x = cp.zeros(size, dtype=cp.int32)
-    source_y = cp.zeros(size, dtype=cp.int32)
+    sources = [cp.zeros(size, dtype=cp.int32) for _ in range(ndim)]
     changed = cp.zeros(1, dtype=cp.int32)
 
+    # Dimension sizes in C-order (same as image.shape)
+    dim_args = tuple(int(s) for s in image_shape)
+
     # Initialize from markers
-    init_kernel = _get_watershed_compact_init_kernel()
+    init_kernel = _get_watershed_compact_init_kernel(ndim)
+
+    init_args = [markers.ravel(), labels, state, priority]
+    init_args.extend(sources)
+    init_args.extend([mask_flat, has_mask, *dim_args])
 
     init_kernel(
         (blocks,),
         (threads_per_block,),
-        (
-            markers.ravel(),
-            labels,
-            state,
-            priority,
-            source_x,
-            source_y,
-            mask_flat,
-            has_mask,
-            int(width),
-            int(size),
-        ),
+        tuple(init_args),
     )
 
     # Iteratively propagate labels
-    step_kernel = _get_watershed_compact_step_kernel_2d(connectivity)
+    step_kernel = _get_watershed_compact_step_kernel(ndim, connectivity)
+
+    step_args = [image_flat, labels, state, priority]
+    step_args.extend(sources)
+    step_args.extend([changed, cp.float32(compactness), *dim_args])
+    step_args = tuple(step_args)
 
     for iteration in range(max_iterations):
-        # Reset change counter
         changed[0] = 0
-
-        # Run one iteration
-        step_kernel(
-            grid_size,
-            block_size,
-            (
-                image_flat,
-                labels,
-                state,
-                priority,
-                source_x,
-                source_y,
-                changed,
-                cp.float32(compactness),
-                int(width),
-                int(height),
-            ),
-        )
-
-        # Check for convergence
+        step_kernel((blocks,), (threads_per_block,), step_args)
         if changed[0] == 0:
             break
 
-    return labels, state, priority, source_x, source_y, changed
+    return labels, state, priority, changed
+
+
+#########################################
+# Watershed line post-processing kernel #
+#########################################
+
+
+@cp.memoize(for_each_device=True)
+def _get_watershed_line_kernel(ndim, connectivity=1):
+    """Get post-processing kernel to create 1-pixel watershed lines.
+
+    After the CA iteration has converged and all pixels have final labels,
+    this kernel identifies boundary pixels. To produce 1-pixel-wide lines
+    (rather than 2-pixel), only the pixel that arrived "later" in the
+    flooding (higher priority) is set to 0. For equal priorities, the
+    pixel with the higher label value is zeroed as a consistent
+    tie-breaker.
+
+    Uses a 1D grid for all dimensionalities.
+
+    Parameters
+    ----------
+    ndim : int
+        Number of dimensions.
+    connectivity : int
+        Neighborhood connectivity.
+    """
+    dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
+    neighbors = _get_neighbor_offsets(ndim, connectivity)
+    neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
+
+    neighbor_check = ""
+    for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
+        neighbor_check += f"""
+        {{
+            {nc_decl_str}
+            if ({bounds_str}) {{
+                int nidx = {nidx_expr};
+                int nlabel = labels_in[nidx];
+                if (nlabel != 0 && nlabel != my_label) {{
+                    float npri = priority[nidx];
+                    if (npri < my_pri ||
+                        (npri == my_pri && nlabel < my_label)) {{
+                        is_boundary = 1;
+                    }}
+                }}
+            }}
+        }}
+"""
+
+    kernel_code = f"""
+extern "C" __global__
+void watershed_line(
+    const int* __restrict__ labels_in,
+    const float* __restrict__ priority,
+    int* __restrict__ labels_out,
+    {dim_params}
+) {{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int size = {size_expr};
+    if (idx >= size) return;
+
+    {coord_code}
+
+    int my_label = labels_in[idx];
+    if (my_label == 0) {{
+        labels_out[idx] = 0;
+        return;
+    }}
+
+    float my_pri = priority[idx];
+    int is_boundary = 0;
+    {neighbor_check}
+
+    labels_out[idx] = is_boundary ? 0 : my_label;
+}}
+"""
+    return cp.RawKernel(kernel_code, "watershed_line")
+
+
+def _validate_inputs(image, markers, mask, connectivity):
+    """Validate and prepare inputs for watershed algorithm.
+
+    See `watershed` for parameter descriptions.
+    """
+    # Check image first to get ndim
+    if not isinstance(image, cp.ndarray):
+        image = cp.asarray(image)
+
+    ndim = image.ndim
+
+    # Check connectivity - must be an integer
+    if not isinstance(connectivity, (int, np.integer, cp.integer)):
+        raise TypeError(
+            f"connectivity must be an integer, got {type(connectivity)}"
+        )
+    connectivity = int(connectivity)
+
+    # Check connectivity value based on dimensionality
+    if connectivity not in range(1, ndim + 1):
+        raise ValueError(
+            f"connectivity must be in [1, {ndim}] for {ndim}D images, "
+            f"got {connectivity}"
+        )
+
+    # Convert image to float32 for processing
+    if image.dtype != cp.float32:
+        image = image.astype(cp.float32)
+
+    # Validate mask before markers (needed for marker generation)
+    n_pixels = image.size
+    if mask is not None:
+        if not isinstance(mask, cp.ndarray):
+            mask = cp.asarray(mask)
+
+        if mask.shape != image.shape:
+            raise ValueError(
+                f"mask shape {mask.shape} must match image shape {image.shape}"
+            )
+
+        mask = mask.astype(cp.uint8)
+        n_pixels = int(cp.sum(mask))
+
+    # Handle markers
+    if markers is None:
+        # Auto-detect markers from local minima (matching scikit-image)
+        markers_bool = local_minima(image, connectivity=connectivity)
+        if mask is not None:
+            markers_bool = markers_bool * mask.astype(bool)
+        footprint = ndi.generate_binary_structure(ndim, connectivity)
+        markers = ndi.label(markers_bool, structure=footprint)[0]
+        markers = markers.astype(cp.int32)
+    elif not isinstance(markers, (cp.ndarray, np.ndarray, list, tuple)):
+        # Assume int: generate that many regularly-spaced markers
+        n_markers = int(markers)
+        # Scale n_markers by fraction of masked pixels (like scikit-image)
+        markers = regular_seeds(
+            image.shape, int(n_markers / (n_pixels / image.size))
+        )
+        if mask is not None:
+            markers *= mask.astype(markers.dtype)
+        markers = markers.astype(cp.int32)
+    else:
+        if not isinstance(markers, cp.ndarray):
+            markers = cp.asarray(markers)
+
+        if mask is not None:
+            markers = markers * mask.astype(markers.dtype)
+
+        if markers.shape != image.shape:
+            raise ValueError(
+                f"markers shape {markers.shape} must match "
+                f"image shape {image.shape}"
+            )
+
+        # Convert markers to int32
+        if markers.dtype != cp.int32:
+            markers = markers.astype(cp.int32)
+
+    return image, markers, mask, connectivity
 
 
 def watershed(
@@ -1539,12 +1520,6 @@ def watershed(
 
     ndim = image.ndim
 
-    # Check compactness support (2D only, requires separate compact kernels)
-    if compactness != 0 and ndim != 2:
-        raise NotImplementedError(
-            "compactness parameter is only supported for 2D images"
-        )
-
     # Get dimensions
     size = image.size
     # width/height needed for block-async and compact (2D only)
@@ -1565,17 +1540,6 @@ def watershed(
     # Thread/block configuration
     threads_per_block = 256
     blocks = (size + threads_per_block - 1) // threads_per_block
-
-    # 2D block and grid configuration for step kernel (only used for 2D)
-    if ndim == 2:
-        block_size_2d = (16, 16)
-        grid_size_2d = (
-            (width + block_size_2d[0] - 1) // block_size_2d[0],
-            (height + block_size_2d[1] - 1) // block_size_2d[1],
-        )
-    else:
-        block_size_2d = None
-        grid_size_2d = None
 
     # Upper bound on iterations (shouldn't need this many)
     max_iterations = max(image.shape) * 2
@@ -1621,20 +1585,11 @@ def watershed(
                 use_age=use_age,
             )
     else:
-        (
-            labels,
-            state,
-            priority,
-            source_x,
-            source_y,
-            changed,
-        ) = _watershed_compact(
+        labels, state, priority, changed = _watershed_compact(
             **common_kwargs,
             compactness=compactness,
-            width=width,
-            height=height,
-            grid_size=grid_size_2d,
-            block_size=block_size_2d,
+            ndim=ndim,
+            image_shape=image.shape,
         )
 
     # Post-processing: create watershed lines if requested
