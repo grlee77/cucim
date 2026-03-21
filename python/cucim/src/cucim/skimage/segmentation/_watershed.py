@@ -25,15 +25,20 @@ from ..util._regular_grid import regular_seeds
 
 # CUDA kernel for initialization (standard watershed)
 @cp.memoize(for_each_device=True)
-def _get_watershed_init_kernel():
+def _get_watershed_init_kernel(use_age=False):
     """Get initialization kernel for CA-watershed.
 
     This kernel initializes the label, state, and priority arrays
     from the marker image. Priority is based on image intensity values
-    to match scikit-image's watershed behavior.
+    to match scikit-image's watershed behavior. Optionally initializes
+    an age array for tie-breaking (lower age = closer to marker).
     """
-    return cp.RawKernel(
-        r"""
+    age_params = "int* age," if use_age else ""
+    age_init_mask = "age[idx] = 0;" if use_age else ""
+    age_init_marker = "age[idx] = 0;" if use_age else ""
+    age_init_unlabeled = "age[idx] = 2147483647;" if use_age else ""
+
+    kernel_code = f"""
 extern "C" __global__
 void watershed_init(
     const float* image,
@@ -41,41 +46,44 @@ void watershed_init(
     int* labels,
     unsigned char* state,
     float* priority,
+    {age_params}
     const unsigned char* mask,
     int has_mask,
     int size
-) {
+) {{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx >= size) return;
 
     // Check if pixel is in the mask
-    if (has_mask && !mask[idx]) {
+    if (has_mask && !mask[idx]) {{
         labels[idx] = 0;
         state[idx] = 0;  // WATERSHED (background)
         priority[idx] = 0.0f;
+        {age_init_mask}
         return;
-    }
+    }}
 
     // Initialize from markers
     int marker_label = markers[idx];
 
-    if (marker_label != 0) {
+    if (marker_label != 0) {{
         // Seed pixel - already labeled (can be positive or negative)
         // Priority is the image value at the marker (like scikit-image)
         labels[idx] = marker_label;
         state[idx] = 1;  // LABELED (will not change)
         priority[idx] = image[idx];
-    } else {
+        {age_init_marker}
+    }} else {{
         // Unlabeled pixel - to be processed
         labels[idx] = 0;
         state[idx] = 2;  // UNLABELED (needs processing)
         priority[idx] = 3.4028235e+38f;  // FLT_MAX
-    }
-}
-""",
-        "watershed_init",
-    )
+        {age_init_unlabeled}
+    }}
+}}
+"""
+    return cp.RawKernel(kernel_code, "watershed_init")
 
 
 # CUDA kernel for initialization (compact watershed)
@@ -244,7 +252,7 @@ def _get_neighbor_offsets_3d(connectivity):
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_step_kernel_2d(connectivity=1):
+def _get_watershed_step_kernel_2d(connectivity=1, use_age=False):
     """Get iteration kernel for 2D CA-watershed.
 
     This kernel uses image intensity as priority (like scikit-image).
@@ -255,6 +263,9 @@ def _get_watershed_step_kernel_2d(connectivity=1):
     ----------
     connectivity : int
         1 for 4-connectivity, 2 for 8-connectivity
+    use_age : bool
+        If True, use age (hop distance) as tie-breaker when priorities
+        are equal. This more closely matches scikit-image's behavior.
 
     Returns
     -------
@@ -266,6 +277,19 @@ def _get_watershed_step_kernel_2d(connectivity=1):
     # Generate neighbor checking code
     neighbor_code = ""
     for i, (dy, dx) in enumerate(neighbors):
+        age_read = "int nage = age[nidx];" if use_age else ""
+        age_new = "int new_age = nage + 1;" if use_age else ""
+        if use_age:
+            better_path_cmp = (
+                "if (new_priority < best_priority ||\n"
+                "                    (new_priority == best_priority "
+                "&& new_age < best_age))"
+            )
+            age_update = "best_age = new_age;"
+        else:
+            better_path_cmp = "if (new_priority < best_priority)"
+            age_update = ""
+
         neighbor_code += f"""
     // Neighbor {i}: dy={dy}, dx={dx}
     {{
@@ -275,6 +299,7 @@ def _get_watershed_step_kernel_2d(connectivity=1):
             int nidx = ny * width + nx;
             int nlabel = labels[nidx];
             float npriority = priority[nidx];
+            {age_read}
 
             // If neighbor has a label (non-zero), it can propagate to current
             // pixel
@@ -287,9 +312,12 @@ def _get_watershed_step_kernel_2d(connectivity=1):
                     new_priority = npriority;
                 }}
 
-                // Update if this is a better path (lower priority)
-                if (new_priority < best_priority) {{
+                {age_new}
+
+                // Update if this is a better path
+                {better_path_cmp} {{
                     best_priority = new_priority;
+                    {age_update}
                     best_label = nlabel;
                     found_label = 1;
                 }}
@@ -298,6 +326,19 @@ def _get_watershed_step_kernel_2d(connectivity=1):
     }}
 """
 
+    age_param = "int* __restrict__ age," if use_age else ""
+    age_best_init = "int best_age = age[idx];" if use_age else ""
+    if use_age:
+        better_path_final_cmp = (
+            "if (best_priority < priority[idx] ||\n"
+            "            (best_priority == priority[idx] "
+            "&& best_age < age[idx]))"
+        )
+        age_final_update = "age[idx] = best_age;"
+    else:
+        better_path_final_cmp = "if (best_priority < priority[idx])"
+        age_final_update = ""
+
     kernel_code = f"""
 extern "C" __global__
 void watershed_step_2d(
@@ -305,6 +346,7 @@ void watershed_step_2d(
     int* __restrict__ labels,
     unsigned char* __restrict__ state,
     float* __restrict__ priority,
+    {age_param}
     int* __restrict__ changed,
     int width,
     int height
@@ -321,6 +363,7 @@ void watershed_step_2d(
 
     // Check all neighbors
     float best_priority = priority[idx];
+    {age_best_init}
     int best_label = 0;
     int found_label = 0;
 
@@ -328,9 +371,10 @@ void watershed_step_2d(
 
     // Update pixel if we found a better label
     if (found_label && best_label != 0) {{
-        if (best_priority < priority[idx]) {{
+        {better_path_final_cmp} {{
             labels[idx] = best_label;
             priority[idx] = best_priority;
+            {age_final_update}
 
             // Signal that a change occurred
             atomicAdd(changed, 1);
@@ -343,7 +387,7 @@ void watershed_step_2d(
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_step_kernel_3d(connectivity=1):
+def _get_watershed_step_kernel_3d(connectivity=1, use_age=False):
     """Get iteration kernel for 3D CA-watershed.
 
     This kernel uses image intensity as priority (like scikit-image).
@@ -356,6 +400,8 @@ def _get_watershed_step_kernel_3d(connectivity=1):
         1 for 6-connectivity (face neighbors)
         2 for 18-connectivity (face + edge neighbors)
         3 for 26-connectivity (face + edge + corner neighbors)
+    use_age : bool
+        If True, use age (hop distance) as tie-breaker.
 
     Returns
     -------
@@ -367,6 +413,19 @@ def _get_watershed_step_kernel_3d(connectivity=1):
     # Generate neighbor checking code
     neighbor_code = ""
     for i, (dz, dy, dx) in enumerate(neighbors):
+        age_read = "int nage = age[nidx];" if use_age else ""
+        age_new = "int new_age = nage + 1;" if use_age else ""
+        if use_age:
+            better_path_cmp = (
+                "if (new_priority < best_priority ||\n"
+                "                    (new_priority == best_priority "
+                "&& new_age < best_age))"
+            )
+            age_update = "best_age = new_age;"
+        else:
+            better_path_cmp = "if (new_priority < best_priority)"
+            age_update = ""
+
         neighbor_code += f"""
     // Neighbor {i}: dz={dz}, dy={dy}, dx={dx}
     {{
@@ -377,6 +436,7 @@ def _get_watershed_step_kernel_3d(connectivity=1):
             int nidx = (nz * height + ny) * width + nx;
             int nlabel = labels[nidx];
             float npriority = priority[nidx];
+            {age_read}
 
             // If neighbor has a label (non-zero), it can propagate to current
             // voxel
@@ -389,9 +449,12 @@ def _get_watershed_step_kernel_3d(connectivity=1):
                     new_priority = npriority;
                 }}
 
-                // Update if this is a better path (lower priority)
-                if (new_priority < best_priority) {{
+                {age_new}
+
+                // Update if this is a better path
+                {better_path_cmp} {{
                     best_priority = new_priority;
+                    {age_update}
                     best_label = nlabel;
                     found_label = 1;
                 }}
@@ -400,6 +463,19 @@ def _get_watershed_step_kernel_3d(connectivity=1):
     }}
 """  # noqa: E501
 
+    age_param = "int* __restrict__ age," if use_age else ""
+    age_best_init = "int best_age = age[idx];" if use_age else ""
+    if use_age:
+        better_path_final_cmp = (
+            "if (best_priority < priority[idx] ||\n"
+            "            (best_priority == priority[idx] "
+            "&& best_age < age[idx]))"
+        )
+        age_final_update = "age[idx] = best_age;"
+    else:
+        better_path_final_cmp = "if (best_priority < priority[idx])"
+        age_final_update = ""
+
     kernel_code = f"""
 extern "C" __global__
 void watershed_step_3d(
@@ -407,6 +483,7 @@ void watershed_step_3d(
     int* __restrict__ labels,
     unsigned char* __restrict__ state,
     float* __restrict__ priority,
+    {age_param}
     int* __restrict__ changed,
     int width,
     int height,
@@ -428,6 +505,7 @@ void watershed_step_3d(
 
     // Check all neighbors
     float best_priority = priority[idx];
+    {age_best_init}
     int best_label = 0;
     int found_label = 0;
 
@@ -435,9 +513,10 @@ void watershed_step_3d(
 
     // Update voxel if we found a better label
     if (found_label && best_label != 0) {{
-        if (best_priority < priority[idx]) {{
+        {better_path_final_cmp} {{
             labels[idx] = best_label;
             priority[idx] = best_priority;
+            {age_final_update}
 
             // Signal that a change occurred
             atomicAdd(changed, 1);
@@ -1031,6 +1110,7 @@ def watershed(
     watershed_line=False,
     *,
     use_block_async=None,
+    use_age=False,
 ):
     """Watershed segmentation using cellular automaton algorithm.
 
@@ -1086,7 +1166,14 @@ def watershed(
         If True, uses block-asynchronous algorithm with shared memory tiling.
         If False, uses synchronous algorithm.
         This variant is only implemented for 2D images and only affects the
-        standard watershed (compactness=0).
+        standard watershed (compactness=0). Not used when use_age=True.
+    use_age : bool, optional
+        If True (default), use an age (hop distance) counter as a
+        tie-breaker when two labels arrive at a pixel with equal priority.
+        This more closely matches scikit-image's age-based tie-breaking
+        behavior, producing fairer splits on plateau regions. If False,
+        ties are broken by neighbor iteration order (less deterministic).
+        Only affects the standard watershed (compactness=0).
 
     Returns
     -------
@@ -1240,13 +1327,13 @@ def watershed(
     # Use different code paths for standard vs compact watershed
     if compactness == 0:
         # Determine whether to use block-async algorithm (2D only)
-        # Auto-select based on image size if not specified
+        # Block-async does not support age tie-breaking yet
         if use_block_async is None:
-            # Use block-async for larger 2D images (> 128x128)
-            # where the shared memory overhead is worthwhile
-            use_block_async = ndim == 2 and min(height, width) >= 128
+            use_block_async = (
+                ndim == 2 and min(height, width) >= 128 and not use_age
+            )
 
-        if use_block_async and ndim == 2:
+        if use_block_async and ndim == 2 and not use_age:
             # Block-asynchronous watershed with shared memory tiling (2D only)
             labels, state, priority, changed = _watershed_standard_block_async(
                 image_flat,
@@ -1280,6 +1367,7 @@ def watershed(
                 grid_size_2d,
                 block_size_2d,
                 max_iterations,
+                use_age=use_age,
             )
     else:
         # Compact watershed (floating-point priority with distance penalty)
@@ -1336,6 +1424,7 @@ def _watershed_standard(
     grid_size_2d,
     block_size_2d,
     max_iterations,
+    use_age=True,
 ):
     """Run standard watershed algorithm (compactness=0).
 
@@ -1349,74 +1438,62 @@ def _watershed_standard(
     priority = cp.zeros(size, dtype=cp.float32)
     changed = cp.zeros(1, dtype=cp.int32)
 
+    if use_age:
+        age = cp.zeros(size, dtype=cp.int32)
+    else:
+        age = None
+
     # Initialize from markers (same kernel for 2D and 3D)
-    init_kernel = _get_watershed_init_kernel()
+    init_kernel = _get_watershed_init_kernel(use_age=use_age)
+
+    init_args = [
+        image_flat,
+        markers.ravel(),
+        labels,
+        state,
+        priority,
+    ]
+    if use_age:
+        init_args.append(age)
+    init_args.extend([mask_flat, has_mask, int(size)])
 
     init_kernel(
         (blocks,),
         (threads_per_block,),
-        (
-            image_flat,
-            markers.ravel(),
-            labels,
-            state,
-            priority,
-            mask_flat,
-            has_mask,
-            int(size),
-        ),
+        tuple(init_args),
     )
 
     # Iteratively propagate labels
     if ndim == 2:
-        step_kernel = _get_watershed_step_kernel_2d(connectivity)
+        step_kernel = _get_watershed_step_kernel_2d(
+            connectivity, use_age=use_age
+        )
+
+        step_args_base = [image_flat, labels, state, priority]
+        if use_age:
+            step_args_base.append(age)
+        step_args_base.extend([changed, int(width), int(height)])
+        step_args = tuple(step_args_base)
 
         for iteration in range(max_iterations):
-            # Reset change counter
             changed[0] = 0
-
-            # Run one iteration
-            step_kernel(
-                grid_size_2d,
-                block_size_2d,
-                (
-                    image_flat,
-                    labels,
-                    state,
-                    priority,
-                    changed,
-                    int(width),
-                    int(height),
-                ),
-            )
-
-            # Check for convergence
+            step_kernel(grid_size_2d, block_size_2d, step_args)
             if changed[0] == 0:
                 break
     else:  # ndim == 3
-        step_kernel = _get_watershed_step_kernel_3d(connectivity)
+        step_kernel = _get_watershed_step_kernel_3d(
+            connectivity, use_age=use_age
+        )
+
+        step_args_base = [image_flat, labels, state, priority]
+        if use_age:
+            step_args_base.append(age)
+        step_args_base.extend([changed, int(width), int(height), int(depth)])
+        step_args = tuple(step_args_base)
 
         for iteration in range(max_iterations):
-            # Reset change counter
             changed[0] = 0
-
-            # Run one iteration (1D grid for 3D data)
-            step_kernel(
-                (blocks,),
-                (threads_per_block,),
-                (
-                    image_flat,
-                    labels,
-                    state,
-                    priority,
-                    changed,
-                    int(width),
-                    int(height),
-                    int(depth),
-                ),
-            )
-
-            # Check for convergence
+            step_kernel((blocks,), (threads_per_block,), step_args)
             if changed[0] == 0:
                 break
 
