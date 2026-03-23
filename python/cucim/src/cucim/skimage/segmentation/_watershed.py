@@ -1437,12 +1437,29 @@ def watershed(
     # Ensure image is contiguous and flat for kernel
     image_flat = cp.ascontiguousarray(image.ravel())
 
+    import warnings
+
     # Use different code paths for standard vs compact watershed
     if compactness == 0:
         # Determine whether to use block-async algorithm
         # (2D non-compact only; supports age)
+        _min_block_async_size = max(TILE_W, TILE_H)
         if use_block_async is None:
-            use_block_async = ndim == 2 and min(height, width) >= 128
+            use_block_async = (
+                ndim == 2 and min(height, width) >= _min_block_async_size
+            )
+        elif (
+            use_block_async
+            and ndim == 2
+            and (min(height, width) < _min_block_async_size)
+        ):
+            warnings.warn(
+                f"use_block_async=True requires image dimensions >= "
+                f"{_min_block_async_size}; falling back to synchronous. "
+                f"Got image shape {image.shape}.",
+                stacklevel=2,
+            )
+            use_block_async = False
 
     label_ctype = _DTYPE_TO_CTYPE[label_dtype]
 
