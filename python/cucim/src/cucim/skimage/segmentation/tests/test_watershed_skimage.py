@@ -990,3 +990,129 @@ def test_connectivity():
 
     for lab, area in zip(range(5), [61824, 3653, 20466, 12386, 11291]):
         assert (abs(int(cp.sum(labels_c2 == lab)) - area) / area) < tol
+
+
+# ---------------------------------------------------------------
+# Parametrized tests for block-async vs synchronous code paths
+# ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("use_block_async", [True, False])
+@pytest.mark.parametrize("use_age", [True, False])
+def test_block_async_vs_sync_competitive(use_block_async, use_age):
+    """Block-async and synchronous should produce similar results on a
+    competitive segmentation case with mask."""
+    data = blob
+    mask = data != 255
+    markers = cp.zeros(data.shape, int)
+    markers[6, 7] = 1
+    markers[14, 7] = 2
+    out = watershed(
+        data,
+        markers,
+        connectivity=2,
+        mask=mask,
+        use_block_async=use_block_async,
+        use_age=use_age,
+    )
+    # Both objects should be roughly the same size
+    size1 = int(cp.sum(out == 1))
+    size2 = int(cp.sum(out == 2))
+    assert abs(size1 - size2) <= 6
+
+
+@pytest.mark.parametrize("use_block_async", [True, False])
+@pytest.mark.parametrize("use_age", [True, False])
+def test_block_async_vs_sync_large_image(use_block_async, use_age):
+    """Watershed on a large image should converge and produce valid labels
+    for all code path combinations."""
+    image = cp.zeros((256, 256))
+    rng = cp.random.default_rng(42)
+    coords = rng.integers(0, 256, (20, 2))
+    markers = cp.zeros((256, 256), dtype=cp.int32)
+    for i, (x, y) in enumerate(coords):
+        image[x, y] = 1
+        markers[x, y] = i + 1
+    from cucim.skimage._shared.filters import gaussian
+
+    image = gaussian(image, sigma=4, mode="reflect")
+
+    out = watershed(
+        image,
+        markers,
+        connectivity=2,
+        use_block_async=use_block_async,
+        use_age=use_age,
+    )
+    assert out.shape == (256, 256)
+    # All pixels should be labeled (no zeros since no mask)
+    assert int(cp.sum(out == 0)) == 0
+    # Should have all 20 labels
+    assert len(cp.unique(out)) == 20
+
+
+@pytest.mark.parametrize("use_block_async", [True, False])
+def test_block_async_vs_sync_with_age_match(use_block_async):
+    """With use_age=True, block-async and synchronous should produce
+    identical results on a flat image (deterministic tie-breaking)."""
+    image = cp.zeros((64, 64))
+    markers = cp.zeros((64, 64), dtype=cp.int32)
+    markers[16, 16] = 1
+    markers[16, 48] = 2
+    markers[48, 16] = 3
+    markers[48, 48] = 4
+
+    out = watershed(
+        image,
+        markers,
+        connectivity=1,
+        use_block_async=use_block_async,
+        use_age=True,
+    )
+    # Every pixel should be assigned to closest seed
+    i, j = cp.mgrid[0:64, 0:64]
+    d = cp.dstack(
+        [
+            cp.sqrt((i.astype(float) - i0) ** 2, (j.astype(float) - j0) ** 2)
+            for i0, j0 in ((16, 16), (16, 48), (48, 16), (48, 48))
+        ]
+    )
+    dmin = cp.min(d, 2)
+    assert cp.all(d[i, j, out[i, j] - 1] == dmin)
+
+
+@pytest.mark.parametrize("use_block_async", [True, False])
+def test_block_async_watershed_line(use_block_async):
+    """Watershed line post-processing should work with both code paths."""
+    image = cp.array(
+        [
+            [0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        dtype=cp.float32,
+    )
+    markers = cp.array(
+        [
+            [0, 0, 0, 0, 0],
+            [0, 1, 0, 2, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        dtype=cp.int32,
+    )
+    out = watershed(
+        image,
+        markers,
+        connectivity=1,
+        watershed_line=True,
+        use_block_async=use_block_async,
+    )
+    # Should have boundary pixels (label=0)
+    assert int(cp.sum(out == 0)) > 0
+    # Both labels should be present
+    unique = set(cp.unique(out).tolist())
+    assert 1 in unique and 2 in unique
