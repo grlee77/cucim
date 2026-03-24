@@ -1168,7 +1168,9 @@ def _validate_inputs(image, markers, mask, connectivity):
     """
     # Check image first to get ndim
     if not isinstance(image, cp.ndarray):
-        image = cp.asarray(image)
+        raise TypeError(
+            f"image must be a cupy.ndarray, got {type(image).__name__}"
+        )
 
     ndim = image.ndim
 
@@ -1194,7 +1196,9 @@ def _validate_inputs(image, markers, mask, connectivity):
     n_pixels = image.size
     if mask is not None:
         if not isinstance(mask, cp.ndarray):
-            mask = cp.asarray(mask)
+            raise TypeError(
+                f"mask must be a cupy.ndarray, got {type(mask).__name__}"
+            )
 
         if mask.shape != image.shape:
             raise ValueError(
@@ -1212,7 +1216,7 @@ def _validate_inputs(image, markers, mask, connectivity):
             markers_bool = markers_bool * mask.astype(bool)
         footprint = ndi.generate_binary_structure(ndim, connectivity)
         markers = ndi.label(markers_bool, structure=footprint)[0]
-    elif not isinstance(markers, (cp.ndarray, np.ndarray, list, tuple)):
+    elif not isinstance(markers, (cp.ndarray, list, tuple)):
         # Assume int: generate that many regularly-spaced markers
         n_markers = int(markers)
         # Scale n_markers by fraction of masked pixels (like scikit-image)
@@ -1223,7 +1227,10 @@ def _validate_inputs(image, markers, mask, connectivity):
             markers *= mask.astype(markers.dtype)
     else:
         if not isinstance(markers, cp.ndarray):
-            markers = cp.asarray(markers)
+            raise TypeError(
+                f"markers must be a cupy.ndarray or int, "
+                f"got {type(markers).__name__}"
+            )
 
         if mask is not None:
             markers = markers * mask.astype(markers.dtype)
@@ -1390,7 +1397,7 @@ def watershed(
     >>>                                         markers, compactness=0.1)
     """
     # Determine output label dtype from markers
-    if isinstance(markers, (cp.ndarray, np.ndarray)):
+    if isinstance(markers, cp.ndarray):
         label_dtype = cp.dtype(markers.dtype)
     else:
         label_dtype = cp.dtype(cp.int32)
