@@ -690,6 +690,89 @@ def test_no_markers():
     assert cp.max(out) == 2
 
 
+def test_single_marker():
+    """All pixels should be assigned to the only marker."""
+    image = cp.random.default_rng(0).random((10, 10)).astype(cp.float32)
+    markers = cp.zeros((10, 10), dtype=cp.int32)
+    markers[5, 5] = 1
+    labels = watershed(image, markers)
+    cp.testing.assert_array_equal(labels, cp.ones_like(labels))
+
+
+def test_empty_markers():
+    """All-zero markers should produce all-zero output."""
+    image = cp.random.default_rng(0).random((10, 10)).astype(cp.float32)
+    markers = cp.zeros((10, 10), dtype=cp.int32)
+    labels = watershed(image, markers)
+    cp.testing.assert_array_equal(labels, cp.zeros_like(labels))
+
+
+def test_all_markers():
+    """When every pixel is a marker, output should equal input markers."""
+    image = cp.random.default_rng(0).random((5, 5)).astype(cp.float32)
+    markers = cp.arange(1, 26, dtype=cp.int32).reshape(5, 5)
+    labels = watershed(image, markers)
+    cp.testing.assert_array_equal(labels, markers)
+
+
+def test_single_pixel():
+    """Watershed on a 1x1 image."""
+    labels = watershed(
+        cp.array([[5.0]], dtype=cp.float32),
+        cp.array([[1]], dtype=cp.int32),
+    )
+    assert labels.shape == (1, 1)
+    assert int(labels[0, 0]) == 1
+
+
+def test_border_markers():
+    """Markers at all four corners should each claim a quadrant."""
+    image = cp.random.default_rng(0).random((10, 10)).astype(cp.float32)
+    markers = cp.zeros((10, 10), dtype=cp.int32)
+    markers[0, 0] = 1
+    markers[0, 9] = 2
+    markers[9, 0] = 3
+    markers[9, 9] = 4
+    labels = watershed(image, markers)
+    assert int(cp.max(labels)) == 4
+    assert labels[0, 0] == 1
+    assert labels[0, 9] == 2
+    assert labels[9, 0] == 3
+    assert labels[9, 9] == 4
+
+
+def test_negative_markers():
+    """Negative marker labels should be preserved."""
+    image = cp.random.default_rng(0).random((10, 10)).astype(cp.float32)
+    markers = cp.zeros((10, 10), dtype=cp.int32)
+    markers[3, 3] = -1
+    markers[7, 7] = 1
+    labels = watershed(image, markers)
+    assert labels[3, 3] == -1
+    assert labels[7, 7] == 1
+    assert int(cp.any(cp.unique(labels) < 0))
+    assert int(cp.any(cp.unique(labels) > 0))
+
+
+def test_numpy_input_rejected():
+    """Watershed should reject NumPy arrays (CuPy arrays required)."""
+    import numpy as np
+
+    image_np = np.random.default_rng(0).random((10, 10)).astype(np.float32)
+    markers_np = np.zeros((10, 10), dtype=np.int32)
+    markers_np[3, 3] = 1
+    markers_np[7, 7] = 2
+    markers_cp = cp.asarray(markers_np)
+    image_cp = cp.asarray(image_np)
+
+    # NumPy image should be rejected
+    with pytest.raises(TypeError):
+        watershed(image_np, markers_cp)
+    # NumPy markers should be rejected
+    with pytest.raises(TypeError):
+        watershed(image_cp, markers_np)
+
+
 def test_block_async_small_image_warning():
     """Forcing use_block_async=True on a small image should warn and
     fall back to the synchronous path, producing correct results."""
