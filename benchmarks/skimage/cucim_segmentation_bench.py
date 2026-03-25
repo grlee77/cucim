@@ -114,9 +114,9 @@ class WatershedBench(ImageBench):
 
     def set_args(self, dtype):
         ndim = len(self.shape)
-        # use_block_async only meaningful for 2D; remove for other ndim
+        # use_block_async only meaningful for 2D/3D; remove for other ndim
         # to avoid redundant benchmark combinations
-        if ndim != 2 and "use_block_async" in self.var_kwargs:
+        if ndim not in (2, 3) and "use_block_async" in self.var_kwargs:
             del self.var_kwargs["use_block_async"]
 
         from cupyx.scipy import ndimage as ndi
