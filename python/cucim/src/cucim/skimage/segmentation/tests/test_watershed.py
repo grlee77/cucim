@@ -1011,3 +1011,95 @@ def test_block_async_watershed_line(use_block_async):
     assert int(cp.sum(out == 0)) > 0
     unique = set(cp.unique(out).tolist())
     assert 1 in unique and 2 in unique
+
+
+@pytest.mark.parametrize("use_block_async", [True, False])
+def test_block_async_3d(use_block_async):
+    """3D block-async should produce valid segmentation."""
+    rng = cp.random.default_rng(42)
+    image = rng.random((16, 16, 16)).astype(cp.float32)
+    markers = cp.zeros_like(image, dtype=cp.int32)
+    markers[4, 4, 4] = 1
+    markers[4, 12, 4] = 2
+    markers[12, 4, 12] = 3
+    markers[12, 12, 12] = 4
+    out = watershed(
+        image,
+        markers,
+        use_block_async=use_block_async,
+        use_age=True,
+    )
+    assert out.shape == (16, 16, 16)
+    assert set(cp.unique(out).tolist()) == {1, 2, 3, 4}
+
+
+@pytest.mark.parametrize("use_block_async", [True, False])
+def test_block_async_3d_with_mask(use_block_async):
+    """3D block-async with mask should only label masked pixels."""
+    image = cp.zeros((16, 16, 16), dtype=cp.float32)
+    markers = cp.zeros_like(image, dtype=cp.int32)
+    markers[4, 4, 4] = 1
+    markers[12, 12, 12] = 2
+    mask = cp.zeros_like(image, dtype=bool)
+    mask[2:14, 2:14, 2:14] = True
+    out = watershed(
+        image,
+        markers,
+        mask=mask,
+        use_block_async=use_block_async,
+    )
+    assert cp.all(out[~mask] == 0)
+    assert set(cp.unique(out[mask]).tolist()) == {1, 2}
+
+
+def test_block_async_3d_vs_sync_realistic():
+    """Block-async and synchronous 3D watershed should produce mostly the
+    same result on a realistic image generated from binary blobs with
+    distance-transform markers.
+
+    Both paths use use_age=True to minimize non-determinism.
+    """
+    from cucim.skimage.data import binary_blobs
+    from cucim.skimage.feature import peak_local_max
+
+    shape = (32, 32, 32)
+    blobs = binary_blobs(max(shape), n_dim=3, rng=5)
+    blobs = blobs[tuple(slice(s) for s in shape)]
+
+    distance = ndi.distance_transform_edt(blobs)
+    image = (cp.max(distance) - distance).astype(cp.float32)
+
+    coords = peak_local_max(
+        distance,
+        min_distance=3,
+        labels=blobs,
+    )
+    markers = cp.zeros(shape, dtype=cp.int32)
+    markers[tuple(coords.T)] = cp.arange(1, len(coords) + 1)
+    markers, _ = ndi.label(markers > 0)
+    mask = blobs.astype(bool)
+
+    n_markers = int(markers.max())
+    assert n_markers >= 2, "Need at least 2 markers for a meaningful test"
+
+    common = dict(markers=markers, mask=mask, use_age=True)
+    out_sync = watershed(image, use_block_async=False, **common)
+    out_ba = watershed(image, use_block_async=True, **common)
+
+    # Both should produce the same set of labels
+    assert set(cp.unique(out_sync).tolist()) == set(cp.unique(out_ba).tolist())
+
+    # Background (outside mask) should be unlabeled in both
+    assert cp.all(out_sync[~mask] == 0)
+    assert cp.all(out_ba[~mask] == 0)
+
+    # The vast majority of foreground pixels should agree.
+    # Allow up to 5% disagreement at tile boundaries.
+    foreground = mask
+    n_foreground = int(cp.sum(foreground))
+    n_disagree = int(cp.sum(out_sync[foreground] != out_ba[foreground]))
+    disagree_pct = n_disagree / n_foreground
+    assert disagree_pct < 0.05, (
+        f"{n_disagree}/{n_foreground} ({disagree_pct:.1%}) pixels disagree "
+        f"between block-async and synchronous"
+    )
