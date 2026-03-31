@@ -99,7 +99,7 @@ class MorphGeodesicBench(ImageBench):
 
 class WatershedBench(ImageBench):
     # kwargs that only apply to the cuCIM implementation (not scikit-image)
-    _gpu_only_kwargs = {"use_block_async", "use_age"}
+    _gpu_only_kwargs = {"use_block_async", "use_age", "inner_iterations"}
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

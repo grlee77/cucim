@@ -1558,6 +1558,7 @@ def watershed(
     *,
     use_block_async=None,
     use_age=False,
+    inner_iterations=None,
 ):
     """Watershed segmentation using cellular automaton algorithm.
 
@@ -1623,6 +1624,12 @@ def watershed(
         behavior, producing fairer splits on plateau regions. If False,
         ties are broken by neighbor iteration order (less deterministic).
         Only affects the standard watershed (compactness=0).
+    inner_iterations : int or None, optional
+        Number of iterations to perform within each block before
+        synchronizing with global memory (block-async mode only).
+        If None (default), uses 16 for 2D and 8 for 3D. Lower values
+        improve agreement with the synchronous path at the cost of
+        reduced performance. Has no effect when use_block_async=False.
 
     Returns
     -------
@@ -1745,28 +1752,32 @@ def watershed(
 
     import warnings
 
-    # Use different code paths for standard vs compact watershed
-    if compactness == 0:
-        # Determine whether to use block-async algorithm
-        # (2D/3D non-compact only; supports age)
-        if ndim == 2:
-            _min_ba = max(TILE_W, TILE_H)
-        elif ndim == 3:
-            _min_ba = TILE_3D
+    # Determine whether to use block-async algorithm.
+    # Block-async is only available for 2D/3D non-compact watershed.
+    if use_block_async is None:
+        # Auto-select: only for 2D/3D, non-compact, large enough images
+        if compactness == 0 and ndim in (2, 3):
+            _min_ba = max(TILE_W, TILE_H) if ndim == 2 else TILE_3D
+            use_block_async = min(image.shape) >= _min_ba
         else:
-            _min_ba = None  # not supported for other ndim
-
-        if use_block_async is None:
-            use_block_async = (
-                _min_ba is not None and min(image.shape) >= _min_ba
-            )
-        elif use_block_async and (
-            _min_ba is None or min(image.shape) < _min_ba
-        ):
+            use_block_async = False
+    elif use_block_async:
+        # Explicitly requested — warn and fall back if not applicable
+        reason = None
+        if compactness != 0:
+            reason = "use_block_async is not supported with compactness > 0"
+        elif ndim not in (2, 3):
+            reason = f"use_block_async is only supported for 2D/3D, got {ndim}D"
+        else:
+            _min_ba = max(TILE_W, TILE_H) if ndim == 2 else TILE_3D
+            if min(image.shape) < _min_ba:
+                reason = (
+                    f"use_block_async=True requires image dimensions >= "
+                    f"{_min_ba} for {ndim}D; got image shape {image.shape}"
+                )
+        if reason is not None:
             warnings.warn(
-                f"use_block_async=True requires image dimensions >= "
-                f"{_min_ba} for {ndim}D; falling back to synchronous. "
-                f"Got image shape {image.shape}.",
+                f"{reason}; falling back to synchronous.",
                 stacklevel=2,
             )
             use_block_async = False
@@ -1793,6 +1804,7 @@ def watershed(
             ndim=ndim,
             image_shape=image.shape,
             use_age=use_age,
+            inner_iterations=inner_iterations,
         )
     else:
         labels, state, priority, changed = _watershed_synchronous(
