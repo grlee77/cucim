@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 import math
@@ -71,16 +71,18 @@ def median(
     algorithm : {'auto', 'wavelet_matrix', 'histogram', 'sorting'}
         Determines which algorithm is used to compute the median. The default
         of 'auto' will attempt to use a wavelet matrix-based algorithm for 2D
-        images with 8 or 16-bit unsigned integer data types and sufficiently
-        large footprints. Falls back to histogram-based or sorting-based
-        algorithms when wavelet matrix is not suitable.
+        images with square or rectangular footprints with odd length on each
+        axis. Falls back to histogram-based or sorting-based algorithms when
+        wavelet matrix is not suitable.
 
         - 'wavelet_matrix': Fast wavelet matrix algorithm [2]_. Best for larger
-          footprints on 2D uint8/uint16 images.
+          footprints on 2D images.
         - 'histogram': Histogram-based algorithm [1]_. Works for 2D integer
-          images.
+          images, but in practice only when range is does not substantially
+          exceed uint8_t range.
         - 'sorting': Sorting-based algorithm via scipy.ndimage. Works for any
-          dtype and dimensionality.
+          dtype and dimensionality, but is slower than the histogram or
+          wavelet_matrix approaches.
         - 'auto': Automatically selects the best algorithm.
 
         Note: this parameter is cuCIM-specific and does not exist in upstream
@@ -121,10 +123,12 @@ def median(
     ----------
     .. [1] O. Green, "Efficient Scalable Median Filtering Using Histogram-Based
        Operations," in IEEE Transactions on Image Processing, vol. 27, no. 5,
-       pp. 2217-2228, May 2018, https://doi.org/10.1109/TIP.2017.2781375.
-    .. [2] Y. Sumida et al., "High-Performance 2D Median Filter Using Wavelet
-       Matrix," in ACM SIGGRAPH Asia 2022 Technical Communications,
-       https://doi.org/10.1145/3550454.3555512.
+       pp. 2217-2228, May 2018.
+       :DOI:`10.1109/TIP.2017.2781375`
+    .. [2] Y. Moroto and N. Umetani., "Constant Time Median Filter Using 2D
+       Wavelet Matrix," in ACM Trans. Graph. Volume 41, Issue 6,
+       Article No.: 267, December 2022.
+       :DOI:`10.1145/3550454.3555512`
 
     Examples
     --------

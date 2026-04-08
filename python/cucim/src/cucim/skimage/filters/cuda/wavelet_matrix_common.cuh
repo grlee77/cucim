@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
  * Copyright (C) 2009, Willow Garage Inc., all rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
  *
  * Common definitions and utilities for the wavelet matrix median filter.
@@ -12,11 +12,7 @@
  * - Block type definitions for bitvector storage
  * - Common device functions used across kernels
  *
- * Based on the wavelet matrix 2D median algorithm described in:
- * - Sumida et al. (2022) "High-Performance 2D Median Filter using Wavelet Matrix"
- *   https://dl.acm.org/doi/10.1145/3550454.3555512
- * - Adams (2021) "Fast Median Filters Using Separable Sorting Networks"
- *   https://dl.acm.org/doi/10.1145/3450626.3459773
+ * See wavelet_matrix_median.cu for more detailed references.
  */
 
 #ifndef CUCIM_WAVELET_MATRIX_COMMON_CUH

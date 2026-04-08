@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
  * Copyright (C) 2009, Willow Garage Inc., all rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
  *
  * Wavelet matrix median filter kernels for cuCIM.
@@ -12,9 +12,18 @@
  * The wavelet matrix construction kernels are in a separate file
  * (wavelet_matrix_construct.cu) as they are more complex.
  *
- * Based on the wavelet matrix 2D median algorithm described in:
- * - Sumida et al. (2022) "High-Performance 2D Median Filter using Wavelet Matrix"
- *   https://dl.acm.org/doi/10.1145/3550454.3555512
+ * Based on the 2D median algorithm described in:
+ *
+ * Y. Moroto and N. Umetani., "Constant Time Median Filter Using 2D Wavelet
+ * Matrix," in ACM Trans. Graph. Volume 41, Issue 6, Article No.: 267,
+ * December 2022. https://doi.org/10.1145/3550454.3555512
+ *
+ * The PR adapting that code to OpenCV was:
+ * https://github.com/opencv/opencv_contrib/pull/3627
+ *
+ * The OpenCV contribution above was made by the authors of the publication.
+ * Their original MIT-licensed source code is at:
+ * https://github.com/TumoiYorozu/WMatrixMedian
  *
  * Memory Layout and Axis Convention:
  * - Input images must be C-contiguous (row-major order)
@@ -26,6 +35,10 @@
  * Note: This file cannot be compiled standalone. It requires a preamble with
  * #define statements for the configuration parameters. See _median_wavelet.py
  * for the Python code that generates the full kernel.
+ *
+ * The code here is NOT a direct copy of the OpenCV code, but was implemented using it as
+ * a reference. The file at ../_median_wavelet.py generates the final C++ source used
+ * by cuCIM for a given data type.
  */
 
 // ============================================================================

@@ -1,10 +1,13 @@
 /*
  * Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
  * Copyright (C) 2009, Willow Garage Inc., all rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
  *
  * Wavelet matrix construction kernels for 2D median filter.
+ *
+ * See wavelet_matrix_median.cu for more detailed references to the publication and
+ * original source repository.
  *
  * This file contains the kernels for building the wavelet matrix data structure:
  * - wavelet_first_pass: Initial setup and MSB counting

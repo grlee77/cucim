@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -6,11 +6,19 @@ Wavelet matrix-based median filter implementation for cuCIM.
 
 This module provides a fast GPU-based median filter using the wavelet matrix
 algorithm described in:
-- Sumida et al. (2022) "High-Performance 2D Median Filter using Wavelet Matrix"
-  https://dl.acm.org/doi/10.1145/3550454.3555512
+- Y. Moroto and N. Umetani., "Constant Time Median Filter Using 2D Wavelet
+  Matrix," in ACM Trans. Graph. Volume 41, Issue 6, Article No.: 267,
+  December 2022. https://doi.org/10.1145/3550454.3555512
 
 The wavelet matrix approach is faster than histogram-based methods, especially
 for larger kernel sizes and higher bit-depth images.
+
+The implementation here was adapted from the MIT-licensed one provided by the
+authors at:
+https://github.com/TumoiYorozu/WMatrixMedian?tab=readme-ov-file
+
+That same implementation was also contributed to Open-CV in the following PR:
+https://github.com/opencv/opencv_contrib/pull/3627
 """
 
 import os
@@ -1498,20 +1506,21 @@ def _median_wavelet_filter(
         - 'nearest': Pad with nearest edge value
         - 'mirror': Reflection without edge duplication (d c b | a b c d | c b a)
         - 'wrap': Circular wrap around
-        Note: Only used when use_padding=True. When use_padding=False, the
-        `mode` parameter is ignored and clamp-to-border boundary handling is
-        used (see use_padding description).
+        Note: Only used when ``use_padding=True``. When ``use_padding=False``,
+        the `mode` parameter is ignored and clamp-to-border boundary handling
+        is used (see use_padding description).
     use_padding : bool, optional
-        If True (default), pad the input image and build the wavelet matrix on
-        padded dimensions. The query kernel uses a full (2*radius+1) window for
-        all pixels, with boundary values determined by the `mode` parameter.
-        If False, build the wavelet matrix on original dimensions and use a
-        boundary-aware query kernel with clamp-to-border semantics. This is
-        ~20-30% faster and uses less memory, but **uses a smaller effective
-        window at image edges** because query bounds are clamped to valid image
-        coordinates rather than using padded/replicated values. For example,
-        at corner (0,0) with radius=3, non-padded mode uses a (radius+1)x(radius+1)
-        window instead of the full (2*radius+1)x(2*radius+1) window.
+        If ``True`` (default), pad the input image and build the wavelet matrix
+        on padded dimensions. The query kernel uses a full ``(2*radius + 1)``
+        window for all pixels, with boundary values determined by the `mode`
+        parameter. If ``False``, build the wavelet matrix on original
+        dimensions and use a boundary-aware query kernel with clamp-to-border
+        semantics. This is ~20-30% faster and uses less memory, but **uses a
+        smaller effective window at image edges** because query bounds are
+        clamped to valid image coordinates rather than using padded/replicated
+        values. For example, at corner ``(0, 0)`` with ``radius=3``, non-padded
+        mode uses a ``(radius + 1)*(radius + 1)`` window instead of the full
+        ``(2*radius + 1)*(2*radius + 1)`` window.
 
     Returns
     -------
