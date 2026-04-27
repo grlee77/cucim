@@ -262,6 +262,7 @@ def _generate_nd_kernel(
     has_mask=False,
     binary_morphology=False,
     all_weights_nonzero=False,
+    track_changes=False,
 ):
     # Currently this code uses CArray for weights but avoids using CArray for
     # the input data and instead does the indexing itself since it is faster.
@@ -277,6 +278,8 @@ def _generate_nd_kernel(
     if has_mask:
         in_params += ", raw M mask"
     out_params = "Y y"
+    if track_changes:
+        out_params += ", raw int32 changed"
 
     constant_mode = False
     if isinstance(modes, str):
@@ -395,6 +398,8 @@ def _generate_nd_kernel(
         name += "_with_structure"
     if has_mask:
         name += "_with_mask"
+    if track_changes:
+        name += "_track_changed"
     preamble = _ndimage_includes + _ndimage_CAST_FUNCTION + preamble
 
     return cupy.ElementwiseKernel(

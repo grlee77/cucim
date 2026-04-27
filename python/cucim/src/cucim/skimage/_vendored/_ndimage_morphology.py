@@ -29,6 +29,7 @@ def _get_binary_erosion_kernel(
     invert,
     masked,
     all_weights_nonzero,
+    track_changes=False,
 ):
     if invert:
         border_value = int(not border_value)
@@ -39,23 +40,37 @@ def _get_binary_erosion_kernel(
         true_val = 1
         false_val = 0
 
+    def _store_and_return(value, escape_braces=False):
+        if track_changes:
+            code = f"""
+                Y _out = cast<Y>({value});
+                if (_out != cast<Y>(_in)) {{
+                    atomicExch(&changed[0], 1);
+                }}
+                y = _out;
+                return;"""
+        else:
+            code = f"""
+                y = cast<Y>({value});
+                return;"""
+        if escape_braces:
+            code = code.replace("{", "{{").replace("}", "}}")
+        return code
+
     if masked:
         pre = f"""
             bool mv = (bool)mask[i];
             bool _in = (bool)x[i];
             if (!mv) {{
-                y = cast<Y>(_in);
-                return;
+                {_store_and_return("_in")}
             }} else if ({int(center_is_true)} && _in == {false_val}) {{
-                y = cast<Y>(_in);
-                return;
+                {_store_and_return("_in")}
             }}"""
     else:
         pre = f"""
             bool _in = (bool)x[i];
             if ({int(center_is_true)} && _in == {false_val}) {{
-                y = cast<Y>(_in);
-                return;
+                {_store_and_return("_in")}
             }}"""
     pre = (
         pre
@@ -67,14 +82,12 @@ def _get_binary_erosion_kernel(
     found = f"""
         if ({{cond}}) {{{{
             if (!{border_value}) {{{{
-                y = cast<Y>({false_val});
-                return;
+                {_store_and_return(str(false_val), escape_braces=True)}
             }}}}
         }}}} else {{{{
             bool nn = {{value}} ? {true_val} : {false_val};
             if (!nn) {{{{
-                y = cast<Y>({false_val});
-                return;
+                {_store_and_return(str(false_val), escape_braces=True)}
             }}}}
         }}}}"""
 
@@ -84,11 +97,17 @@ def _get_binary_erosion_kernel(
     has_weights = not all_weights_nonzero
 
     modes = ("constant",) * len(w_shape)
+    post = ""
+    if track_changes:
+        post = """
+            if (y != cast<Y>(_in)) {
+                atomicExch(&changed[0], 1);
+            }"""
     return _filters_core._generate_nd_kernel(
         name,
         pre,
         found,
-        "",
+        post,
         modes,
         w_shape,
         int_type,
@@ -99,6 +118,7 @@ def _get_binary_erosion_kernel(
         has_structure=False,
         has_mask=masked,
         binary_morphology=True,
+        track_changes=track_changes,
     )
 
 
@@ -283,6 +303,7 @@ def _binary_erosion(
         invert,
         masked,
         all_weights_nonzero,
+        track_changes=iterations != 1,
     )
     if all_weights_nonzero:
         if masked:
@@ -308,9 +329,10 @@ def _binary_erosion(
         tmp_out = output
         if iterations >= 1 and not iterations & 1:
             tmp_in, tmp_out = tmp_out, tmp_in
-        tmp_out = erode_kernel(*in_args, tmp_out)
-        # TODO: kernel doesn't return the changed status, so determine it here
-        changed = not (input == tmp_out).all()  # synchronize!
+        changed_flag = cupy.empty(1, dtype=cupy.int32)
+        changed_flag.fill(0)
+        erode_kernel(*in_args, tmp_out, changed_flag)
+        changed = bool(changed_flag.get()[0])  # synchronize!
         ii = 1
         while ii < iterations or ((iterations < 1) and changed):
             tmp_in, tmp_out = tmp_out, tmp_in
@@ -324,10 +346,11 @@ def _binary_erosion(
                     in_args = (tmp_in, structure, mask)
                 else:
                     in_args = (tmp_in, structure)
-            tmp_out = erode_kernel(*in_args, tmp_out)
-            changed = not (tmp_in == tmp_out).all()
+            changed_flag.fill(0)
+            erode_kernel(*in_args, tmp_out, changed_flag)
+            changed = bool(changed_flag.get()[0])  # synchronize!
             ii += 1
-            if not changed and (not ii & 1):  # synchronize!
+            if not changed and (not ii & 1):
                 # can exit early if nothing changed
                 # (only do this after even number of tmp_in/out swaps)
                 break

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Testing axes support that is not currently present in CuPy/SciPy."""
@@ -71,6 +71,38 @@ def test_binary_axes(func, expand_axis, origin, border_value):
     cucim_func = getattr(ndi, func)
     cucim_func(data, struct, output=out, axes=axes, **kwargs)
     cp.testing.assert_array_almost_equal(out, expected)
+
+
+@pytest.mark.parametrize("func", ["binary_erosion", "binary_dilation"])
+@pytest.mark.parametrize("iterations", [0, 3, 5, 9])
+@pytest.mark.parametrize("dtype", [bool, np.uint8])
+def test_binary_iterative_change_tracking(func, iterations, dtype):
+    struct = np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+    data = np.asarray(
+        [
+            [0, 0, 0, 0, 0, 0, 0],
+            [0, 2, 2, 2, 0, 0, 0],
+            [0, 2, 2, 2, 0, 1, 0],
+            [0, 2, 2, 2, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0],
+        ],
+        dtype=dtype,
+    )
+    # scale up the test pattern above by a factor of 3 in size
+    data = np.kron(data, np.ones((3, 3), dtype=self.x_dtype))
+
+    expected = getattr(ndi_cpu, func)(
+        data, struct, iterations=iterations, brute_force=True
+    )
+
+    result = getattr(ndi, func)(
+        cp.asarray(data),
+        cp.asarray(struct),
+        iterations=iterations,
+        brute_force=True,
+    )
+    cp.testing.assert_array_equal(result, cp.asarray(expected))
 
 
 @pytest.mark.parametrize("origin", [(0, 0), (-1, 0)])
