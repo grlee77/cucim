@@ -168,6 +168,7 @@ repos:
             ^python/cucim/src/cucim/skimage/measure/_colocalization[.]py$|
             ^python/cucim/src/cucim/skimage/measure/_label_kernels[.]py$|
             ^python/cucim/src/cucim/skimage/measure/_label[.]py$|
+            ^python/cucim/src/cucim/skimage/measure/_marching_cubes[.]py$|
             ^python/cucim/src/cucim/skimage/measure/_moments_analytical[.]py$|
             ^python/cucim/src/cucim/skimage/measure/_moments[.]py$|
             ^python/cucim/src/cucim/skimage/measure/_polygon[.]py$|
@@ -181,6 +182,7 @@ repos:
             ^python/cucim/src/cucim/skimage/measure/tests/test_ccomp[.]py$|
             ^python/cucim/src/cucim/skimage/measure/tests/test_colocalization[.]py$|
             ^python/cucim/src/cucim/skimage/measure/tests/test_entropy[.]py$|
+            ^python/cucim/src/cucim/skimage/measure/tests/test_marching_cubes[.]py$|
             ^python/cucim/src/cucim/skimage/measure/tests/test_moments[.]py$|
             ^python/cucim/src/cucim/skimage/measure/tests/test_polygon[.]py$|
             ^python/cucim/src/cucim/skimage/measure/tests/test_profile[.]py$|
@@ -449,6 +451,7 @@ repos:
             python/cucim/src/cucim/skimage/measure/_colocalization[.]py$|
             python/cucim/src/cucim/skimage/measure/_label_kernels[.]py$|
             python/cucim/src/cucim/skimage/measure/_label[.]py$|
+            python/cucim/src/cucim/skimage/measure/_marching_cubes[.]py$|
             python/cucim/src/cucim/skimage/measure/_moments_analytical[.]py$|
             python/cucim/src/cucim/skimage/measure/_moments[.]py$|
             python/cucim/src/cucim/skimage/measure/_polygon[.]py$|
@@ -462,6 +465,7 @@ repos:
             python/cucim/src/cucim/skimage/measure/tests/test_ccomp[.]py$|
             python/cucim/src/cucim/skimage/measure/tests/test_colocalization[.]py$|
             python/cucim/src/cucim/skimage/measure/tests/test_entropy[.]py$|
+            python/cucim/src/cucim/skimage/measure/tests/test_marching_cubes[.]py$|
             python/cucim/src/cucim/skimage/measure/tests/test_moments[.]py$|
             python/cucim/src/cucim/skimage/measure/tests/test_polygon[.]py$|
             python/cucim/src/cucim/skimage/measure/tests/test_profile[.]py$|
