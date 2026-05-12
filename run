@@ -379,6 +379,7 @@ build_local_cucim_() {
         -DPYTHON_LIBRARY="${python_library}" \
         -DPYTHON_INCLUDE_DIR="${python_include_dir}"
     ${CMAKE_CMD} --build "${build_folder}" --config "${build_type_str}" --target cucim -- -j "$(nproc)"
+    ${CMAKE_CMD} --build "${build_folder}" --config "${build_type_str}" --target cucim_skimage_cpp -- -j "$(nproc)"
     ${CMAKE_CMD} --build "${build_folder}" --config "${build_type_str}" --target install -- -j "$(nproc)"
 
     popd
@@ -452,8 +453,10 @@ build_local() {
         build_local_cucim_ "${TOP}"/python "${build_type}" ${build_type_str} "${prefix}"
     fi
 
-    # Remove existing library files at python/cucim/src/cucim/clara
+    # Remove existing library files at python/cucim/src/cucim/clara and
+    # optional compiled skimage extension modules.
     rm -f "${TOP}"/python/cucim/src/cucim/clara/*.so*
+    rm -f "${TOP}"/python/cucim/src/cucim/skimage/_cucim_skimage_cpp_ext*.so
 
     if [ "$subcommand" = "all" ] || [ "$subcommand" = "cucim" ]; then
         # We don't need to copy binary if executed by conda-build
@@ -470,6 +473,7 @@ build_local() {
             fi
             # Copy .so files from pybind's build folder to cuCIM's Python source folder
             cp "${TOP}"/python/build-"${build_type}"/lib/cucim/_cucim.*.so "${TOP}"/python/cucim/src/cucim/clara/
+            cp "${TOP}"/python/build-"${build_type}"/lib/cucim/skimage/_cucim_skimage_cpp_ext.*.so "${TOP}"/python/cucim/src/cucim/skimage/
         fi
     fi
 

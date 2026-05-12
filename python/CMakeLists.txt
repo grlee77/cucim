@@ -175,6 +175,21 @@ set_target_properties(cucim PROPERTIES
 
 #target_compile_options(cucim PRIVATE -g -O0)
 
+################################################################################
+# Add library: cucim_skimage_cpp
+################################################################################
+
+pybind11_add_module(cucim_skimage_cpp
+    MODULE
+        pybind11/skimage/skimage_cpp_py.cpp
+        )
+
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR}/cucim/skimage)
+set_target_properties(cucim_skimage_cpp PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR}
+        OUTPUT_NAME cucim/skimage/_cucim_skimage_cpp_ext
+        )
+
 #pybind11_add_module(cucim_io
 #    MODULE
 #        pybind11/io/device.cpp
@@ -191,9 +206,10 @@ set_target_properties(cucim PROPERTIES
 ################################################################################
 set(INSTALL_TARGETS
         cucim
+        cucim_skimage_cpp
         )
 
-install(TARGETS cucim
+install(TARGETS ${INSTALL_TARGETS}
         EXPORT cucim-targets
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
                 COMPONENT cucim_Runtime

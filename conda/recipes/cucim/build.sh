@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 
 set -e -u -o pipefail
@@ -18,7 +18,8 @@ export LD_LIBRARY_PATH="$BUILD_PREFIX/lib:$PREFIX/lib:$LD_LIBRARY_PATH"
 # (https://conda-forge.org/docs/maintainer/knowledge_base.html#using-cmake)
 ./run build_local cucim "${CUCIM_BUILD_TYPE}"
 
-cp -P python/install/lib/* python/cucim/src/cucim/clara/
+cp -P python/install/lib/_cucim*.so python/cucim/src/cucim/clara/
+cp -P python/install/lib/_cucim_skimage_cpp_ext*.so python/cucim/src/cucim/skimage/
 
 pushd python/cucim
 

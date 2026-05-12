@@ -132,7 +132,7 @@ Note that the environment files in `./conda/environments/` will pull in GCC and 
 If you want to change the version of GCC or CUDA, please update the environment file before executing the following commands.
 
 ```bash
-conda env create -n cucim -f ./conda/environments/all_cuda-132_arch-$(uname -m).yaml
+conda env create -n cucim -f ./conda/environments/all_cuda-131_arch-$(uname -m).yaml
 # activate the environment
 conda activate cucim
 ```
@@ -156,15 +156,21 @@ export CUDACXX=$CONDA_PREFIX/pkgs/cuda-toolkit/bin/nvcc
 
 The build command will create the following files:
 - `./install/lib/libcucim*`
-- `./python/install/lib/_cucim.cpython-*-x86_64-linux-gnu.so`
+- `./python/install/lib/_cucim*.so`
+- `./python/install/lib/_cucim_skimage_cpp_ext*.so`
 - `./cpp/plugins/cucim.kit.cuslide/install/lib/cucim.kit.cuslide@*.so`
 - `./cpp/plugins/cucim.kit.cumed/install/lib/cucim.kit.cumed@*.so`
 
-And, it will copy the built library files to `python/cucim/src/cucim/clara/` folder:
+And, it will copy the built library files to the Python source tree.
+
+Files copied to `python/cucim/src/cucim/clara/`:
 - `libcucim.so.*`
-- `_cucim.cpython-*-x86_64-linux-gnu.so`
+- `_cucim*.so`
 - `cucim.kit.cuslide@*.so`
 - `cucim.kit.cumed@*.so`
+
+Files copied to `python/cucim/src/cucim/skimage/`:
+- `_cucim_skimage_cpp_ext*.so`
 
 
 **Building `cucim`(python bindings)**
