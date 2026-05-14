@@ -114,18 +114,29 @@ class WatershedBench(ImageBench):
 
     def set_args(self, dtype):
         ndim = len(self.shape)
-        # use_block_async only meaningful for 2D/3D; remove for other ndim
-        # to avoid redundant benchmark combinations
-        if ndim not in (2, 3) and "use_block_async" in self.var_kwargs:
+        # use_block_async is only supported for 2D and 3D; remove for other
+        # ndim to avoid redundant benchmark combinations
+        if ndim not in [2, 3] and "use_block_async" in self.var_kwargs:
             del self.var_kwargs["use_block_async"]
 
         from cupyx.scipy import ndimage as ndi
 
         from cucim.skimage.feature import peak_local_max
 
-        # Generate a gradient-like image from binary blobs
+        # Generate a reproducible gradient-like image from binary blobs.
         blobs = cucim.skimage.data.binary_blobs(max(self.shape), n_dim=ndim, rng=5)
         blobs = blobs[tuple(slice(s) for s in self.shape)]
+        if ndim == 2:
+            # Avoid one dominant connected foreground component while keeping
+            # the separators sparse enough to preserve larger 2D regions.
+            blobs[::128, :] = False
+            blobs[:, ::128] = False
+        elif ndim == 3:
+            # Break up the otherwise dominant connected foreground component
+            # so 3D benchmarks exercise multiple independent basins.
+            blobs[::32, :, :] = False
+            blobs[:, ::32, :] = False
+            blobs[:, :, ::32] = False
 
         distance = ndi.distance_transform_edt(blobs)
         image_d = cp.max(distance) - distance  # invert so minima are inside
@@ -274,7 +285,7 @@ def main(args):
             False,
         ),
         # _watershed.py
-        # Standard watershed: compare block-async vs synchronous (2D only)
+        # Standard watershed: compare block-async vs synchronous (2D/3D only)
         (
             "watershed",
             dict(compactness=0),
