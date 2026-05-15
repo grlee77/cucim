@@ -45,27 +45,19 @@ struct Contour
     bool active = true;
 };
 
+struct ContourAssembly
+{
+    std::vector<Node> nodes;
+    std::vector<Contour> contours;
+};
+
 std::string hello()
 {
     return "hello from cucim.skimage._cucim_skimage_cpp_ext";
 }
 
-// Assemble marching-squares output segments into ordered contours.
-//
-// Input is a C-contiguous float64 NumPy array with shape (n_segments, 2, 2).
-// Each segment stores two endpoints in row/column coordinates:
-//     segments[i, 0, :] == from_point
-//     segments[i, 1, :] == to_point
-//
-// segment_keys is a C-contiguous int64 NumPy array with shape (n_segments, 2).
-// Each key is a topological ID for the source grid edge containing the
-// corresponding endpoint. The function links endpoints by these integer keys,
-// preserving the same traversal-order behavior as scikit-image's Python
-// implementation. It returns a Python list of NumPy arrays, where each array
-// has shape (n_points, 2) and contains one open or closed contour in
-// row/column order.
-py::list assemble_contours(py::array_t<double, py::array::c_style | py::array::forcecast> segments,
-                           py::array_t<long long, py::array::c_style | py::array::forcecast> segment_keys)
+ContourAssembly build_contour_assembly(py::array_t<double, py::array::c_style | py::array::forcecast> segments,
+                                       py::array_t<long long, py::array::c_style | py::array::forcecast> segment_keys)
 {
     py::buffer_info info = segments.request();
     if (info.ndim != 3 || info.shape[1] != 2 || info.shape[2] != 2)
@@ -82,8 +74,9 @@ py::list assemble_contours(py::array_t<double, py::array::c_style | py::array::f
     }
     const long long* key_data = static_cast<const long long*>(key_info.ptr);
 
-    std::vector<Node> nodes;
-    std::vector<Contour> contours;
+    ContourAssembly assembly;
+    std::vector<Node>& nodes = assembly.nodes;
+    std::vector<Contour>& contours = assembly.contours;
     std::unordered_map<long long, std::size_t> starts;
     std::unordered_map<long long, std::size_t> ends;
     nodes.reserve(2 * n_segments);
@@ -202,14 +195,46 @@ py::list assemble_contours(py::array_t<double, py::array::c_style | py::array::f
         }
     }
 
+    return assembly;
+}
+
+std::pair<std::size_t, std::size_t> count_active_contours(const ContourAssembly& assembly)
+{
     std::size_t active_contours = 0;
-    for (const Contour& contour : contours)
+    std::size_t total_points = 0;
+    for (const Contour& contour : assembly.contours)
     {
         if (contour.active)
         {
             ++active_contours;
+            total_points += contour.size;
         }
     }
+    return { active_contours, total_points };
+}
+
+// Assemble marching-squares output segments into ordered contours.
+//
+// Input is a C-contiguous float64 NumPy array with shape (n_segments, 2, 2).
+// Each segment stores two endpoints in row/column coordinates:
+//     segments[i, 0, :] == from_point
+//     segments[i, 1, :] == to_point
+//
+// segment_keys is a C-contiguous int64 NumPy array with shape (n_segments, 2).
+// Each key is a topological ID for the source grid edge containing the
+// corresponding endpoint. The function links endpoints by these integer keys,
+// preserving the same traversal-order behavior as scikit-image's Python
+// implementation. It returns a Python list of NumPy arrays, where each array
+// has shape (n_points, 2) and contains one open or closed contour in
+// row/column order.
+py::list assemble_contours(py::array_t<double, py::array::c_style | py::array::forcecast> segments,
+                           py::array_t<long long, py::array::c_style | py::array::forcecast> segment_keys)
+{
+    ContourAssembly assembly = build_contour_assembly(segments, segment_keys);
+    std::vector<Node>& nodes = assembly.nodes;
+    std::vector<Contour>& contours = assembly.contours;
+    const auto counts = count_active_contours(assembly);
+    const std::size_t active_contours = counts.first;
 
     py::list output(active_contours);
     std::size_t output_index = 0;
@@ -236,6 +261,55 @@ py::list assemble_contours(py::array_t<double, py::array::c_style | py::array::f
     return output;
 }
 
+// Return contours in packed form:
+//
+//     points:  float64 array, shape (total_points, 2)
+//     offsets: int64 array, shape (n_contours + 1,)
+//
+// Contour i is points[offsets[i]:offsets[i + 1]]. This avoids allocating one
+// NumPy array per contour and gives callers a single contiguous coordinate
+// array that can be transferred to another backend in one operation.
+py::tuple assemble_contours_packed(py::array_t<double, py::array::c_style | py::array::forcecast> segments,
+                                   py::array_t<long long, py::array::c_style | py::array::forcecast> segment_keys)
+{
+    ContourAssembly assembly = build_contour_assembly(segments, segment_keys);
+    std::vector<Node>& nodes = assembly.nodes;
+    std::vector<Contour>& contours = assembly.contours;
+    const auto [active_contours, total_points] = count_active_contours(assembly);
+
+    py::array_t<double> points(
+        std::vector<py::ssize_t>{ static_cast<py::ssize_t>(total_points), static_cast<py::ssize_t>(2) },
+        std::vector<py::ssize_t>{ static_cast<py::ssize_t>(2 * sizeof(double)),
+                                  static_cast<py::ssize_t>(sizeof(double)) });
+    py::array_t<long long> offsets(std::vector<py::ssize_t>{ static_cast<py::ssize_t>(active_contours + 1) },
+                                   std::vector<py::ssize_t>{ static_cast<py::ssize_t>(sizeof(long long)) });
+    py::buffer_info points_info = points.request();
+    py::buffer_info offsets_info = offsets.request();
+    double* points_data = static_cast<double*>(points_info.ptr);
+    long long* offsets_data = static_cast<long long*>(offsets_info.ptr);
+
+    std::size_t output_index = 0;
+    std::size_t point_index = 0;
+    offsets_data[0] = 0;
+    for (const Contour& contour : contours)
+    {
+        if (!contour.active)
+        {
+            continue;
+        }
+        for (std::size_t node_index = contour.head; node_index != invalid_index; node_index = nodes[node_index].next)
+        {
+            const Point& point = nodes[node_index].point;
+            points_data[2 * point_index] = point.row;
+            points_data[2 * point_index + 1] = point.col;
+            ++point_index;
+        }
+        ++output_index;
+        offsets_data[output_index] = static_cast<long long>(point_index);
+    }
+    return py::make_tuple(std::move(points), std::move(offsets));
+}
+
 } // namespace cucim::skimage
 
 PYBIND11_MODULE(_cucim_skimage_cpp_ext, m)
@@ -244,4 +318,6 @@ PYBIND11_MODULE(_cucim_skimage_cpp_ext, m)
     m.def("hello", &cucim::skimage::hello, "Return a test string from the C++ extension.");
     m.def("assemble_contours", &cucim::skimage::assemble_contours,
           "Assemble marching-squares line segments into contours.");
+    m.def("assemble_contours_packed", &cucim::skimage::assemble_contours_packed,
+          "Assemble marching-squares line segments into a packed points/offsets representation.");
 }
