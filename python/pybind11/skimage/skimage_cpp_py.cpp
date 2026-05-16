@@ -5,7 +5,10 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -310,6 +313,239 @@ py::tuple assemble_contours_packed(py::array_t<double, py::array::c_style | py::
     return py::make_tuple(std::move(points), std::move(offsets));
 }
 
+std::vector<py::ssize_t> nonzero_indices(const std::vector<float>& prob)
+{
+    std::vector<py::ssize_t> indices;
+    for (py::ssize_t i = 0; i < static_cast<py::ssize_t>(prob.size()); ++i)
+    {
+        if (prob[i] > 0.0F)
+        {
+            indices.push_back(i);
+        }
+    }
+    return indices;
+}
+
+float multiotsu_var_between_class(const std::vector<float>& zeroth_moment,
+                                  const std::vector<float>& first_moment,
+                                  py::ssize_t i,
+                                  py::ssize_t j)
+{
+    if (i == 0)
+    {
+        if (zeroth_moment[j] > 0.0F)
+        {
+            return (first_moment[j] * first_moment[j]) / zeroth_moment[j];
+        }
+    }
+    else
+    {
+        const float zeroth_moment_ij = zeroth_moment[j] - zeroth_moment[i - 1];
+        if (zeroth_moment_ij > 0.0F)
+        {
+            const float first_moment_ij = first_moment[j] - first_moment[i - 1];
+            return (first_moment_ij * first_moment_ij) / zeroth_moment_ij;
+        }
+    }
+    return 0.0F;
+}
+
+float multiotsu_search_indices(const std::vector<float>& zeroth_moment,
+                               const std::vector<float>& first_moment,
+                               py::ssize_t hist_idx,
+                               py::ssize_t thresh_idx,
+                               py::ssize_t nbins,
+                               py::ssize_t thresh_count,
+                               float sigma_max,
+                               std::vector<py::ssize_t>& current_indices,
+                               std::vector<py::ssize_t>& thresh_indices,
+                               py::ssize_t bin_width,
+                               py::ssize_t refinement_window_factor,
+                               const std::vector<py::ssize_t>& thresh_indices_stage1)
+{
+    if (thresh_idx < thresh_count)
+    {
+        py::ssize_t idx_start = hist_idx;
+        py::ssize_t idx_stop = nbins - thresh_count + thresh_idx;
+        if (bin_width > 1)
+        {
+            const py::ssize_t window_width = refinement_window_factor * bin_width;
+            const py::ssize_t left_width = window_width / 2;
+            const py::ssize_t right_width = window_width - left_width;
+            const py::ssize_t center = thresh_indices_stage1[thresh_idx];
+            idx_start = std::max(idx_start, center - left_width);
+            idx_stop = std::min(center + right_width, idx_stop);
+        }
+
+        for (py::ssize_t idx = idx_start; idx < idx_stop; ++idx)
+        {
+            current_indices[thresh_idx] = idx;
+            sigma_max = multiotsu_search_indices(zeroth_moment, first_moment, idx + 1, thresh_idx + 1, nbins,
+                                                 thresh_count, sigma_max, current_indices, thresh_indices, bin_width,
+                                                 refinement_window_factor, thresh_indices_stage1);
+        }
+    }
+    else
+    {
+        float sigma =
+            multiotsu_var_between_class(zeroth_moment, first_moment, 0, current_indices[0]) +
+            multiotsu_var_between_class(zeroth_moment, first_moment, current_indices[thresh_count - 1] + 1, nbins - 1);
+        for (py::ssize_t idx = 0; idx < thresh_count - 1; ++idx)
+        {
+            sigma += multiotsu_var_between_class(
+                zeroth_moment, first_moment, current_indices[idx] + 1, current_indices[idx + 1]);
+        }
+        if (sigma > sigma_max)
+        {
+            sigma_max = sigma;
+            thresh_indices = current_indices;
+        }
+    }
+    return sigma_max;
+}
+
+std::vector<py::ssize_t> get_multiotsu_thresh_indices(const std::vector<float>& prob,
+                                                      py::ssize_t thresh_count,
+                                                      py::ssize_t bin_width = 1,
+                                                      py::ssize_t refinement_window_factor = 4,
+                                                      const std::vector<py::ssize_t>& thresh_indices_stage1 = {})
+{
+    const py::ssize_t nbins = static_cast<py::ssize_t>(prob.size());
+    std::vector<py::ssize_t> thresh_indices(static_cast<std::size_t>(thresh_count), 0);
+    std::vector<py::ssize_t> current_indices(static_cast<std::size_t>(thresh_count), 0);
+    std::vector<float> zeroth_moment(static_cast<std::size_t>(nbins), 0.0F);
+    std::vector<float> first_moment(static_cast<std::size_t>(nbins), 0.0F);
+
+    zeroth_moment[0] = prob[0];
+    first_moment[0] = prob[0];
+    for (py::ssize_t i = 1; i < nbins; ++i)
+    {
+        zeroth_moment[i] = zeroth_moment[i - 1] + prob[i];
+        first_moment[i] = first_moment[i - 1] + static_cast<float>(i) * prob[i];
+    }
+
+    multiotsu_search_indices(zeroth_moment, first_moment, 0, 0, nbins, thresh_count, 0.0F, current_indices,
+                             thresh_indices, bin_width, refinement_window_factor, thresh_indices_stage1);
+    return thresh_indices;
+}
+
+std::vector<float> downsample_probability_histogram(const std::vector<float>& prob, py::ssize_t bin_width)
+{
+    const auto nbins = static_cast<py::ssize_t>(prob.size());
+    const py::ssize_t out_size = (nbins + bin_width - 1) / bin_width;
+    std::vector<float> prob1(static_cast<std::size_t>(out_size), 0.0F);
+    for (py::ssize_t i = 0; i < nbins; ++i)
+    {
+        prob1[i / bin_width] += prob[i];
+    }
+    return prob1;
+}
+
+// Return multi-Otsu threshold bin indices using the two-stage method proposed
+// in scikit-image PR 5198. Stage 1 solves a coarse histogram problem; stage 2
+// refines the full histogram search near the coarse thresholds.
+std::vector<long long> multiotsu_thresh_indices(py::array_t<float, py::array::c_style | py::array::forcecast> probability,
+                                                py::ssize_t classes,
+                                                py::ssize_t bin_width_stage1 = 0,
+                                                py::ssize_t refinement_window_factor = 4)
+{
+    if (classes < 2)
+    {
+        throw py::value_error("classes must be greater than or equal to 2");
+    }
+
+    py::buffer_info info = probability.request();
+    if (info.ndim != 1)
+    {
+        throw py::value_error("probability must be a 1D array");
+    }
+
+    const py::ssize_t nbins = info.shape[0];
+    const float* prob_data = static_cast<const float*>(info.ptr);
+    std::vector<float> prob(prob_data, prob_data + nbins);
+    const py::ssize_t thresh_count = classes - 1;
+
+    if (bin_width_stage1 == 0)
+    {
+        bin_width_stage1 = (classes < 3 || nbins <= 16) ? 1 : 4;
+    }
+    if (bin_width_stage1 < 1)
+    {
+        throw py::value_error("bin_width_stage1 must be a positive integer");
+    }
+    if (refinement_window_factor < 1)
+    {
+        throw py::value_error("refinement_window_factor must be a positive integer");
+    }
+
+    std::vector<py::ssize_t> nz = nonzero_indices(prob);
+    if (static_cast<py::ssize_t>(nz.size()) < classes)
+    {
+        throw py::value_error("The input image has fewer different values than the requested number of classes.");
+    }
+    if (static_cast<py::ssize_t>(nz.size()) == classes)
+    {
+        nz.resize(static_cast<std::size_t>(thresh_count));
+        std::vector<long long> out(nz.size());
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            out[i] = static_cast<long long>(nz[i]);
+        }
+        return out;
+    }
+
+    std::vector<float> prob_stage1;
+    if (bin_width_stage1 == 1)
+    {
+        prob_stage1 = prob;
+    }
+    else
+    {
+        prob_stage1 = downsample_probability_histogram(prob, bin_width_stage1);
+    }
+
+    std::vector<py::ssize_t> nz_stage1 = nonzero_indices(prob_stage1);
+    if (static_cast<py::ssize_t>(nz_stage1.size()) < classes)
+    {
+        throw py::value_error(
+            "The downsampled histogram has fewer different values than the requested number of classes. "
+            "Try reducing bin_width_stage1.");
+    }
+
+    std::vector<py::ssize_t> thresh_idx_stage1;
+    if (static_cast<py::ssize_t>(nz_stage1.size()) == classes)
+    {
+        nz_stage1.resize(static_cast<std::size_t>(thresh_count));
+        thresh_idx_stage1 = nz_stage1;
+    }
+    else
+    {
+        thresh_idx_stage1 = get_multiotsu_thresh_indices(prob_stage1, thresh_count);
+    }
+
+    std::vector<py::ssize_t> thresh_idx;
+    if (bin_width_stage1 == 1)
+    {
+        thresh_idx = thresh_idx_stage1;
+    }
+    else
+    {
+        for (py::ssize_t& idx : thresh_idx_stage1)
+        {
+            idx *= bin_width_stage1;
+        }
+        thresh_idx = get_multiotsu_thresh_indices(
+            prob, thresh_count, bin_width_stage1, refinement_window_factor, thresh_idx_stage1);
+    }
+
+    std::vector<long long> out(thresh_idx.size());
+    for (std::size_t i = 0; i < out.size(); ++i)
+    {
+        out[i] = static_cast<long long>(thresh_idx[i]);
+    }
+    return out;
+}
+
 } // namespace cucim::skimage
 
 PYBIND11_MODULE(_cucim_skimage_cpp_ext, m)
@@ -320,4 +556,7 @@ PYBIND11_MODULE(_cucim_skimage_cpp_ext, m)
           "Assemble marching-squares line segments into contours.");
     m.def("assemble_contours_packed", &cucim::skimage::assemble_contours_packed,
           "Assemble marching-squares line segments into a packed points/offsets representation.");
+    m.def("multiotsu_thresh_indices", &cucim::skimage::multiotsu_thresh_indices, py::arg("probability"),
+          py::arg("classes"), py::arg("bin_width_stage1") = 0, py::arg("refinement_window_factor") = 4,
+          "Return multi-Otsu threshold bin indices using an approximate two-stage search.");
 }
