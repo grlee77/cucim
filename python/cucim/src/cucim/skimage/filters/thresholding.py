@@ -1540,7 +1540,9 @@ def apply_hysteresis_threshold(image, low, high):
     return thresholded
 
 
-def threshold_multiotsu(image=None, classes=3, nbins=256, *, hist=None):
+def threshold_multiotsu(
+    image=None, classes=3, nbins=256, *, hist=None, bin_width_stage1=4
+):
     r"""Generate `classes`-1 threshold values to divide gray levels in `image`,
     following Otsu's method for multiple classes.
 
@@ -1565,6 +1567,10 @@ def threshold_multiotsu(image=None, classes=3, nbins=256, *, hist=None):
         Histogram from which to determine the threshold, and optionally a
         corresponding array of bin center intensities. If no hist provided,
         this function will compute it from the image (see notes).
+    bin_width_stage1 : int, optional
+        Coarse histogram bin width used by the optional approximate two-stage
+        C++ helper. The default is 4. Set to 1 to use an exact search that
+        matches scikit-image threshold results.
 
     Returns
     -------
@@ -1580,18 +1586,20 @@ def threshold_multiotsu(image=None, classes=3, nbins=256, *, hist=None):
     Notes
     -----
     This implementation uses an optional pybind11 C++ helper when available.
-    The C++ helper uses a two-stage search for multi-class cases. If the
-    optional helper is not available, this function falls back to the
-    scikit-image CPU implementation.
+    For ``bin_width_stage1=1``, the helper performs an exact search matching
+    scikit-image threshold results. For ``bin_width_stage1 > 1``, the helper
+    uses an approximate two-stage search.
 
-    The two-stage search is an approximation. It often gives the same
-    thresholds as the exhaustive scikit-image implementation, but can differ,
-    particularly for narrowly distributed histograms with long tails.
-    Across 16 test images from ``skimage.data`` for ``classes=3``,
-    ``classes=4``, and ``classes=5``, the only mismatch observed with the
-    default settings was for the ``moon`` image at ``classes=4``, where the
-    approximate thresholds were ``[64, 103, 142]`` versus the exact result
-    ``[60, 102, 142]``.
+    The approximate two-stage search often gives the same thresholds as the
+    exhaustive scikit-image implementation, but can differ, particularly for
+    narrowly distributed histograms with long tails. Across 16 test images
+    from ``skimage.data`` for ``classes=3``, ``classes=4``, and
+    ``classes=5``, the only mismatch observed with the default settings was
+    for the ``moon`` image at ``classes=4``, where the approximate thresholds
+    were ``[64, 103, 142]`` versus the exact result ``[60, 102, 142]``.
+
+    If the optional helper is not available, this function falls back to the
+    scikit-image CPU implementation.
 
     If no hist is given, this function will make use of
     `skimage.exposure.histogram`, which behaves differently than
@@ -1634,10 +1642,12 @@ def threshold_multiotsu(image=None, classes=3, nbins=256, *, hist=None):
     prob, bin_centers = _validate_image_histogram(
         image, hist, nbins, normalize=True
     )
-    prob = cp.asnumpy(prob).astype(cp.float32, copy=False)
+    prob = cp.asnumpy(prob).astype(np.float32, copy=False)
     bin_centers = cp.asnumpy(bin_centers)
     try:
-        thresh_idx = _skimage_cpp.multiotsu_thresh_indices(prob, classes)
+        thresh_idx = _skimage_cpp.multiotsu_thresh_indices(
+            prob, classes, bin_width_stage1
+        )
     except ImportError:
         return cp.asarray(
             _threshold_multiotsu_cpu(
