@@ -10,7 +10,12 @@ watershed transform on GPU. In Pattern Recognition (ICPR), 2010 20th
 International Conference on (pp. 447-450). IEEE.
 
 This file implements a block-asynchronous variant as described in section 4.3
-of that publication. This variant is implemented for 2D and 3D data only.
+of that publication. Unlike the synchronous CA path, which performs one
+global-memory update per kernel launch, each block here loads a tile plus
+halo into shared memory, performs several local CA iterations, and writes the
+tile back to global memory. This reduces global memory traffic and launch
+synchronization while preserving global convergence through repeated outer
+kernel launches. This variant is implemented for 2D and 3D data only.
 
 """
 
@@ -69,6 +74,135 @@ def _gen_tiled_load(arrays, sidx, gidx):
     return load, default
 
 
+def _get_tiled_arrays(label_ctype, use_age):
+    """Return descriptors for arrays participating in shared-memory tiling."""
+    arrays = [
+        _TiledArray("labels", "s_labels", label_ctype, "0"),
+        _TiledArray("state", "s_state", "unsigned char", "0"),
+        _TiledArray("priority", "s_priority", "float", "0.0f"),
+        _TiledArray("image", "s_image", "float", "0.0f", readonly=True),
+    ]
+    if use_age:
+        arrays.append(_TiledArray("age", "s_age", "int", "2147483647"))
+    return arrays
+
+
+def _gen_tiled_kernel_fragments(arrays, shared_size):
+    """Generate declaration, parameter, and writeback fragments."""
+    shared_decls = "\n    ".join(
+        f"__shared__ {a.ctype} {a.sname}[{shared_size}];" for a in arrays
+    )
+    kernel_params = "\n    ".join(
+        f"{'const ' if a.readonly else ''}{a.ctype}* __restrict__ {a.gname},"
+        for a in arrays
+    )
+    writeback_code = "\n        ".join(
+        f"{a.gname}[gidx] = {a.sname}[sidx];" for a in arrays if not a.readonly
+    )
+    return shared_decls, kernel_params, writeback_code
+
+
+def _gen_cooperative_load_fragments(arrays):
+    """Generate in-bounds/default fragments for cooperative 1D halo loads."""
+    coop_load = "\n            ".join(
+        f"{a.sname}[s] = {a.gname}[gidx];" for a in arrays
+    )
+    coop_default = "\n            ".join(
+        f"{a.sname}[s] = {a.default};" for a in arrays
+    )
+    return coop_load, coop_default
+
+
+def _gen_best_state_init_code(label_ctype, use_age):
+    """Generate per-pixel best-state initialization."""
+    if use_age:
+        return (
+            "float best_priority = s_priority[sidx];\n"
+            "            int best_age = s_age[sidx];\n"
+            f"            {label_ctype} best_label = 0;\n"
+            "            int found_label = 0;"
+        )
+
+    return (
+        "float best_priority = s_priority[sidx];\n"
+        "            \n"
+        f"            {label_ctype} best_label = 0;\n"
+        "            int found_label = 0;"
+    )
+
+
+def _gen_inner_update_code(use_age):
+    """Generate the shared-memory update after neighbor inspection."""
+    if use_age:
+        inner_cmp = (
+            "if (found_label && best_label != 0 && "
+            "(best_priority < s_priority[sidx] || "
+            "(best_priority == s_priority[sidx] "
+            "&& best_age < s_age[sidx])))"
+        )
+        age_inner_update = "s_age[sidx] = best_age;"
+    else:
+        inner_cmp = (
+            "if (found_label && best_label != 0 "
+            "&& best_priority < s_priority[sidx])"
+        )
+        age_inner_update = ""
+
+    return f"""{inner_cmp} {{
+                s_labels[sidx] = best_label;
+                s_priority[sidx] = best_priority;
+                {age_inner_update}
+                my_changed = 1;
+            }}"""
+
+
+def _gen_neighbor_check_code(label_ctype, neighbor_index_code, use_age):
+    """Generate the common neighbor-inspection body."""
+    if use_age:
+        age_read_n = "int nage = s_age[nsidx];"
+        age_new_n = "int new_age = nage + 1;"
+        better_cmp = (
+            "if (new_priority < best_priority ||\n"
+            "                        (new_priority == best_priority "
+            "&& new_age < best_age))"
+        )
+        age_update_n = "best_age = new_age;"
+    else:
+        age_read_n = ""
+        age_new_n = ""
+        better_cmp = "if (new_priority < best_priority)"
+        age_update_n = ""
+
+    neighbor_code = ""
+    for nsidx_code in neighbor_index_code:
+        neighbor_code += f"""
+            {{
+                {nsidx_code}
+
+                {label_ctype} nlabel = s_labels[nsidx];
+                float npriority = s_priority[nsidx];
+                {age_read_n}
+
+                if (nlabel != 0) {{
+                    float new_priority = my_image;
+                    if (new_priority < npriority) {{
+                        new_priority = npriority;
+                    }}
+
+                    {age_new_n}
+
+                    {better_cmp} {{
+                        best_priority = new_priority;
+                        {age_update_n}
+                        best_label = nlabel;
+                        found_label = 1;
+                    }}
+                }}
+            }}
+"""
+    return neighbor_code
+
+
 @cp.memoize(for_each_device=True)
 def _get_watershed_block_async_kernel_2d(
     connectivity=1,
@@ -104,37 +238,15 @@ def _get_watershed_block_async_kernel_2d(
     kernel : cupy.RawKernel
         Compiled CUDA kernel
     """
-    L = label_ctype
     neighbors = _get_neighbor_offsets(2, connectivity)
 
     shared_w = TILE_W + 2 * HALO
     shared_h = TILE_H + 2 * HALO
     shared_size = f"{shared_w} * {shared_h}"
 
-    # --- Array descriptor table ---
-    # All arrays that need shared memory tiling. Adding a new array
-    # (e.g. source coordinates for compact mode) only requires adding
-    # an entry here -- load/store/declaration code is generated
-    # automatically.
-    arrays = [
-        _TiledArray("labels", "s_labels", L, "0"),
-        _TiledArray("state", "s_state", "unsigned char", "0"),
-        _TiledArray("priority", "s_priority", "float", "0.0f"),
-        _TiledArray("image", "s_image", "float", "0.0f", readonly=True),
-    ]
-    if use_age:
-        arrays.append(_TiledArray("age", "s_age", "int", "2147483647"))
-
-    # --- Generated code fragments from the table ---
-    shared_decls = "\n    ".join(
-        f"__shared__ {a.ctype} {a.sname}[{shared_size}];" for a in arrays
-    )
-    kernel_params = "\n    ".join(
-        f"{'const ' if a.readonly else ''}{a.ctype}* __restrict__ {a.gname},"
-        for a in arrays
-    )
-    writeback_code = "\n        ".join(
-        f"{a.gname}[gidx] = {a.sname}[sidx];" for a in arrays if not a.readonly
+    arrays = _get_tiled_arrays(label_ctype, use_age)
+    shared_decls, kernel_params, writeback_code = _gen_tiled_kernel_fragments(
+        arrays, shared_size
     )
 
     # --- Phase 1: Tile + halo loading ---
@@ -229,65 +341,19 @@ def _get_watershed_block_async_kernel_2d(
 
     all_loads = "\n".join(load_sections)
 
-    # --- Phase 2: Neighbor checking code ---
-    if use_age:
-        age_read_n = "int nage = s_age[nsidx];"
-        age_new_n = "int new_age = nage + 1;"
-        better_cmp = (
-            "if (new_priority < best_priority ||\n"
-            "                        (new_priority == best_priority "
-            "&& new_age < best_age))"
+    best_state_init_code = _gen_best_state_init_code(label_ctype, use_age)
+    inner_update_code = _gen_inner_update_code(use_age)
+    neighbor_index_code = [
+        (
+            f"int nsx = sx + ({dx});\n"
+            f"                int nsy = sy + ({dy});\n"
+            f"                int nsidx = nsy * {shared_w} + nsx;"
         )
-        age_update_n = "best_age = new_age;"
-        age_best_init = "int best_age = s_age[sidx];"
-        inner_cmp = (
-            "if (found_label && best_label != 0 && "
-            "(best_priority < s_priority[sidx] || "
-            "(best_priority == s_priority[sidx] "
-            "&& best_age < s_age[sidx])))"
-        )
-        age_inner_update = "s_age[sidx] = best_age;"
-    else:
-        age_read_n = ""
-        age_new_n = ""
-        better_cmp = "if (new_priority < best_priority)"
-        age_update_n = ""
-        age_best_init = ""
-        inner_cmp = (
-            "if (found_label && best_label != 0 "
-            "&& best_priority < s_priority[sidx])"
-        )
-        age_inner_update = ""
-
-    neighbor_code = ""
-    for i, (dy, dx) in enumerate(neighbors):
-        neighbor_code += f"""
-            {{
-                int nsx = sx + ({dx});
-                int nsy = sy + ({dy});
-                int nsidx = nsy * {shared_w} + nsx;
-
-                {L} nlabel = s_labels[nsidx];
-                float npriority = s_priority[nsidx];
-                {age_read_n}
-
-                if (nlabel != 0) {{
-                    float new_priority = my_image;
-                    if (new_priority < npriority) {{
-                        new_priority = npriority;
-                    }}
-
-                    {age_new_n}
-
-                    {better_cmp} {{
-                        best_priority = new_priority;
-                        {age_update_n}
-                        best_label = nlabel;
-                        found_label = 1;
-                    }}
-                }}
-            }}
-"""
+        for dy, dx in neighbors
+    ]
+    neighbor_code = _gen_neighbor_check_code(
+        label_ctype, neighbor_index_code, use_age
+    )
 
     # --- Assemble kernel ---
     kernel_code = (
@@ -327,19 +393,11 @@ void watershed_block_async_2d(
 
     for (int iter = 0; iter < {inner_iterations}; iter++) {{
         if (s_state[sidx] == 2) {{  // UNLABELED
-            float best_priority = s_priority[sidx];
-            {age_best_init}
-            {L} best_label = 0;
-            int found_label = 0;
+            {best_state_init_code}
 
             {neighbor_code}
 
-            {inner_cmp} {{
-                s_labels[sidx] = best_label;
-                s_priority[sidx] = best_priority;
-                {age_inner_update}
-                my_changed = 1;
-            }}
+            {inner_update_code}
         }}
 
         __syncthreads();
@@ -401,7 +459,6 @@ def _get_watershed_block_async_kernel_3d(
     label_ctype : str
         C type for label arrays.
     """
-    L = label_ctype
     neighbors = _get_neighbor_offsets(3, connectivity)
 
     T = TILE_3D
@@ -412,94 +469,27 @@ def _get_watershed_block_async_kernel_3d(
     shared_total = shared_x * shared_y * shared_z
     num_threads = T * T * T
 
-    # --- Array descriptor table (same pattern as 2D) ---
-    arrays = [
-        _TiledArray("labels", "s_labels", L, "0"),
-        _TiledArray("state", "s_state", "unsigned char", "0"),
-        _TiledArray("priority", "s_priority", "float", "0.0f"),
-        _TiledArray("image", "s_image", "float", "0.0f", readonly=True),
-    ]
-    if use_age:
-        arrays.append(_TiledArray("age", "s_age", "int", "2147483647"))
-
-    shared_decls = "\n    ".join(
-        f"__shared__ {a.ctype} {a.sname}[{shared_total}];" for a in arrays
-    )
-    kernel_params = "\n    ".join(
-        f"{'const ' if a.readonly else ''}{a.ctype}* __restrict__ {a.gname},"
-        for a in arrays
-    )
-    writeback_code = "\n        ".join(
-        f"{a.gname}[gidx] = {a.sname}[sidx];" for a in arrays if not a.readonly
+    arrays = _get_tiled_arrays(label_ctype, use_age)
+    shared_decls, kernel_params, writeback_code = _gen_tiled_kernel_fragments(
+        arrays, shared_total
     )
 
     # --- Phase 1: Cooperative 1D halo loading ---
-    coop_load = "\n            ".join(
-        f"{a.sname}[s] = {a.gname}[gidx];" for a in arrays
+    coop_load, coop_default = _gen_cooperative_load_fragments(arrays)
+
+    best_state_init_code = _gen_best_state_init_code(label_ctype, use_age)
+    inner_update_code = _gen_inner_update_code(use_age)
+    neighbor_index_code = [
+        (
+            f"int nsidx = (sz + ({dz})) * {shared_y * shared_x}\n"
+            f"                          + (sy + ({dy})) * {shared_x}\n"
+            f"                          + (sx + ({dx}));"
+        )
+        for dz, dy, dx in neighbors
+    ]
+    neighbor_code = _gen_neighbor_check_code(
+        label_ctype, neighbor_index_code, use_age
     )
-    coop_default = "\n            ".join(
-        f"{a.sname}[s] = {a.default};" for a in arrays
-    )
-
-    # --- Phase 2: Neighbor checking ---
-    if use_age:
-        age_read_n = "int nage = s_age[nsidx];"
-        age_new_n = "int new_age = nage + 1;"
-        better_cmp = (
-            "if (new_priority < best_priority ||\n"
-            "                        (new_priority == best_priority "
-            "&& new_age < best_age))"
-        )
-        age_update_n = "best_age = new_age;"
-        age_best_init = "int best_age = s_age[sidx];"
-        inner_cmp = (
-            "if (found_label && best_label != 0 && "
-            "(best_priority < s_priority[sidx] || "
-            "(best_priority == s_priority[sidx] "
-            "&& best_age < s_age[sidx])))"
-        )
-        age_inner_update = "s_age[sidx] = best_age;"
-    else:
-        age_read_n = ""
-        age_new_n = ""
-        better_cmp = "if (new_priority < best_priority)"
-        age_update_n = ""
-        age_best_init = ""
-        inner_cmp = (
-            "if (found_label && best_label != 0 "
-            "&& best_priority < s_priority[sidx])"
-        )
-        age_inner_update = ""
-
-    neighbor_code = ""
-    for dz, dy, dx in neighbors:
-        neighbor_code += f"""
-            {{
-                int nsidx = (sz + ({dz})) * {shared_y * shared_x}
-                          + (sy + ({dy})) * {shared_x}
-                          + (sx + ({dx}));
-
-                {L} nlabel = s_labels[nsidx];
-                float npriority = s_priority[nsidx];
-                {age_read_n}
-
-                if (nlabel != 0) {{
-                    float new_priority = my_image;
-                    if (new_priority < npriority) {{
-                        new_priority = npriority;
-                    }}
-
-                    {age_new_n}
-
-                    {better_cmp} {{
-                        best_priority = new_priority;
-                        {age_update_n}
-                        best_label = nlabel;
-                        found_label = 1;
-                    }}
-                }}
-            }}
-"""
 
     kernel_code = (
         _KERNEL_PREAMBLE
@@ -570,19 +560,11 @@ void watershed_block_async_3d(
 
     for (int iter = 0; iter < {inner_iterations}; iter++) {{
         if (s_state[sidx] == 2) {{  // UNLABELED
-            float best_priority = s_priority[sidx];
-            {age_best_init}
-            {L} best_label = 0;
-            int found_label = 0;
+            {best_state_init_code}
 
             {neighbor_code}
 
-            {inner_cmp} {{
-                s_labels[sidx] = best_label;
-                s_priority[sidx] = best_priority;
-                {age_inner_update}
-                my_changed = 1;
-            }}
+            {inner_update_code}
         }}
 
         __syncthreads();
