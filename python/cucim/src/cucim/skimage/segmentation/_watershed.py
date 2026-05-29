@@ -1,16 +1,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Watershed segmentation using a cellular automaton algorithm.
+"""Watershed segmentation using cellular-automaton-style relaxation.
 
-This module implements a synchronous CA-watershed algorithm based on:
+This module provides a GPU-parallel watershed implementation inspired by
+cellular automaton (CA) watershed work, including:
 
-Kauffmann, C., & Piche, N. (2010). Cellular automaton for ultra-fast
-watershed transform on GPU. In Pattern Recognition (ICPR), 2010 20th
-International Conference on (pp. 447-450). IEEE.
+P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D watershed on
+graphics processing unit: block-asynchronous approaches based on cellular
+automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
+pp. 2638-2655, ISSN 0045-7906,
+:DOI:`10.1016/j.compeleceng.2013.04.020`
 
-The compact watershed extension follows the approach from scikit-image,
-which is based on:
+There is also an earlier publication for CA-based watershed using graphics
+shaders:
+
+Kauffmann, C., & Piché, N. (2008). Cellular automaton for ultra-fast watershed
+transform on GPU, 2008 19th International Conference on Pattern Recognition
+(ICPR), Tampa, FL, USA, 2008, pp. 1-4.
+:DOI:`10.1109/ICPR.2008.4761628`
+
+This code is not an exact reproduction of those papers' synchronous or
+hill-climbing plateau automata. It adapts CA-style local relaxation to the
+scikit-image watershed API, including arbitrary markers, masks,
+n-dimensional connectivity, optional age-based tie-breaking, and a compact
+watershed extension.
+
+The marker-controlled watershed model follows the morphological flooding
+formulation of Meyer and Beucher:
+
+Meyer, F., & Beucher, S. (1990). Morphological segmentation. Journal of Visual
+Communication and Image Representation, 1(1), pp. 21-46.
+:DOI:`10.1016/1047-3203(90)90014-M`
+
+The compact watershed extension follows the scikit-image approach, based on:
 
 Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive SLIC:
 On Improving Trade-offs of Superpixel Segmentation Algorithms.
@@ -217,11 +240,13 @@ def watershed(
     use_age=False,
     inner_iterations=None,
 ):
-    """Watershed segmentation using cellular automaton algorithm.
+    """Watershed segmentation using cellular-automaton-style relaxation.
 
     This function implements a GPU-accelerated watershed transform using
-    a cellular automaton approach. The algorithm is particularly efficient
-    for seeded watershed segmentation on 2D and 3D images.
+    CA-inspired local relaxation of marker labels and path priorities. It is
+    designed to follow the scikit-image watershed API rather than reproduce one
+    paper verbatim, supporting arbitrary markers, masks, n-dimensional
+    connectivity, optional plateau tie-breaking, and compact watershed.
 
     Parameters
     ----------
@@ -270,8 +295,8 @@ def watershed(
     use_block_async : bool or None, optional
         Parameter to control algorithm variant for standard watershed.
         If None (default), automatically chooses based on image size.
-        If True, uses block-asynchronous algorithm with shared memory tiling.
-        If False, uses synchronous algorithm.
+        If True, uses a plain block-asynchronous algorithm with shared memory
+        tiling. If False, uses the global-relaxation algorithm.
         This variant is only implemented for 2D and 3D images and only
         affects the standard watershed (compactness=0).
     use_age : bool, optional
@@ -282,8 +307,8 @@ def watershed(
         ties are broken by neighbor iteration order (less deterministic).
         Only affects the standard watershed (compactness=0).
     inner_iterations : int or None, optional
-        Number of iterations to perform within each block before
-        synchronizing with global memory (block-async mode only).
+        Number of iterations to perform within each block before writing back
+        to global memory (block-async mode only).
         If None (default), uses 16 for 2D and 8 for 3D. Lower values
         improve agreement with the synchronous path at the cost of
         reduced performance. Has no effect when use_block_async=False.
@@ -303,34 +328,49 @@ def watershed(
 
     Notes
     -----
-    This implementation uses a cellular automaton (CA) approach, which is
-    well-suited for GPU parallelization. The algorithm iteratively propagates
-    labels from seed points (markers) to neighboring pixels based on their
-    values in the input image.
+    The marker-controlled watershed model follows the morphological flooding
+    formulation of Meyer and Beucher [1]_, also used by tools such as
+    MorphoLibJ and scikit-image. This implementation is related to the
+    CA-watershed and Ford-Bellman-style GPU relaxations described in [2]_,
+    [3]_, and [4]_, but it is not an exact implementation of the synchronous
+    or hill-climbing plateau automata from those papers. It instead propagates
+    marker labels by repeatedly relaxing a path priority, similar in spirit to
+    seeded watershed but structured for GPU-wide parallel updates.
 
-    The algorithm is based on the CA-watershed method described in [1]_.
-    Unlike the classical priority queue-based watershed, this approach
-    processes all pixels in parallel during each iteration, making it
-    highly efficient on GPU architectures.
+    The block-asynchronous path follows the plain tiled/shared-memory update
+    pattern from [2]_. It does not implement the artifact-free distance
+    correction proposed there; the optional ``use_age`` value is a
+    scikit-image-oriented plateau tie-breaker, not that correction scheme.
 
-    The compact watershed extension follows the approach from scikit-image [2]_,
-    which adds a distance penalty to encourage more regularly-shaped regions.
-    This is useful for superpixel generation (2D only).
-
-    Current limitations:
-    - watershed_line parameter is not yet implemented
-    - compactness parameter is only supported for 2D images
-    - block-async optimization is only available for 2D and 3D images
+    The compact watershed extension follows the scikit-image approach [5]_,
+    adding a distance penalty to encourage more regularly-shaped regions. This
+    is useful for superpixel generation.
 
     References
     ----------
-    .. [1] Kauffmann, C., & Piche, N. (2010). Cellular automaton for
-           ultra-fast watershed transform on GPU. In Pattern Recognition
-           (ICPR), 2010 20th International Conference on (pp. 447-450). IEEE.
-
-    .. [2] Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive
-           SLIC: On Improving Trade-offs of Superpixel Segmentation Algorithms.
-           In Pattern Recognition (ICPR), 2014 22nd International Conference on.
+    .. [1] Meyer, F., & Beucher, S. (1990). Morphological segmentation.
+           Journal of Visual Communication and Image Representation, 1(1),
+           pp. 21-46.
+           :DOI:`10.1016/1047-3203(90)90014-M`
+    .. [2] P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D
+           watershed on graphics processing unit: block-asynchronous approaches
+           based on cellular automata, Computers & Electrical Engineering,
+           Volume 39, Issue 8, 2013, pp. 2638-2655, ISSN 0045-7906,
+           :DOI:`10.1016/j.compeleceng.2013.04.020`
+    .. [3] Kauffmann, C., & Piché, N. (2008). Cellular automaton for ultra-fast
+           watershed transform on GPU, 2008 19th International Conference on
+           Pattern Recognition (ICPR), Tampa, FL, USA, 2008, pp. 1-4.
+           :DOI:`10.1109/ICPR.2008.4761628`
+    .. [4] Kauffmann, C., & Piché, N. (2010). Seeded ND medical image
+           segmentation by cellular automaton on GPU, International Journal of
+           Computer Assisted Radiology and Surgery, Volume 5, Issue 3, 2010,
+           pp. 251-262.
+           :DOI:`10.1007/s11548-009-0392-0`
+    .. [5] Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive
+           SLIC: On Improving Trade-offs of Superpixel Segmentation Algorithms,
+           2014 22nd International Conference on Pattern Recognition (ICPR),
+           Stockholm, Sweden, 2014, pp. 996-1001
+           :DOI:`10.1109/ICPR.2014.181`
 
     Examples
     --------

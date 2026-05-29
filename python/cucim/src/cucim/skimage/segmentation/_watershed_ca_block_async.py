@@ -1,23 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Watershed segmentation using a block-async cellular automaton algorithm.
+"""Block-asynchronous watershed using cellular-automaton-style relaxation.
 
-The `_watershed_ca.py` module implements the CA-watershed algorithm based on:
+The `_watershed_ca.py` module implements the base GPU relaxation. The
+block-asynchronous variant here is inspired by:
 
-Kauffmann, C., & Piche, N. (2010). Cellular automaton for ultra-fast
-watershed transform on GPU. In Pattern Recognition (ICPR), 2010 20th
-International Conference on (pp. 447-450). IEEE.
+P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D watershed on
+graphics processing unit: block-asynchronous approaches based on cellular
+automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
+pp. 2638-2655, ISSN 0045-7906,
+:DOI:`10.1016/j.compeleceng.2013.04.020`
 
-This file implements a block-asynchronous variant as described in section 4.3
-of that publication. Unlike the synchronous CA path, which performs one
-global-memory update per kernel launch, each block here loads a tile plus
-halo into shared memory, performs several local CA iterations, and writes the
-tile back to global memory. This reduces global memory traffic and launch
-synchronization while preserving global convergence through repeated outer
-kernel launches. This variant is implemented for 2D and 3D data only.
+The structure follows the plain block-asynchronous approach from Section 4.2:
+each block loads a tile plus halo into shared memory, performs several local
+CA-like relaxation iterations, writes the tile back to global memory, and
+converges through repeated outer kernel launches. This is not a literal
+implementation of the paper's hill-climbing plateau automaton, and it does not
+include the artifact-free distance-correction scheme from Section 4.3.
 
-"""
+The implementation is adapted to cuCIM/scikit-image semantics: marker labels
+are propagated by path priority, optional age values break equal-priority
+plateau ties, and 2D/3D connectivities follow ndimage conventions. Compact
+watershed is handled only by the synchronous/global-relaxation path.
+
+"""  # noqa: E501
 
 import cupy as cp
 
