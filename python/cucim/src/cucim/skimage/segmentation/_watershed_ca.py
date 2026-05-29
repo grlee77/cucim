@@ -1,25 +1,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Watershed segmentation using a cellular automaton algorithm.
+"""Watershed segmentation using cellular-automaton-style relaxation.
 
-This module implements a synchronous CA-watershed algorithm based on:
+This module implements a GPU-parallel watershed relaxation inspired by
+cellular automaton (CA) watershed work, including:
 
-Kauffmann, C., & Piche, N. (2010). Cellular automaton for ultra-fast
-watershed transform on GPU. In Pattern Recognition (ICPR), 2010 20th
-International Conference on (pp. 447-450). IEEE.
+P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D watershed on
+graphics processing unit: block-asynchronous approaches based on cellular
+automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
+pp. 2638-2655, ISSN 0045-7906,
+:DOI:`10.1016/j.compeleceng.2013.04.020`
 
-The compact watershed extension follows the approach from scikit-image,
-which is based on:
+There is also an earlier publication for CA-based watershed using graphics
+shaders:
 
-Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive SLIC:
-On Improving Trade-offs of Superpixel Segmentation Algorithms.
-In Pattern Recognition (ICPR), 2014 22nd International Conference on.
+Kauffmann, C., & Piché, N. (2008). Cellular automaton for ultra-fast watershed
+transform on GPU, 2008 19th International Conference on Pattern Recognition
+(ICPR), Tampa, FL, USA, 2008, pp. 1-4.
+:DOI:`10.1109/ICPR.2008.4761628`
 
-The implementation here is a general n-dimensional version of the algorithms.
+The implementation is not a literal reproduction of either paper's
+double-buffered synchronous CA or hill-climbing plateau automaton. Instead, it
+uses an in-place global-memory relaxation of labels and path priorities,
+adapted to the scikit-image watershed API: arbitrary marker labels, masks,
+n-dimensional connectivity, optional age-based plateau tie-breaking, and a
+compact watershed mode.
+
+The compact watershed extension follows the scikit-image approach, based on:
+
+Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive SLIC: On
+Improving Trade-offs of Superpixel Segmentation Algorithms, 2014 22nd
+International Conference on Pattern Recognition (ICPR), Stockholm, Sweden,
+2014, pp. 996-1001
+:DOI:`10.1109/ICPR.2014.181`
 
 See `_watershed_ca_block_async.py` for a faster block-asynchronous variant
-supporting compactness=0 for 2D and 3D data only.
+for standard 2D and 3D watershed. That variant follows the plain
+block-asynchronous structure of Quesada-Barriuso et al.; it is not the
+artifact-free distance-correction algorithm from that paper.
 """
 
 import itertools
