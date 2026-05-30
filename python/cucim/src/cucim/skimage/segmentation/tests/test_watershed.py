@@ -676,6 +676,20 @@ def test_incorrect_mask_shape():
         watershed(image, markers=4, mask=mask)
 
 
+def test_offset_not_implemented():
+    """A non-default `offset` is accepted positionally (matching the
+    scikit-image signature) but raises NotImplementedError."""
+    image = cp.zeros((5, 6), dtype=cp.float32)
+    markers = cp.zeros((5, 6), dtype=cp.int32)
+    markers[1, 1] = 1
+    markers[3, 4] = 2
+    # offset is the 4th positional argument, as in scikit-image
+    with pytest.raises(NotImplementedError):
+        watershed(image, markers, 1, (1, 1))
+    with pytest.raises(NotImplementedError):
+        watershed(image, markers, offset=(1, 1))
+
+
 def test_markers_in_mask():
     data = blob
     mask = data != 255

@@ -224,9 +224,11 @@ def _get_watershed_block_async_kernel_2d(
     local iterations before writing back to global memory, reducing the
     number of global synchronization rounds.
 
-    Based on the "Block-asynchronous algorithm" described in Section 4.3
-    of Kauffmann, C. & Piche, N. (2010), "Cellular automaton for
-    ultra-fast watershed transform on GPU", ICPR 2010, pp. 447-450.
+    Based on the plain block-asynchronous approach described in Section 4.2
+    of Quesada-Barriuso, Heras & Argüello (2013), "Efficient 2D and 3D
+    watershed on graphics processing unit: block-asynchronous approaches
+    based on cellular automata". This is not the artifact-free
+    distance-correction variant from Section 4.3 of that paper.
 
     Parameters
     ----------
@@ -453,7 +455,9 @@ def _get_watershed_block_async_kernel_3d(
     via a linear sweep. This avoids enumerating 26 separate halo
     regions and generalizes cleanly to 3D.
 
-    Based on Section 4.3 of Kauffmann & Piche (2010).
+    Based on the plain block-asynchronous approach (Section 4.2) of
+    Quesada-Barriuso, Heras & Argüello (2013); not the artifact-free
+    distance-correction variant from Section 4.3 of that paper.
 
     Parameters
     ----------
