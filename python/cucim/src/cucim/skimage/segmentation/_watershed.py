@@ -40,6 +40,8 @@ On Improving Trade-offs of Superpixel Segmentation Algorithms.
 In Pattern Recognition (ICPR), 2014 22nd International Conference on.
 """
 
+import warnings
+
 import cupy as cp
 import numpy as np
 from cupyx.scipy import ndimage as ndi
@@ -279,7 +281,8 @@ def watershed(
           - 1: 6-connectivity (face neighbors)
           - 2: 18-connectivity (face + edge neighbors)
           - 3: 26-connectivity (face + edge + corner neighbors)
-        Default is 1.
+        Default is 1. Unlike scikit-image, only an integer is accepted; a
+        connectivity given as an ndarray footprint raises ``TypeError``.
     offset : array_like of shape image.ndim, optional
         The coordinates of the center of the connectivity footprint. This
         parameter is accepted for compatibility with the scikit-image API,
@@ -463,13 +466,17 @@ def watershed(
     threads_per_block = 256
     blocks = (size + threads_per_block - 1) // threads_per_block
 
-    # Upper bound on iterations (shouldn't need this many)
-    max_iterations = max(image.shape) * 2
+    # Safety ceiling on the number of relaxation rounds. Label propagation
+    # advances the frontier by at least one hop per round, so a Bellman-Ford
+    # style relaxation converges in at most (number of pixels - 1) rounds
+    # (the longest possible geodesic, e.g. a space-filling/spiral mask).
+    # Using image.size as the bound therefore guarantees the result is never
+    # silently truncated; the loop still exits early as soon as it converges,
+    # so this ceiling has no effect on the common case.
+    max_iterations = int(image.size)
 
     # Ensure image is contiguous and flat for kernel
     image_flat = cp.ascontiguousarray(image.ravel())
-
-    import warnings
 
     # Determine whether to use block-async algorithm.
     # Block-async is only available for 2D/3D non-compact watershed.
