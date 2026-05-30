@@ -690,6 +690,70 @@ def test_offset_not_implemented():
         watershed(image, markers, offset=(1, 1))
 
 
+@pytest.mark.parametrize("interval", [0, -1])
+def test_convergence_check_interval_invalid(interval):
+    """convergence_check_interval must be a positive integer."""
+    image = cp.zeros((8, 8), dtype=cp.float32)
+    markers = cp.zeros((8, 8), dtype=cp.int32)
+    markers[1, 1] = 1
+    markers[6, 6] = 2
+    with pytest.raises(ValueError):
+        watershed(image, markers, convergence_check_interval=interval)
+
+
+@pytest.mark.parametrize("use_block_async", [False, True])
+@pytest.mark.parametrize("interval", [1, 4, 64])
+def test_convergence_check_interval_matches(use_block_async, interval):
+    """Batching convergence checks must not change the result.
+
+    Uses a deterministic configuration (flat image + use_age=True) so the
+    relaxation has a unique fixed point; only the number of host syncs and
+    the count of (no-op) launches past convergence should differ.
+    """
+    shape = (64, 64)
+    image = cp.zeros(shape)
+    markers = cp.zeros(shape, dtype=cp.int32)
+    markers[16, 16] = 1
+    markers[16, 48] = 2
+    markers[48, 16] = 3
+    markers[48, 48] = 4
+
+    ref = watershed(
+        image,
+        markers,
+        connectivity=1,
+        use_age=True,
+        use_block_async=use_block_async,
+        convergence_check_interval=1,
+    )
+    out = watershed(
+        image,
+        markers,
+        connectivity=1,
+        use_age=True,
+        use_block_async=use_block_async,
+        convergence_check_interval=interval,
+    )
+    cp.testing.assert_array_equal(out, ref)
+
+
+def test_convergence_check_interval_matches_compact():
+    """Batching must not change the compact (synchronous) watershed result."""
+    image = cp.zeros((5, 6))
+    image[:, 3] = 2
+    image[:, 4:] = 1
+    seeds = cp.zeros((5, 6), dtype=int)
+    seeds[2, 0] = 1
+    seeds[2, 5] = 2
+    ref = watershed(
+        image, seeds, compactness=0.01, convergence_check_interval=1
+    )
+    out = watershed(
+        image, seeds, compactness=0.01, convergence_check_interval=32
+    )
+    cp.testing.assert_array_equal(out, ref)
+
+
 def test_markers_in_mask():
     data = blob
     mask = data != 255

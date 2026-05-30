@@ -625,6 +625,7 @@ def _watershed_standard_block_async(
     inner_iterations=None,
     use_age=False,
     label_dtype=cp.int32,
+    convergence_check_interval=None,
     **kwargs,
 ):
     """Run standard watershed with block-asynchronous algorithm.
@@ -717,9 +718,22 @@ def _watershed_standard_block_async(
         max_iterations + inner_iterations - 1
     ) // inner_iterations
 
-    for iteration in range(max_outer_iterations):
+    # Batch ``convergence_check_interval`` outer launches between convergence
+    # checks to reduce device->host syncs (see _watershed_synchronous for the
+    # rationale). ``changed`` is reset once per batch and accumulates across
+    # the batch's launches. Unlike the synchronous path, each launch here is
+    # expensive (it reloads a shared-memory tile + halo) and the launches are
+    # comparatively few, so a wasted launch costs more than a sync; the
+    # default therefore checks after every launch.
+    if convergence_check_interval is None:
+        convergence_check_interval = 1
+    launched = 0
+    while launched < max_outer_iterations:
         changed[0] = 0
-        step_kernel(grid_size, block_size, step_args)
+        batch = min(convergence_check_interval, max_outer_iterations - launched)
+        for _ in range(batch):
+            step_kernel(grid_size, block_size, step_args)
+        launched += batch
         if changed[0] == 0:
             break
 
