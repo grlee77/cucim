@@ -177,7 +177,6 @@ def _validate_inputs(image, markers, mask, connectivity):
         image = image.astype(cp.float32)
 
     # Validate mask before markers (needed for marker generation)
-    n_pixels = image.size
     if mask is not None:
         if not isinstance(mask, cp.ndarray):
             raise TypeError(
@@ -190,7 +189,6 @@ def _validate_inputs(image, markers, mask, connectivity):
             )
 
         mask = mask.astype(cp.uint8)
-        n_pixels = int(cp.sum(mask))
 
     # Handle markers
     if markers is None:
@@ -201,12 +199,16 @@ def _validate_inputs(image, markers, mask, connectivity):
         footprint = ndi.generate_binary_structure(ndim, connectivity)
         markers = ndi.label(markers_bool, structure=footprint)[0]
     elif not isinstance(markers, (cp.ndarray, list, tuple)):
-        # Assume int: generate that many regularly-spaced markers
+        # Assume int: generate that many regularly-spaced markers.
+        # Scale by the fraction of masked pixels (like scikit-image) so the
+        # requested count refers to markers *within* the mask. The masked
+        # pixel count is only needed here, so the reduction (and its
+        # device->host sync) is deferred to this branch.
         n_markers = int(markers)
-        # Scale n_markers by fraction of masked pixels (like scikit-image)
-        markers = regular_seeds(
-            image.shape, int(n_markers / (n_pixels / image.size))
-        )
+        if mask is not None:
+            n_pixels = int(cp.sum(mask))
+            n_markers = int(n_markers / (n_pixels / image.size))
+        markers = regular_seeds(image.shape, n_markers)
         if mask is not None:
             markers *= mask.astype(markers.dtype)
     else:
@@ -232,6 +234,7 @@ def watershed(
     image,
     markers=None,
     connectivity=1,
+    offset=None,
     mask=None,
     compactness=0,
     watershed_line=False,
@@ -265,6 +268,8 @@ def watershed(
         are generated using :func:`cucim.skimage.util.regular_seeds`.
         If an array, non-zero values represent different regions to grow
         from. Negative markers are supported (e.g., -1 for background).
+        Unlike scikit-image, Python ``list``/``tuple`` markers are not
+        accepted; pass a :class:`cupy.ndarray` or an int.
     connectivity : int, optional
         Neighborhood connectivity as integer:
         - For 2D images:
@@ -275,11 +280,17 @@ def watershed(
           - 2: 18-connectivity (face + edge neighbors)
           - 3: 26-connectivity (face + edge + corner neighbors)
         Default is 1.
+    offset : array_like of shape image.ndim, optional
+        The coordinates of the center of the connectivity footprint. This
+        parameter is accepted for compatibility with the scikit-image API,
+        but only the default (``None``, i.e. a footprint centered on each
+        pixel) is supported. Passing any other value raises
+        :class:`NotImplementedError`.
     mask : cupy.ndarray of bool, shape (M, N) or (D, M, N), optional
         If provided, only pixels/voxels where mask is True will be segmented.
         Useful for restricting watershed to regions of interest.
     compactness : float, optional
-        Use compact watershed with given compactness parameter (2D only).
+        Use compact watershed with given compactness parameter.
         Higher values give more regularly-shaped basins. When compactness
         is non-zero, the priority is computed as:
             priority = (
@@ -300,11 +311,11 @@ def watershed(
         This variant is only implemented for 2D and 3D images and only
         affects the standard watershed (compactness=0).
     use_age : bool, optional
-        If True (default), use an age (hop distance) counter as a
-        tie-breaker when two labels arrive at a pixel with equal priority.
-        This more closely matches scikit-image's age-based tie-breaking
-        behavior, producing fairer splits on plateau regions. If False,
-        ties are broken by neighbor iteration order (less deterministic).
+        If True, use an age (hop distance) counter as a tie-breaker when
+        two labels arrive at a pixel with equal priority. This more closely
+        matches scikit-image's age-based tie-breaking behavior, producing
+        fairer splits on plateau regions. If False (default), ties are
+        broken by neighbor iteration order (less deterministic).
         Only affects the standard watershed (compactness=0).
     inner_iterations : int or None, optional
         Number of iterations to perform within each block before writing back
@@ -324,7 +335,8 @@ def watershed(
     ValueError
         If input arrays have incompatible shapes or invalid parameters.
     NotImplementedError
-        If watershed_line is used, or if compactness is used with 3D images.
+        If a non-default ``offset`` is given (only ``offset=None`` is
+        supported).
 
     Notes
     -----
@@ -404,6 +416,16 @@ def watershed(
     >>> labels_compact = segmentation.watershed(-image,
     >>>                                         markers, compactness=0.1)
     """
+    if offset is not None:
+        # `offset` is accepted only to keep the positional argument order
+        # consistent with scikit-image. The CA kernels use symmetric
+        # neighborhoods centered on each pixel, so a shifted footprint
+        # center is not supported.
+        raise NotImplementedError(
+            "The `offset` parameter is accepted for scikit-image API "
+            "compatibility but only the default (offset=None) is supported."
+        )
+
     # Determine output label dtype from markers
     if isinstance(markers, cp.ndarray):
         label_dtype = cp.dtype(markers.dtype)
