@@ -244,6 +244,7 @@ def watershed(
     use_block_async=None,
     use_age=False,
     inner_iterations=None,
+    convergence_check_interval=None,
 ):
     """Watershed segmentation using cellular-automaton-style relaxation.
 
@@ -326,6 +327,19 @@ def watershed(
         If None (default), uses 16 for 2D and 8 for 3D. Lower values
         improve agreement with the synchronous path at the cost of
         reduced performance. Has no effect when use_block_async=False.
+    convergence_check_interval : int or None, optional
+        Number of relaxation kernel launches to perform between successive
+        convergence checks. Each check reads a device flag back to the host,
+        which forces a synchronization and serializes the CPU and GPU.
+        Running several launches back-to-back before checking reduces these
+        host-device syncs by roughly this factor, at the cost of up to
+        ``convergence_check_interval - 1`` extra launches after convergence.
+        Because the relaxation is idempotent at its fixed point, those extra
+        launches are no-ops and never change the result. If None (default),
+        a value tuned to the algorithm is used: 8 for the synchronous path
+        (many cheap launches, where syncs dominate) and 1 for the
+        block-asynchronous path (few, expensive launches, where extra
+        launches cost more than the syncs saved). Must be >= 1 if given.
 
     Returns
     -------
@@ -429,6 +443,14 @@ def watershed(
             "compatibility but only the default (offset=None) is supported."
         )
 
+    if convergence_check_interval is not None:
+        convergence_check_interval = int(convergence_check_interval)
+        if convergence_check_interval < 1:
+            raise ValueError(
+                "convergence_check_interval must be a positive integer, got "
+                f"{convergence_check_interval}"
+            )
+
     # Determine output label dtype from markers
     if isinstance(markers, cp.ndarray):
         label_dtype = cp.dtype(markers.dtype)
@@ -522,6 +544,7 @@ def watershed(
         threads_per_block=threads_per_block,
         max_iterations=max_iterations,
         label_dtype=label_dtype,
+        convergence_check_interval=convergence_check_interval,
     )
 
     if use_block_async and ndim in (2, 3) and compactness == 0:

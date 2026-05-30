@@ -603,6 +603,7 @@ def _watershed_synchronous(
     compactness=0,
     use_age=False,
     label_dtype=cp.int32,
+    convergence_check_interval=None,
     **kwargs,
 ):
     """Run synchronous watershed algorithm (standard or compact).
@@ -678,9 +679,24 @@ def _watershed_synchronous(
     step_args.extend(dim_args)
     step_args = tuple(step_args)
 
-    for iteration in range(max_iterations):
+    # Run kernels in batches of ``convergence_check_interval`` launches and
+    # only read ``changed`` back to the host once per batch. Reading the flag
+    # forces a device->host sync, so batching reduces the number of syncs by
+    # roughly this factor. ``changed`` is reset once per batch and accumulates
+    # across the batch's launches, so a zero after the batch means none of the
+    # launches changed anything (i.e. convergence). The relaxation is a no-op
+    # at its fixed point, so any launches past convergence within a batch are
+    # harmless. These step kernels are cheap and numerous, so the per-launch
+    # sync dominates; checking every 8th launch recovers most of that cost.
+    if convergence_check_interval is None:
+        convergence_check_interval = 8
+    launched = 0
+    while launched < max_iterations:
         changed[0] = 0
-        step_kernel((blocks,), (threads_per_block,), step_args)
+        batch = min(convergence_check_interval, max_iterations - launched)
+        for _ in range(batch):
+            step_kernel((blocks,), (threads_per_block,), step_args)
+        launched += batch
         if changed[0] == 0:
             break
 
