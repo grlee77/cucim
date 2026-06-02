@@ -241,7 +241,7 @@ def watershed(
     compactness=0,
     watershed_line=False,
     *,
-    use_block_async=None,
+    use_block_async=False,
     use_age=False,
     inner_iterations=None,
     convergence_check_interval=None,
@@ -256,10 +256,11 @@ def watershed(
 
     Parameters
     ----------
-    image : cupy.ndarray, shape (M, N) or (D, M, N)
+    image : cupy.ndarray, shape (M, N[, ...])
         Input image (typically a gradient magnitude or distance transform).
         Lower values have higher priority for watershed expansion.
-        Supports both 2D and 3D images.
+        n-dimensional images are supported (the opt-in block-asynchronous
+        path is limited to 2D and 3D; see ``use_block_async``).
     markers : int, cupy.ndarray of int, or None, optional
         The desired number of basins, or an array marking the basins with
         the values to be assigned in the label matrix. Zero means not a
@@ -290,9 +291,10 @@ def watershed(
         but only the default (``None``, i.e. a footprint centered on each
         pixel) is supported. Passing any other value raises
         :class:`NotImplementedError`.
-    mask : cupy.ndarray of bool, shape (M, N) or (D, M, N), optional
+    mask : cupy.ndarray of bool, shape (M, N[, ...]), optional
         If provided, only pixels/voxels where mask is True will be segmented.
-        Useful for restricting watershed to regions of interest.
+        Useful for restricting watershed to regions of interest. Default is
+        None (the whole image is segmented).
     compactness : float, optional
         Use compact watershed with given compactness parameter.
         Higher values give more regularly-shaped basins. When compactness
@@ -307,20 +309,22 @@ def watershed(
         the watershed algorithm. The line has the label 0. This is
         implemented as a post-processing step after the CA iteration
         converges (see Notes). Default is False.
-    use_block_async : bool or None, optional
-        Parameter to control algorithm variant for standard watershed.
-        If None (default), automatically chooses based on image size.
-        If True, uses a plain block-asynchronous algorithm with shared memory
-        tiling. If False, uses the global-relaxation algorithm.
-        This variant is only implemented for 2D and 3D images and only
-        affects the standard watershed (compactness=0).
+    use_block_async : bool, optional
+        Opt-in faster algorithm variant for standard watershed. If False
+        (default), uses the synchronous double-buffered relaxation. If True,
+        uses a block-asynchronous algorithm with shared-memory tiling, which
+        is faster for larger images but only approximately matches the
+        synchronous result (tile-local updates are applied before global
+        synchronization). Only implemented for 2D and 3D images and only
+        affects the standard watershed (compactness=0); it is ignored (with
+        a warning) otherwise.
     use_age : bool, optional
-        If True, use an age (hop distance) counter as a tie-breaker when
-        two labels arrive at a pixel with equal priority. This more closely
-        matches scikit-image's age-based tie-breaking behavior, producing
-        fairer splits on plateau regions. If False (default), ties are
-        broken by neighbor iteration order (less deterministic).
-        Only affects the standard watershed (compactness=0).
+        If True, use an age (hop distance) counter as a tie-breaker when two
+        labels arrive at a pixel with equal priority, producing fairer splits
+        on plateau regions. Only affects the block-asynchronous path
+        (``use_block_async=True``); it is a no-op for the default synchronous
+        path, which already yields the closest-marker assignment on plateaus
+        by construction. Default is False.
     inner_iterations : int or None, optional
         Number of iterations to perform within each block before writing back
         to global memory (block-async mode only).
@@ -343,9 +347,10 @@ def watershed(
 
     Returns
     -------
-    labels : cupy.ndarray of int, shape (M, N) or (D, M, N)
-        Labeled array, where each basin is assigned a unique positive
-        integer label matching the input markers.
+    labels : cupy.ndarray of int, shape (M, N[, ...])
+        Labeled array of the same shape as ``image``. Each basin is labeled
+        with the value of its marker (negative marker values are preserved),
+        and the output dtype matches the marker dtype.
 
     Raises
     ------
@@ -488,29 +493,18 @@ def watershed(
     threads_per_block = 256
     blocks = (size + threads_per_block - 1) // threads_per_block
 
-    # Safety ceiling on the number of relaxation rounds. Label propagation
-    # advances the frontier by at least one hop per round, so a Bellman-Ford
-    # style relaxation converges in at most (number of pixels - 1) rounds
-    # (the longest possible geodesic, e.g. a space-filling/spiral mask).
-    # Using image.size as the bound therefore guarantees the result is never
-    # silently truncated; the loop still exits early as soon as it converges,
-    # so this ceiling has no effect on the common case.
+    # Using image.size as the bound guarantees the result is never silently
+    # truncated; the loop still exits early as soon as it converges, so this
+    # ceiling has no effect on the common case.
     max_iterations = int(image.size)
 
     # Ensure image is contiguous and flat for kernel
     image_flat = cp.ascontiguousarray(image.ravel())
 
-    # Determine whether to use block-async algorithm.
-    # Block-async is only available for 2D/3D non-compact watershed.
-    if use_block_async is None:
-        # Auto-select: only for 2D/3D, non-compact, large enough images
-        if compactness == 0 and ndim in (2, 3):
-            _min_ba = max(TILE_W, TILE_H) if ndim == 2 else TILE_3D
-            use_block_async = min(image.shape) >= _min_ba
-        else:
-            use_block_async = False
-    elif use_block_async:
-        # Explicitly requested — warn and fall back if not applicable
+    # Block-async is an opt-in fast path, only available for 2D/3D
+    # non-compact watershed. When requested but not applicable, warn and fall
+    # back to the synchronous (double-buffered) path.
+    if use_block_async:
         reason = None
         if compactness != 0:
             reason = "use_block_async is not supported with compactness > 0"
@@ -561,7 +555,6 @@ def watershed(
             compactness=compactness,
             ndim=ndim,
             image_shape=image.shape,
-            use_age=use_age,
         )
 
     # Post-processing: create watershed lines if requested
