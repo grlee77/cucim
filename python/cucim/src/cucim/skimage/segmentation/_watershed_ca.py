@@ -391,13 +391,21 @@ def _get_watershed_step_kernel(
     ndim,
     connectivity=1,
     compact=False,
-    use_age=False,
     label_ctype="cuda::std::int32_t",
 ):
     """Get iteration kernel for nD CA-watershed (standard or compact).
 
     Uses a 1D grid for all dimensionalities, recovering nD coordinates
     from the flat index for neighbor bounds checking.
+
+    The synchronous path is always double-buffered (a synchronous-CA /
+    Jacobi update): the kernel reads from input arrays
+    (``labels_in``/``priority_in``/...) and writes to separate output
+    arrays (``labels_out``/...), copying unchanged cells through, and the
+    caller swaps the buffers each iteration. This propagates exactly one
+    neighborhood step per launch and is deterministic (no read/write race),
+    and it yields the closest-marker assignment on plateaus without needing
+    an age tie-breaker.
 
     Parameters
     ----------
@@ -408,9 +416,6 @@ def _get_watershed_step_kernel(
     compact : bool
         If True, generate compact watershed kernel with Euclidean
         distance penalty and source coordinate tracking.
-    use_age : bool
-        If True, use age (hop distance) as tie-breaker when priorities
-        are equal (non-compact only).
     label_ctype : str
         C type for label arrays.
 
@@ -424,43 +429,50 @@ def _get_watershed_step_kernel(
     neighbors = _get_neighbor_offsets(ndim, connectivity)
     neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
 
-    # --- Age tie-breaking (non-compact only) ---
-    age_read = "int nage = age[nidx];" if use_age else ""
-    age_new = "int new_age = nage + 1;" if use_age else ""
-    if use_age:
-        better_path_cmp = (
-            "if (new_priority < best_priority ||\n"
-            "                    (new_priority == best_priority "
-            "&& new_age < best_age))"
-        )
-        age_update = "best_age = new_age;"
-    else:
-        better_path_cmp = "if (new_priority < best_priority)"
-        age_update = ""
+    # The relaxation is double-buffered: it reads from ``*_in`` arrays and
+    # writes to distinct ``*_out`` arrays (so __restrict__ is sound and reads
+    # only ever see the previous sweep). The caller swaps them each iteration.
 
     # --- Source coordinate tracking (compact only) ---
     if compact:
         src_names = [f"source_{j}" for j in range(ndim)]
         src_params = (
-            ", ".join(f"int* __restrict__ {s}" for s in src_names) + ","
+            ", ".join(
+                f"const int* __restrict__ {s}_in, int* __restrict__ {s}_out"
+                for s in src_names
+            )
+            + ","
         )
+        src_r = [f"{s}_in" for s in src_names]
+        src_w = [f"{s}_out" for s in src_names]
         best_src_decls = "\n    ".join(
             f"int best_src_{j} = -1;" for j in range(ndim)
         )
         final_src_updates = "\n            ".join(
-            f"{s}[idx] = best_src_{j};" for j, s in enumerate(src_names)
+            f"{w}[idx] = best_src_{j};" for j, w in enumerate(src_w)
         )
     else:
         src_params = ""
+        src_r = []
+        src_w = []
         best_src_decls = ""
         final_src_updates = ""
+
+    # --- Copy-through code: every output cell must be written each sweep, so
+    #     cells that do not update copy their input forward. ---
+    copy_lines = [
+        "labels_out[idx] = labels_in[idx];",
+        "priority_out[idx] = priority_in[idx];",
+    ]
+    copy_lines.extend(f"{w}[idx] = {r}[idx];" for r, w in zip(src_r, src_w))
+    copy_through = "\n        ".join(copy_lines)
 
     # --- Per-neighbor code ---
     neighbor_code = ""
     for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
         if compact:
             src_reads = "\n                ".join(
-                f"int nsrc_{j} = {s}[nidx];" for j, s in enumerate(src_names)
+                f"int nsrc_{j} = {r}[nidx];" for j, r in enumerate(src_r)
             )
             dist_decls = "\n                ".join(
                 f"float d_{j} = (float)(c_{j} - nsrc_{j});" for j in range(ndim)
@@ -478,7 +490,7 @@ def _get_watershed_step_kernel(
                 float new_priority = image[idx] + compactness * euclidean_dist;
 
                 // Enforce monotonicity
-                float neighbor_priority = priority[nidx];
+                float neighbor_priority = priority_in[nidx];
                 if (new_priority < neighbor_priority) {{
                     new_priority = neighbor_priority;
                 }}
@@ -490,32 +502,30 @@ def _get_watershed_step_kernel(
                     found_label = 1;
                 }}"""
         else:
-            priority_code = f"""
+            priority_code = """
                 float new_priority = image[idx];
                 // Enforce monotonicity
-                if (new_priority < npriority) {{
+                if (new_priority < npriority) {
                     new_priority = npriority;
-                }}
+                }
 
-                {age_new}
-
-                {better_path_cmp} {{
+                if (new_priority < best_priority) {
                     best_priority = new_priority;
-                    {age_update}
                     best_label = nlabel;
                     found_label = 1;
-                }}"""
+                }"""
 
-        npriority_read = "" if compact else "float npriority = priority[nidx];"
+        npriority_read = (
+            "" if compact else "float npriority = priority_in[nidx];"
+        )
 
         neighbor_code += f"""
     {{
         {nc_decl_str}
         if ({bounds_str}) {{
             int nidx = {nidx_expr};
-            {L} nlabel = labels[nidx];
+            {L} nlabel = labels_in[nidx];
             {npriority_read}
-            {age_read}
 
             if (nlabel != 0) {{
                 {priority_code}
@@ -525,20 +535,7 @@ def _get_watershed_step_kernel(
 """
 
     # --- Kernel params and final update ---
-    age_param = "int* __restrict__ age," if use_age else ""
-    age_best_init = "int best_age = age[idx];" if use_age else ""
     compact_param = "float compactness," if compact else ""
-
-    if use_age:
-        better_path_final_cmp = (
-            "if (best_priority < priority[idx] ||\n"
-            "            (best_priority == priority[idx] "
-            "&& best_age < age[idx]))"
-        )
-        age_final_update = "age[idx] = best_age;"
-    else:
-        better_path_final_cmp = "if (best_priority < priority[idx])"
-        age_final_update = ""
 
     kernel_code = (
         _KERNEL_PREAMBLE
@@ -546,10 +543,11 @@ def _get_watershed_step_kernel(
 extern "C" __global__
 void watershed_step(
     const float* __restrict__ image,
-    {L}* __restrict__ labels,
     unsigned char* __restrict__ state,
-    float* __restrict__ priority,
-    {age_param}
+    const {L}* __restrict__ labels_in,
+    {L}* __restrict__ labels_out,
+    const float* __restrict__ priority_in,
+    float* __restrict__ priority_out,
     {src_params}
     int* __restrict__ changed,
     {compact_param}
@@ -561,10 +559,13 @@ void watershed_step(
 
     {coord_code}
 
-    if (state[idx] != 2) return;  // Only process UNLABELED pixels
+    if (state[idx] != 2) {{
+        // Fixed (marker/masked) cell: copy through unchanged.
+        {copy_through}
+        return;
+    }}
 
-    float best_priority = priority[idx];
-    {age_best_init}
+    float best_priority = priority_in[idx];
     {L} best_label = 0;
     {best_src_decls}
     int found_label = 0;
@@ -572,15 +573,17 @@ void watershed_step(
     {neighbor_code}
 
     if (found_label && best_label != 0) {{
-        {better_path_final_cmp} {{
-            labels[idx] = best_label;
-            priority[idx] = best_priority;
-            {age_final_update}
+        if (best_priority < priority_in[idx]) {{
+            labels_out[idx] = best_label;
+            priority_out[idx] = best_priority;
             {final_src_updates}
 
             atomicAdd(changed, 1);
+            return;
         }}
     }}
+    // No improvement this sweep: copy through unchanged.
+    {copy_through}
 }}
 """
     )
@@ -601,7 +604,6 @@ def _watershed_synchronous(
     threads_per_block,
     max_iterations,
     compactness=0,
-    use_age=False,
     label_dtype=cp.int32,
     convergence_check_interval=None,
     **kwargs,
@@ -611,6 +613,12 @@ def _watershed_synchronous(
     When compactness=0, uses image intensity as priority. When
     compactness>0, adds a Euclidean distance penalty from the source
     marker to produce more regularly-shaped basins.
+
+    The relaxation is double-buffered (a synchronous CA / Jacobi update):
+    it reads from one set of buffers and writes to a separate set, swapping
+    them each iteration. This propagates labels by exactly one neighborhood
+    step per iteration, is deterministic (no read/write race), and yields
+    the closest-marker assignment on plateaus without an age tie-breaker.
     """
     compact = compactness > 0
     label_ctype = _DTYPE_TO_CTYPE[cp.dtype(label_dtype)]
@@ -619,12 +627,6 @@ def _watershed_synchronous(
     state = cp.zeros(size, dtype=cp.uint8)
     priority = cp.zeros(size, dtype=cp.float32)
     changed = cp.zeros(1, dtype=cp.int32)
-
-    # Age arrays (non-compact only)
-    if use_age and not compact:
-        age = cp.zeros(size, dtype=cp.int32)
-    else:
-        age = None
 
     # Source coordinate arrays (compact only)
     if compact:
@@ -638,7 +640,7 @@ def _watershed_synchronous(
     init_kernel = _get_watershed_init_kernel(
         ndim=ndim,
         compact=compact,
-        use_age=age is not None,
+        use_age=False,
         label_ctype=label_ctype,
     )
 
@@ -646,8 +648,6 @@ def _watershed_synchronous(
     if not compact:
         init_args.append(image_flat)
     init_args.extend([markers.ravel(), labels, state, priority])
-    if age is not None:
-        init_args.append(age)
     init_args.extend(sources)
     if compact:
         init_args.extend([mask_flat, has_mask, *dim_args])
@@ -665,19 +665,33 @@ def _watershed_synchronous(
         ndim,
         connectivity,
         compact=compact,
-        use_age=age is not None,
         label_ctype=label_ctype,
     )
 
-    step_args = [image_flat, labels, state, priority]
-    if age is not None:
-        step_args.append(age)
-    step_args.extend(sources)
-    step_args.append(changed)
+    # Per-cell state that is read and written each iteration, in the order
+    # the kernel expects: labels, priority, [sources...]. The image, state,
+    # and changed flag are shared (read-only or accumulate-only).
+    read_bufs = [labels, priority]
+    read_bufs.extend(sources)
+
+    # Separate output buffers; every cell is overwritten each sweep (updated
+    # or copied through), so they need no initialization.
+    write_bufs = [cp.empty_like(b) for b in read_bufs]
+
+    trailing = [changed]
     if compact:
-        step_args.append(cp.float32(compactness))
-    step_args.extend(dim_args)
-    step_args = tuple(step_args)
+        trailing.append(cp.float32(compactness))
+    trailing.extend(dim_args)
+    trailing = tuple(trailing)
+
+    def make_args(rd, wr):
+        # Interleave (in, out) for each buffer to match the kernel's paired
+        # parameter order.
+        paired = []
+        for r, w in zip(rd, wr):
+            paired.append(r)
+            paired.append(w)
+        return (image_flat, state, *paired, *trailing)
 
     # Run kernels in batches of ``convergence_check_interval`` launches and
     # only read ``changed`` back to the host once per batch. Reading the flag
@@ -695,9 +709,17 @@ def _watershed_synchronous(
         changed[0] = 0
         batch = min(convergence_check_interval, max_iterations - launched)
         for _ in range(batch):
-            step_kernel((blocks,), (threads_per_block,), step_args)
+            step_kernel(
+                (blocks,),
+                (threads_per_block,),
+                make_args(read_bufs, write_bufs),
+            )
+            read_bufs, write_bufs = write_bufs, read_bufs
         launched += batch
         if changed[0] == 0:
             break
 
+    # After the final swap, read_bufs holds the most recently written values.
+    labels = read_bufs[0]
+    priority = read_bufs[1]
     return labels, state, priority, changed
