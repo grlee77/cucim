@@ -533,6 +533,17 @@ def test_compact_watershed():
     assert num_differences <= 5
 
 
+def test_compact_watershed_uses_marker_image_value_as_initial_cost():
+    """A high-cost marker must not flood as though its initial cost were 0."""
+    image = cp.array([10.0, 0.0, 0.0, 0.0])
+    markers = cp.array([1, 0, 0, 2], dtype=cp.int32)
+
+    result = watershed(image, markers, compactness=0.1)
+
+    expected = cp.array([1, 2, 2, 2], dtype=cp.int32)
+    cp.testing.assert_array_equal(result, expected)
+
+
 # -----------------------------------------------------------------
 # Edge case / overspill tests
 # -----------------------------------------------------------------
