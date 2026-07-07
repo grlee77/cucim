@@ -288,8 +288,8 @@ def _get_watershed_init_kernel(
         Number of dimensions. Only needed when compact=True (for source
         coordinate extraction).
     compact : bool
-        If True, initialize source coordinate arrays and set marker
-        priority to 0. If False, set marker priority from image values.
+        If True, initialize source coordinate arrays. Marker priorities are
+        initialized from image values in both modes.
     use_age : bool
         If True, initialize an age array for tie-breaking.
     label_ctype : str
@@ -317,28 +317,24 @@ def _get_watershed_init_kernel(
         src_init_unlabeled = "\n        ".join(
             f"{s}[idx] = -1;" for s in src_names
         )
-        image_param = ""
         size_param = dim_params
         size_code = f"int size = {size_expr};"
         coord_extract = coord_code
-        marker_priority = "0.0f"
     else:
         src_params = ""
         src_init_mask = ""
         src_init_marker = ""
         src_init_unlabeled = ""
-        image_param = "const float* image,"
         size_param = "int size"
         size_code = ""
         coord_extract = ""
-        marker_priority = "image[idx]"
 
     kernel_code = (
         _KERNEL_PREAMBLE
         + f"""
 extern "C" __global__
 void watershed_init(
-    {image_param}
+    const float* image,
     const {L}* markers,
     {L}* labels,
     unsigned char* state,
@@ -370,7 +366,7 @@ void watershed_init(
     if (marker_label != 0) {{
         labels[idx] = marker_label;
         state[idx] = 1;  // LABELED
-        priority[idx] = {marker_priority};
+        priority[idx] = image[idx];
         {age_init_marker}
         {src_init_marker}
     }} else {{
@@ -644,9 +640,7 @@ def _watershed_synchronous(
         label_ctype=label_ctype,
     )
 
-    init_args = []
-    if not compact:
-        init_args.append(image_flat)
+    init_args = [image_flat]
     init_args.extend([markers.ravel(), labels, state, priority])
     init_args.extend(sources)
     if compact:
