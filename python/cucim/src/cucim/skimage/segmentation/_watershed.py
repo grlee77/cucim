@@ -319,9 +319,12 @@ def watershed(
         uses a block-asynchronous algorithm with shared-memory tiling, which
         is faster for larger images but only approximately matches the
         synchronous result (tile-local updates are applied before global
-        synchronization). Only implemented for 2D and 3D images and only
-        affects the standard watershed (compactness=0); it is ignored (with
-        a warning) otherwise.
+        synchronization). Concurrent in-place updates make this mode
+        non-deterministic, so repeated calls may differ near competing basin
+        boundaries. Use the default synchronous mode when reproducibility is
+        required. Only implemented for 2D and 3D images and only affects the
+        standard watershed (compactness=0); it is ignored (with a warning)
+        otherwise.
     use_age : bool, optional
         If True, use an age (hop distance) counter as a tie-breaker when two
         labels arrive at a pixel with equal priority, producing fairer splits
@@ -382,6 +385,10 @@ def watershed(
     pattern from [2]_. It does not implement the artifact-free distance
     correction proposed there; the optional ``use_age`` value is a
     scikit-image-oriented plateau tie-breaker, not that correction scheme.
+    Updates within and between blocks are applied in place without a global
+    ordering, so their relative visibility depends on GPU scheduling. This
+    improves throughput but means that ``use_block_async=True`` does not
+    guarantee deterministic labels, even when ``use_age=True``.
 
     The compact watershed extension follows the scikit-image approach [5]_,
     adding a distance penalty to encourage more regularly-shaped regions. This
