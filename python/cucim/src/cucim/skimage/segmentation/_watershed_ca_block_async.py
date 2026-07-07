@@ -19,6 +19,12 @@ converges through repeated outer kernel launches. This is not a literal
 implementation of the paper's hill-climbing plateau automaton, and it does not
 include the artifact-free distance-correction scheme from Section 4.3.
 
+Both the shared-memory tile updates and cross-block halo exchanges are
+in-place. CUDA does not define a total order for the resulting concurrent
+reads and writes, so labels near competing basin boundaries can vary between
+runs. This is an intentional performance trade-off of this opt-in path; use
+the synchronous implementation when deterministic output is required.
+
 The implementation is adapted to cuCIM/scikit-image semantics: marker labels
 are propagated by path priority, optional age values break equal-priority
 plateau ties, and 2D/3D connectivities follow ndimage conventions. Compact
