@@ -143,7 +143,8 @@ def _gen_inner_update_code(use_age):
     if use_age:
         inner_cmp = (
             "if (found_label && best_label != 0 && "
-            "(best_priority < s_priority[sidx] || "
+            "(s_labels[sidx] == 0 || "
+            "best_priority < s_priority[sidx] || "
             "(best_priority == s_priority[sidx] "
             "&& best_age < s_age[sidx])))"
         )
@@ -151,7 +152,8 @@ def _gen_inner_update_code(use_age):
     else:
         inner_cmp = (
             "if (found_label && best_label != 0 "
-            "&& best_priority < s_priority[sidx])"
+            "&& (s_labels[sidx] == 0 "
+            "|| best_priority < s_priority[sidx]))"
         )
         age_inner_update = ""
 
@@ -169,7 +171,7 @@ def _gen_neighbor_check_code(label_ctype, neighbor_index_code, use_age):
         age_read_n = "int nage = s_age[nsidx];"
         age_new_n = "int new_age = nage + 1;"
         better_cmp = (
-            "if (new_priority < best_priority ||\n"
+            "if (!found_label || new_priority < best_priority ||\n"
             "                        (new_priority == best_priority "
             "&& new_age < best_age))"
         )
@@ -177,7 +179,7 @@ def _gen_neighbor_check_code(label_ctype, neighbor_index_code, use_age):
     else:
         age_read_n = ""
         age_new_n = ""
-        better_cmp = "if (new_priority < best_priority)"
+        better_cmp = "if (!found_label || new_priority < best_priority)"
         age_update_n = ""
 
     neighbor_code = ""

@@ -491,7 +491,7 @@ def _get_watershed_step_kernel(
                     new_priority = neighbor_priority;
                 }}
 
-                if (new_priority < best_priority) {{
+                if (!found_label || new_priority < best_priority) {{
                     best_priority = new_priority;
                     best_label = nlabel;
                     {best_src_updates}
@@ -505,7 +505,7 @@ def _get_watershed_step_kernel(
                     new_priority = npriority;
                 }
 
-                if (new_priority < best_priority) {
+                if (!found_label || new_priority < best_priority) {
                     best_priority = new_priority;
                     best_label = nlabel;
                     found_label = 1;
@@ -569,7 +569,9 @@ void watershed_step(
     {neighbor_code}
 
     if (found_label && best_label != 0) {{
-        if (best_priority < priority_in[idx]) {{
+        // A first arrival must label the cell even when its priority is
+        // FLT_MAX, infinity, or otherwise not strictly ordered.
+        if (labels_in[idx] == 0 || best_priority < priority_in[idx]) {{
             labels_out[idx] = best_label;
             priority_out[idx] = best_priority;
             {final_src_updates}
