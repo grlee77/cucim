@@ -480,6 +480,31 @@ def test_watershed_line_areas():
         assert int(cp.sum(ws == lab)) == area
 
 
+@pytest.mark.parametrize(
+    "watershed_kwargs",
+    [
+        pytest.param({}, id="synchronous"),
+        pytest.param({"compactness": 0.1}, id="compact"),
+        pytest.param({"use_block_async": True}, id="block-async"),
+    ],
+)
+def test_watershed_line_preserves_adjacent_markers(watershed_kwargs):
+    """Adjacent marker pixels must remain fixed instead of becoming lines."""
+    image = cp.zeros((32, 32), dtype=cp.float32)
+    markers = cp.zeros(image.shape, dtype=cp.int32)
+    markers[16, 15] = 1
+    markers[16, 16] = 2
+
+    result = watershed(
+        image,
+        markers,
+        watershed_line=True,
+        **watershed_kwargs,
+    )
+
+    cp.testing.assert_array_equal(result[16, 15:17], cp.array([1, 2]))
+
+
 def test_input_not_modified():
     """skimage: test_watershed_input_not_modified."""
     image = cp.random.default_rng().random(size=(21, 21))
@@ -673,9 +698,29 @@ def test_watershed_output_dtype(dtype):
     assert out.dtype == markers.dtype
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        cp.float16,
+        cp.float32,
+        cp.float64,
+        cp.complex64,
+        cp.complex128,
+        cp.bool_,
+    ],
+)
+def test_watershed_rejects_unsupported_marker_dtype(dtype):
+    image = cp.zeros((5, 6), dtype=cp.float32)
+    markers = cp.zeros(image.shape, dtype=dtype)
+    markers[1, 1] = 1
+
+    with pytest.raises(TypeError, match="signed or unsigned integer dtype"):
+        watershed(image, markers)
+
+
 def test_incorrect_markers_shape():
     image = cp.ones((5, 6))
-    markers = cp.ones((5, 7))
+    markers = cp.ones((5, 7), dtype=cp.int32)
     with pytest.raises(ValueError):
         watershed(image, markers)
 
@@ -699,6 +744,31 @@ def test_offset_not_implemented():
         watershed(image, markers, 1, (1, 1))
     with pytest.raises(NotImplementedError):
         watershed(image, markers, offset=(1, 1))
+
+
+@pytest.mark.parametrize(
+    "inner_iterations, error",
+    [
+        pytest.param(0, ValueError, id="zero"),
+        pytest.param(-1, ValueError, id="negative"),
+        pytest.param(1.5, TypeError, id="fractional"),
+        pytest.param("2", TypeError, id="string"),
+    ],
+)
+def test_inner_iterations_invalid(inner_iterations, error):
+    """inner_iterations must be a positive integer when provided."""
+    image = cp.zeros((32, 32), dtype=cp.float32)
+    markers = cp.zeros((32, 32), dtype=cp.int32)
+    markers[1, 1] = 1
+    markers[30, 30] = 2
+
+    with pytest.raises(error, match="inner_iterations"):
+        watershed(
+            image,
+            markers,
+            use_block_async=True,
+            inner_iterations=inner_iterations,
+        )
 
 
 @pytest.mark.parametrize("interval", [0, -1])
@@ -786,6 +856,31 @@ def test_single_marker():
     markers[5, 5] = 1
     labels = watershed(image, markers)
     cp.testing.assert_array_equal(labels, cp.ones_like(labels))
+
+
+@pytest.mark.parametrize(
+    "watershed_kwargs",
+    [
+        pytest.param({}, id="synchronous"),
+        pytest.param({"compactness": 0.1}, id="compact"),
+        pytest.param({"use_block_async": True}, id="block-async"),
+        pytest.param(
+            {"use_block_async": True, "use_age": True},
+            id="block-async-age",
+        ),
+    ],
+)
+def test_reachable_float64_values_overflowing_float32_are_labeled(
+    watershed_kwargs,
+):
+    """First arrival must label pixels even when their priority is infinite."""
+    image = cp.full((32, 32), 1e40, dtype=cp.float64)
+    markers = cp.zeros(image.shape, dtype=cp.int32)
+    markers[0, 0] = 1
+
+    labels = watershed(image, markers, **watershed_kwargs)
+
+    cp.testing.assert_array_equal(labels, cp.ones_like(markers))
 
 
 def test_empty_markers():

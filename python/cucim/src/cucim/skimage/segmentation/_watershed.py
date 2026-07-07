@@ -40,6 +40,7 @@ On Improving Trade-offs of Superpixel Segmentation Algorithms.
 In Pattern Recognition (ICPR), 2014 22nd International Conference on.
 """
 
+import operator
 import warnings
 
 import cupy as cp
@@ -77,7 +78,8 @@ def _get_watershed_line_kernel(ndim, connectivity=1, label_ctype="int32_t"):
     (rather than 2-pixel), only the pixel that arrived "later" in the
     flooding (higher priority) is set to 0. For equal priorities, the
     pixel with the higher label value is zeroed as a consistent
-    tie-breaker.
+    tie-breaker. Marker pixels are copied through unchanged, so—as in
+    scikit-image—adjacent marker regions may not have a separating line.
 
     Uses a 1D grid for all dimensionalities.
 
@@ -121,6 +123,7 @@ extern "C" __global__
 void watershed_line(
     const {L}* __restrict__ labels_in,
     const float* __restrict__ priority,
+    const unsigned char* __restrict__ state,
     {L}* __restrict__ labels_out,
     {dim_params}
 ) {{
@@ -131,8 +134,9 @@ void watershed_line(
     {coord_code}
 
     {L} my_label = labels_in[idx];
-    if (my_label == 0) {{
-        labels_out[idx] = 0;
+    if (state[idx] == 1 || my_label == 0) {{
+        // Markers are fixed inputs and must never become watershed lines.
+        labels_out[idx] = my_label;
         return;
     }}
 
@@ -354,6 +358,9 @@ def watershed(
 
     Raises
     ------
+    TypeError
+        If an input has an unsupported type or `markers` does not have a
+        signed or unsigned integer dtype.
     ValueError
         If input arrays have incompatible shapes or invalid parameters.
     NotImplementedError
@@ -448,6 +455,20 @@ def watershed(
             "compatibility but only the default (offset=None) is supported."
         )
 
+    if inner_iterations is not None:
+        try:
+            inner_iterations = operator.index(inner_iterations)
+        except TypeError as e:
+            raise TypeError(
+                "inner_iterations must be an integer or None, got "
+                f"{type(inner_iterations).__name__}"
+            ) from e
+        if inner_iterations < 1:
+            raise ValueError(
+                "inner_iterations must be a positive integer, got "
+                f"{inner_iterations}"
+            )
+
     if convergence_check_interval is not None:
         convergence_check_interval = int(convergence_check_interval)
         if convergence_check_interval < 1:
@@ -459,11 +480,12 @@ def watershed(
     # Determine output label dtype from markers
     if isinstance(markers, cp.ndarray):
         label_dtype = cp.dtype(markers.dtype)
+        if label_dtype not in _DTYPE_TO_CTYPE:
+            raise TypeError(
+                "markers must have a signed or unsigned integer dtype, got "
+                f"{label_dtype}"
+            )
     else:
-        label_dtype = cp.dtype(cp.int32)
-
-    # Ensure it's a supported integer type for kernel codegen
-    if label_dtype not in _DTYPE_TO_CTYPE:
         label_dtype = cp.dtype(cp.int32)
 
     # Validate and prepare inputs
@@ -471,7 +493,8 @@ def watershed(
         image, markers, mask, connectivity
     )
 
-    # Ensure markers match the label dtype
+    # User-provided marker dtypes were validated above. Keep internally
+    # generated or mask-adjusted markers consistent with the kernel type.
     if markers.dtype != label_dtype:
         markers = markers.astype(label_dtype)
 
@@ -567,7 +590,7 @@ def watershed(
         wl_kernel(
             (blocks,),
             (threads_per_block,),
-            (labels, priority, labels_out, *dim_args),
+            (labels, priority, state, labels_out, *dim_args),
         )
         labels = labels_out
 
