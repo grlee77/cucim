@@ -127,6 +127,29 @@ def test_build_gaussian_pyramid_nd():
             assert_array_equal(out.shape, layer_shape)
 
 
+@pytest.mark.parametrize(
+    "shape, downscale, channel_axis",
+    [((1, 1), 2, None), ((2, 3), 1.1, None), ((1, 1, 4), 2, -1)],
+)
+def test_gaussian_pyramid_skips_terminal_reduction(
+    monkeypatch, shape, downscale, channel_axis
+):
+    def fail_reduce(*args, **kwargs):
+        pytest.fail("pyramid_reduce called for an unchanged output shape")
+
+    monkeypatch.setattr(pyramids, "pyramid_reduce", fail_reduce)
+    layers = list(
+        pyramids.pyramid_gaussian(
+            cp.ones(shape),
+            max_layer=-1,
+            downscale=downscale,
+            channel_axis=channel_axis,
+        )
+    )
+    assert len(layers) == 1
+    assert layers[0].shape == shape
+
+
 @pytest.mark.parametrize("channel_axis", [0, 1, 2, -1, -2, -3])
 def test_build_laplacian_pyramid_rgb(channel_axis):
     image = cp.array(data.astronaut())

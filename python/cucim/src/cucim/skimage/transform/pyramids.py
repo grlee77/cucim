@@ -263,6 +263,8 @@ def pyramid_gaussian(
 
     # cast to float for consistent data type in pyramid
     image = convert_to_float(image, preserve_range)
+    if channel_axis is not None:
+        channel_axis = channel_axis % image.ndim
 
     layer = 0
     current_shape = image.shape
@@ -273,6 +275,14 @@ def pyramid_gaussian(
     # build downsampled images until max_layer is reached or downscale process
     # does not change image size
     while layer != max_layer:
+        if max_layer == -1:
+            next_shape = tuple(
+                math.ceil(d / float(downscale)) if ax != channel_axis else d
+                for ax, d in enumerate(current_shape)
+            )
+            if next_shape == current_shape:
+                break
+
         layer += 1
 
         layer_image = pyramid_reduce(
