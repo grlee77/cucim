@@ -19,6 +19,9 @@ from cucim.skimage.segmentation._watershed import (
     _get_neighbor_offsets,
     watershed,
 )
+from cucim.skimage.segmentation._watershed_ca_block_async import (
+    _get_max_outer_iterations,
+)
 
 # fmt: off
 blob = cp.array([[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],  # noqa: E501
@@ -432,7 +435,7 @@ def test_plateau_closest_seed():
     i, j = cp.mgrid[0:21, 0:21]
     d = cp.dstack(
         [
-            cp.sqrt((i.astype(float) - i0) ** 2, (j.astype(float) - j0) ** 2)
+            cp.sqrt((i.astype(float) - i0) ** 2 + (j.astype(float) - j0) ** 2)
             for i0, j0 in ((5, 5), (5, 10), (10, 5), (10, 10))
         ]
     )
@@ -725,6 +728,14 @@ def test_incorrect_markers_shape():
         watershed(image, markers)
 
 
+def test_broadcastable_markers_shape_with_mask_is_rejected():
+    image = cp.ones((5, 6))
+    markers = cp.ones((1, 6), dtype=cp.int32)
+    mask = cp.ones(image.shape, dtype=bool)
+    with pytest.raises(ValueError, match="markers shape"):
+        watershed(image, markers, mask=mask)
+
+
 def test_incorrect_mask_shape():
     image = cp.ones((5, 6))
     mask = cp.ones((5, 7))
@@ -836,6 +847,13 @@ def test_markers_in_mask():
     mask = data != 255
     out = watershed(data, 25, connectivity=2, mask=mask)
     assert cp.all(out[~mask] == 0)
+
+
+def test_integer_markers_with_empty_mask():
+    image = cp.zeros((5, 6), dtype=cp.float32)
+    mask = cp.zeros(image.shape, dtype=bool)
+    out = watershed(image, 4, mask=mask)
+    cp.testing.assert_array_equal(out, cp.zeros(image.shape, dtype=cp.int32))
 
 
 def test_no_markers():
@@ -1166,12 +1184,17 @@ def test_age_tie_breaking_assigns_a_closest_marker(shape, use_block_async):
     i, j = cp.mgrid[0 : shape[0], 0 : shape[1]]
     d = cp.dstack(
         [
-            cp.sqrt((i.astype(float) - i0) ** 2, (j.astype(float) - j0) ** 2)
+            cp.sqrt((i.astype(float) - i0) ** 2 + (j.astype(float) - j0) ** 2)
             for i0, j0 in ((16, 16), (16, 48), (48, 16), (48, 48))
         ]
     )
     dmin = cp.min(d, 2)
     assert cp.all(d[i, j, out[i, j] - 1] == dmin)
+
+
+def test_block_async_launch_bound_ignores_inner_iterations():
+    """Tile-local iterations cannot replace global halo refreshes."""
+    assert _get_max_outer_iterations(4096, 4096) == 4096
 
 
 @pytest.mark.parametrize("use_block_async", [True, False])

@@ -48,6 +48,16 @@ TILE_3D = 8  # 3D tile size per dimension (8x8x8 = 512 threads)
 HALO = 1  # Halo size (1 pixel for immediate neighbors)
 
 
+def _get_max_outer_iterations(max_iterations, inner_iterations):
+    """Return a safe launch bound for cross-tile propagation.
+
+    ``inner_iterations`` is intentionally not used to reduce this bound:
+    shared-memory iterations only propagate within a tile, while tile halos
+    are refreshed from global memory between kernel launches.
+    """
+    return max_iterations
+
+
 class _TiledArray:
     """Descriptor for an array that participates in shared-memory tiling.
 
@@ -722,9 +732,11 @@ def _watershed_standard_block_async(
 
     step_args = tuple(step_args)
 
-    max_outer_iterations = (
-        max_iterations + inner_iterations - 1
-    ) // inner_iterations
+    # Keep the conservative global bound used by the synchronous
+    # implementation; convergence still terminates early in the normal case.
+    max_outer_iterations = _get_max_outer_iterations(
+        max_iterations, inner_iterations
+    )
 
     # Batch ``convergence_check_interval`` outer launches between convergence
     # checks to reduce device->host syncs (see _watershed_synchronous for the

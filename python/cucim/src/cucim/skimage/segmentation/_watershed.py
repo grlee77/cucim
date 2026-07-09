@@ -213,10 +213,14 @@ def _validate_inputs(image, markers, mask, connectivity):
         n_markers = int(markers)
         if mask is not None:
             n_pixels = int(cp.sum(mask))
-            n_markers = int(n_markers / (n_pixels / image.size))
-        markers = regular_seeds(image.shape, n_markers)
-        if mask is not None:
-            markers *= mask.astype(markers.dtype)
+            if n_pixels == 0:
+                markers = cp.zeros(image.shape, dtype=cp.int32)
+            else:
+                n_markers = int(n_markers / (n_pixels / image.size))
+                markers = regular_seeds(image.shape, n_markers)
+                markers *= mask.astype(markers.dtype)
+        else:
+            markers = regular_seeds(image.shape, n_markers)
     else:
         if not isinstance(markers, cp.ndarray):
             raise TypeError(
@@ -224,14 +228,14 @@ def _validate_inputs(image, markers, mask, connectivity):
                 f"got {type(markers).__name__}"
             )
 
-        if mask is not None:
-            markers = markers * mask.astype(markers.dtype)
-
         if markers.shape != image.shape:
             raise ValueError(
                 f"markers shape {markers.shape} must match "
                 f"image shape {image.shape}"
             )
+
+        if mask is not None:
+            markers = markers * mask.astype(markers.dtype)
 
     return image, markers, mask, connectivity
 

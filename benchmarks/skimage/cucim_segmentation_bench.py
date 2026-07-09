@@ -148,10 +148,10 @@ class WatershedBench(ImageBench):
             min_distance=max(3, min(self.shape) // 20),
             labels=blobs,
         )
-        markers_d = cp.zeros(self.shape, dtype=np.int32)
+        markers_d = cp.zeros(self.shape, dtype=dtype)
         markers_d[tuple(coords.T)] = cp.arange(1, len(coords) + 1)
         markers_d, _ = ndi.label(markers_d > 0)
-        markers_d = markers_d.astype(np.int32)
+        markers_d = markers_d.astype(dtype)
 
         # Use the foreground blobs as mask so background isn't labeled
         mask_d = blobs.astype(bool)
