@@ -7,7 +7,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
 
 namespace py = pybind11;
 
@@ -42,17 +41,11 @@ void segmented_radix_sort_keys_ranges_float64(std::uintptr_t keys_in,
                                               std::int64_t num_segments,
                                               std::uintptr_t stream_ptr);
 
-std::string hello()
-{
-    return "hello from cucim.skimage._cucim_skimage_cpp_ext";
-}
-
 } // namespace cucim::skimage
 
 PYBIND11_MODULE(_cucim_skimage_cpp_ext, m)
 {
     m.doc() = "Optional compiled helpers for cucim.skimage.";
-    m.def("hello", &cucim::skimage::hello, "Return a test string from the C++ extension.");
     m.def("segmented_radix_sort_keys_float32", &cucim::skimage::segmented_radix_sort_keys_float32,
           py::arg("keys_in"),
           py::arg("keys_out"),
