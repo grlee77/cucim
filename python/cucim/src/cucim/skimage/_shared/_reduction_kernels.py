@@ -31,6 +31,7 @@ squared-error sum from two images, avoiding full-sized arithmetic temporaries.
 """
 
 import cupy as cp
+from cupy._core import _accelerator
 from cupy._core._scalar import get_typename
 
 _RANGE_CHUNK_SIZE = 4096
@@ -38,14 +39,18 @@ _RANGE_CHUNK_SIZE = 4096
 # A conservative byte limit balances launch savings against the limited
 # throughput of a single block.
 _RANGE_DIRECT_MAX_BYTES = 512 * 1024
+# CuPy's accelerated individual reductions beat custom staging in this band.
+_MINMAX_SEPARATE_MIN_BYTES = 64 * 1024
+_MINMAX_SEPARATE_MAX_BYTES = 32 * 1024 * 1024
 
 _range_preamble = r"""
 template<typename T>
-__device__ bool warp_range_less(T a, T b) { return a < b; }
+__device__ bool minmax_less(T a, T b) { return a < b; }
 
 template<>
-__device__ bool warp_range_less<float>(float a, float b) {
-    // CuPy enables flush-to-zero. Ordered bits preserve subnormal extrema.
+__device__ bool minmax_less<float>(float a, float b) {
+    // CuPy compiles with flush-to-zero enabled. Compare ordered bit patterns
+    // to retain subnormal extrema, which can determine a PSNR data range.
     unsigned int ka = __float_as_uint(a), kb = __float_as_uint(b);
     ka = (ka & 0x80000000u) ? ~ka : (ka | 0x80000000u);
     kb = (kb & 0x80000000u) ? ~kb : (kb | 0x80000000u);
@@ -80,8 +85,8 @@ __device__ MinMaxState<T> merge_minmax_states(MinMaxState<T> a, MinMaxState<T> b
         a.has_nan |= b.has_nan;
         return a;
     }
-    a.minimum = warp_range_less(b.minimum, a.minimum) ? b.minimum : a.minimum;
-    a.maximum = warp_range_less(a.maximum, b.maximum) ? b.maximum : a.maximum;
+    a.minimum = minmax_less(b.minimum, a.minimum) ? b.minimum : a.minimum;
+    a.maximum = minmax_less(a.maximum, b.maximum) ? b.maximum : a.maximum;
     a.has_nan |= b.has_nan;
     return a;
 }
@@ -315,6 +320,14 @@ def _get_minmax_with_nan(image):
     return bounds[0], bounds[1], has_nan
 
 
+_pack_minmax_kernel = cp.ElementwiseKernel(
+    "raw T minimum, raw T maximum",
+    "T bounds",
+    "bounds = i == 0 ? minimum[0] : maximum[0]",
+    "cucim_pack_minmax",
+)
+
+
 def _get_minmax(image):
     """Return a two-element device array of NaN-propagating extrema.
 
@@ -322,6 +335,21 @@ def _get_minmax(image):
     readback without a separate stacking kernel. Integer bounds retain their
     dtype, including the full precision of 64-bit integers.
     """
+    if (
+        image.flags.c_contiguous
+        and image.dtype.kind in "biuf"
+        and image.nbytes > _MINMAX_SEPARATE_MIN_BYTES
+        and (
+            image.nbytes <= _MINMAX_SEPARATE_MAX_BYTES
+            or (image.dtype.kind in "biu" and image.dtype.itemsize <= 2)
+        )
+        and _accelerator.ACCELERATOR_CUB
+        in _accelerator.get_reduction_accelerators()
+    ):
+        # Preserve CuPy's accelerated reductions without the dispatch cost of
+        # staging. Only the scalar results are packed; the image is not copied.
+        # Short integer reductions also favor CuPy at large sizes.
+        return _pack_minmax_kernel(image.min(), image.max(), size=2)
     bounds, _ = _reduce_minmax(image, propagate_nan=image.dtype.kind in "fc")
     return bounds
 
