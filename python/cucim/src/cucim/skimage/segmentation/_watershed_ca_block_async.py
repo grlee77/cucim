@@ -57,12 +57,16 @@ from ._watershed_ca import (
 # one pixel of the tile; the shared-memory tile adds a one-pixel halo.
 TILE_2D = (16, 32)
 TILE_3D = (8, 8, 8)
+# Single-row images (1D images, or images whose other dimensions have size
+# one) use long tiles so the flood can cross many pixels per launch.
+TILE_ROW = (1, 512)
 HALO = 1
 
 # Default caps on shared-memory iterations per launch. Blocks exit the inner
 # loop early once their tile stops changing.
 DEFAULT_INNER_ITERATIONS_2D = 64
 DEFAULT_INNER_ITERATIONS_3D = 32
+DEFAULT_INNER_ITERATIONS_ROW = TILE_ROW[1]
 
 
 @cp.memoize(for_each_device=True)
@@ -291,7 +295,11 @@ def _relax_keys_block_async(
     convergence_check_interval=None,
 ):
     """Relax path-cost keys in place with the tiled 2D/3D kernel."""
-    if ndim == 2:
+    if ndim == 2 and image_shape[0] == 1:
+        tile = TILE_ROW
+        if inner_iterations is None:
+            inner_iterations = DEFAULT_INNER_ITERATIONS_ROW
+    elif ndim == 2:
         tile = TILE_2D
         if inner_iterations is None:
             inner_iterations = DEFAULT_INNER_ITERATIONS_2D

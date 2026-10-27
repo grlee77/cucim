@@ -296,8 +296,9 @@ def watershed(
     inner_iterations : int or None, optional
         Maximum number of shared-memory iterations each block performs per
         launch of the block-asynchronous kernel. A block stops early once
-        its tile stops changing. If None (default), uses 64 for 2D and 32
-        for 3D. Only affects performance, and has no effect when the
+        its tile stops changing. If None (default), uses 64 for 2D, 32 for
+        3D, and 512 for single-row images (such as 1D images), which use
+        1 x 512 tiles. Only affects performance, and has no effect when the
         block-asynchronous kernel is not used.
     convergence_check_interval : int or None, optional
         Number of relaxation kernel launches to perform between successive
