@@ -283,13 +283,16 @@ def watershed(
         Selects the kernel used for standard watershed (``compactness=0``).
         If True, a block-asynchronous kernel relaxes shared-memory tiles
         (plus halo) for many local iterations per launch; it is available
-        for 2D and 3D images. If False, a global-memory kernel performing
-        one relaxation step per launch is used. If None (default), the
-        block-asynchronous kernel is used for 2D and 3D images and the
+        for images with at most three dimensions of size greater than one
+        (dimensions of size one are dropped and a 1D image is processed as
+        a single row). If False, a global-memory kernel performing one
+        relaxation step per launch is used. If None (default), the
+        block-asynchronous kernel is used whenever it is available and the
         global kernel otherwise. Both kernels converge to the same unique
         solution, so this setting only affects performance. Passing True
-        when it does not apply (``compactness > 0`` or an image that is not
-        2D/3D) warns and falls back to the global kernel.
+        when it does not apply (``compactness > 0``, or more than three
+        dimensions of size greater than one) warns and falls back to the
+        global kernel.
     inner_iterations : int or None, optional
         Maximum number of shared-memory iterations each block performs per
         launch of the block-asynchronous kernel. A block stops early once
@@ -350,7 +353,9 @@ def watershed(
       spirit of the Ford-Bellman cellular-automaton watersheds of Kauffmann
       and Piché [6]_, [7]_. (Their 2008 method relaxes a summed
       topographic-distance cost rather than the minimax cost used here.)
-    - **Block-asynchronous tiling.** For 2D and 3D images, a tile plus a
+    - **Block-asynchronous tiling.** For images with at most three
+      dimensions of size greater than one (dimensions of size one are
+      dropped, and a 1D image is processed as a single row), a tile plus a
       one-pixel halo is relaxed in shared memory until it stops changing,
       and the kernel is relaunched until no tile changes, following the
       block-asynchronous cellular automata of Quesada-Barriuso et al. [8]_.
@@ -547,20 +552,35 @@ def watershed(
     if markers.dtype != label_dtype:
         markers = markers.astype(label_dtype)
 
-    ndim = image.ndim
     compact = compactness > 0
+    ndim = image.ndim
+    work_shape = image.shape
+    work_connectivity = connectivity
+    if not compact:
+        # Standard watershed runs on an equivalent shape: dimensions of size
+        # one have no in-bounds neighbors, so dropping them leaves every
+        # neighborhood unchanged, and a 1D image is relaxed as a single row.
+        # This lets such images use the block-asynchronous kernel, and is
+        # applied for every kernel so that they break exact ties identically.
+        work_shape = tuple(s for s in image.shape if s != 1)
+        work_shape = (1,) * max(0, 2 - len(work_shape)) + work_shape
+        work_connectivity = min(connectivity, len(work_shape))
+    work_ndim = len(work_shape)
 
-    # The block-asynchronous kernel is only implemented for standard 2D/3D
-    # watershed. An explicit request that cannot be honored warns and falls
-    # back to the global kernel.
-    block_async_supported = not compact and ndim in (2, 3)
+    # The block-asynchronous kernel is only implemented for standard
+    # watershed with 2 or 3 effective dimensions. An explicit request that
+    # cannot be honored warns and falls back to the global kernel.
+    block_async_supported = not compact and work_ndim in (2, 3)
     if use_block_async is None:
         use_block_async = block_async_supported
     elif use_block_async and not block_async_supported:
         if compact:
             reason = "use_block_async is not supported with compactness > 0"
         else:
-            reason = f"use_block_async is only supported for 2D/3D, got {ndim}D"
+            reason = (
+                "use_block_async is only supported for images with at most "
+                f"3 dimensions of size > 1, got shape {image.shape}"
+            )
         warnings.warn(
             f"{reason}; falling back to the global kernel.", stacklevel=2
         )
@@ -597,9 +617,9 @@ def watershed(
     else:
         cost, keys = _init_keys(image_flat, markers_flat, mask_flat, has_mask)
         relax_kwargs = dict(
-            ndim=ndim,
-            connectivity=connectivity,
-            image_shape=image.shape,
+            ndim=work_ndim,
+            connectivity=work_connectivity,
+            image_shape=work_shape,
             max_iterations=max_iterations,
             convergence_check_interval=convergence_check_interval,
         )
@@ -610,15 +630,15 @@ def watershed(
         else:
             _relax_keys_global(cost, keys, **relax_kwargs)
         labels = _labels_from_keys(
-            cost, keys, markers_flat, ndim, connectivity, image.shape
+            cost, keys, markers_flat, work_ndim, work_connectivity, work_shape
         )
 
     # Post-processing: create watershed lines if requested
     if watershed_line:
         labels_out = cp.empty_like(labels)
         wl_kernel = _get_watershed_line_kernel(
-            ndim,
-            connectivity,
+            work_ndim,
+            work_connectivity,
             label_ctype=_DTYPE_TO_CTYPE[label_dtype],
         )
         threads_per_block = 256
@@ -631,7 +651,7 @@ def watershed(
                 keys,
                 markers_flat,
                 labels_out,
-                *(int(s) for s in image.shape),
+                *(int(s) for s in work_shape),
             ),
         )
         labels = labels_out

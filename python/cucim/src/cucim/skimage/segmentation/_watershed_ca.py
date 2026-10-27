@@ -61,7 +61,10 @@ tie-break. A per-pixel "changed in the previous sweep" flag lets quiet
 regions skip both the neighbor scan and the copy between buffers.
 
 See `_watershed_ca_block_async.py` for the shared-memory tiled variant of the
-standard-watershed key relaxation used for 2D and 3D images.
+standard-watershed key relaxation. `watershed` uses it for images with at most
+three dimensions of size greater than one (after dropping dimensions of size
+one and treating a 1D image as a single row), so the global key kernel here is
+only needed for higher-dimensional images or when explicitly requested.
 """
 
 import itertools

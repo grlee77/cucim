@@ -8,6 +8,7 @@ are preserved in docstrings for traceability.
 """
 
 import math
+import warnings
 
 import cupy as cp
 import numpy as np
@@ -1236,8 +1237,7 @@ def test_plateau_assigns_a_closest_marker(shape, use_block_async):
     "kwargs, shape, match",
     [
         ({"compactness": 0.1}, (16, 16), "compactness"),
-        ({}, (40,), "2D/3D"),
-        ({}, (4, 4, 4, 4), "2D/3D"),
+        ({}, (4, 4, 4, 4), "at most 3 dimensions"),
     ],
 )
 def test_block_async_unsupported_warns(kwargs, shape, match):
@@ -1250,6 +1250,45 @@ def test_block_async_unsupported_warns(kwargs, shape, match):
     with pytest.warns(UserWarning, match=match):
         out = watershed(image, markers, use_block_async=True, **kwargs)
     assert set(cp.unique(out).tolist()) == {1, 2}
+
+
+@pytest.mark.parametrize(
+    "shape, squeezed",
+    [
+        ((300,), (1, 300)),
+        ((1, 40, 1, 30), (40, 30)),
+        ((40, 1, 30), (40, 30)),
+        ((1, 12, 10, 1, 8), (12, 10, 8)),
+    ],
+)
+@pytest.mark.parametrize("full_connectivity", [False, True])
+@pytest.mark.parametrize("watershed_line", [False, True])
+def test_size_one_dimensions_are_dropped(
+    shape, squeezed, full_connectivity, watershed_line
+):
+    """Dimensions of size one have no in-bounds neighbors, so an image with
+    them (or a 1D image) gives the labels of the squeezed image, and can use
+    the block-asynchronous kernel without a warning."""
+    image, markers = _smooth_image_and_markers(squeezed, 6)
+    connectivity = len(shape) if full_connectivity else 1
+    expected = watershed(
+        image,
+        markers,
+        min(connectivity, len(squeezed)),
+        watershed_line=watershed_line,
+    )
+    for use_block_async in (None, True, False):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = watershed(
+                image.reshape(shape),
+                markers.reshape(shape),
+                connectivity,
+                watershed_line=watershed_line,
+                use_block_async=use_block_async,
+            )
+        assert out.shape == shape
+        cp.testing.assert_array_equal(out.reshape(squeezed), expected)
 
 
 @pytest.mark.parametrize("use_block_async", [True, False])
