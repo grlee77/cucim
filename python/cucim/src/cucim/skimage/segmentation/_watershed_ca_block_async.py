@@ -5,7 +5,7 @@
 
 The `_watershed_ca.py` module describes the lexicographic path-cost keys and
 implements the global-memory nD relaxation. The block-asynchronous variant
-here is inspired by:
+here follows the tiling scheme of:
 
 P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D watershed on
 graphics processing unit: block-asynchronous approaches based on cellular
@@ -13,25 +13,30 @@ automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
 pp. 2638-2655, ISSN 0045-7906,
 :DOI:`10.1016/j.compeleceng.2013.04.020`
 
-The structure follows the plain block-asynchronous approach from Section 4.2
-of that paper: each block loads a tile plus a one-pixel halo into shared
-memory, performs local relaxation iterations until the tile stops changing
-(or an iteration cap is reached), writes improved keys back to global memory,
-and convergence is reached through repeated kernel launches. It does not
-include the artifact-free distance-correction scheme from Section 4.3; the
-step count in the keys plays that role instead.
+As there, each block loads a tile plus a one-pixel halo into shared memory,
+iterates until the tile is stable (here, or until an iteration cap is
+reached), writes the tile back to global memory, and the kernel is
+relaunched until no tile changes. The rest differs from that paper:
 
-Each tile records the last launch in which it improved a key. A block only
-relaxes its tile if the tile or one of its neighboring tiles (which supply
-its halo) improved in the previous or the current launch; otherwise nothing
-it reads can have changed since it last converged, and it exits before
-loading the tile. Late in the relaxation only the tiles around the moving
-flood front do any work.
-
-Updates within a tile and halo reads across tiles are unsynchronized, but
-keys only ever decrease toward the unique fixed point of the relaxation, so
-the converged keys (and hence the labels) are identical to those of the
-global-memory kernel and do not depend on GPU scheduling.
+- Their watershed is an unseeded hill-climbing cellular automaton that
+  floods from all regional minima; this one relaxes path-cost keys from
+  markers.
+- They update each tile in synchronous steps and note that the plain
+  block-asynchronous scheme is non-deterministic and may introduce
+  artifacts on plateaus, which their artifact-free variant fixes with a
+  separately computed plateau distance and a correction across tiles. Here
+  keys are updated in place, so threads may read keys their neighbors wrote
+  in the same step and tiles read halos that other tiles are changing,
+  plateaus are ordered by the step count in the keys, and because the
+  relaxation has a unique fixed point the converged keys (and hence the
+  labels) are identical to those of the global-memory kernel and do not
+  depend on GPU scheduling.
+- Each tile records the last launch in which it improved a key. A block only
+  relaxes its tile if the tile or one of its neighboring tiles (which supply
+  its halo) improved in the previous or the current launch; otherwise
+  nothing it reads can have changed since it last converged, and it exits
+  before loading the tile. Late in the relaxation only the tiles around the
+  moving flood front do any work.
 """
 
 import math

@@ -1,45 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Watershed segmentation using cellular-automaton-style relaxation.
+"""Seeded watershed segmentation by parallel path-cost relaxation.
 
-This module provides a GPU-parallel watershed implementation inspired by
-cellular automaton (CA) watershed work, including:
-
-P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D watershed on
-graphics processing unit: block-asynchronous approaches based on cellular
-automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
-pp. 2638-2655, ISSN 0045-7906,
-:DOI:`10.1016/j.compeleceng.2013.04.020`
-
-There is also an earlier publication for CA-based watershed using graphics
-shaders:
-
-Kauffmann, C., & Piché, N. (2008). Cellular automaton for ultra-fast watershed
-transform on GPU, 2008 19th International Conference on Pattern Recognition
-(ICPR), Tampa, FL, USA, 2008, pp. 1-4.
-:DOI:`10.1109/ICPR.2008.4761628`
-
-This code is not an exact reproduction of those papers' synchronous or
-hill-climbing plateau automata. It adapts CA-style parallel relaxation to the
-scikit-image watershed API, including arbitrary markers, masks,
-n-dimensional connectivity and a compact watershed extension. Standard
-watershed relaxes lexicographic path-cost keys that encode scikit-image's
-flooding order and have a unique fixed point, so the result is deterministic
-for any update order (see `_watershed_ca.py`).
-
-The marker-controlled watershed model follows the morphological flooding
-formulation of Meyer and Beucher:
-
-Meyer, F., & Beucher, S. (1990). Morphological segmentation. Journal of Visual
-Communication and Image Representation, 1(1), pp. 21-46.
-:DOI:`10.1016/1047-3203(90)90014-M`
-
-The compact watershed extension follows the scikit-image approach, based on:
-
-Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive SLIC:
-On Improving Trade-offs of Superpixel Segmentation Algorithms.
-In Pattern Recognition (ICPR), 2014 22nd International Conference on.
+The algorithm combines the marker-controlled flooding watershed, the
+lexicographic watershed path cost of Lotufo and Falcão, cellular-automaton
+style GPU relaxation and block-asynchronous shared-memory tiling with a few
+choices specific to this implementation. See the Notes and References of
+`watershed` for how each part relates to the literature, and
+`_watershed_ca.py` and `_watershed_ca_block_async.py` for the kernels.
 """
 
 import operator
@@ -361,58 +330,79 @@ def watershed(
 
     Notes
     -----
-    The marker-controlled watershed model follows the morphological flooding
-    formulation of Meyer and Beucher [1]_, also used by tools such as
-    MorphoLibJ and scikit-image. This implementation is related to the
-    CA-watershed and Ford-Bellman-style GPU relaxations described in [2]_,
-    [3]_, and [4]_, but it is not an exact implementation of the synchronous
-    or hill-climbing plateau automata from those papers.
+    This implementation combines ideas from several publications with a few
+    choices of its own; it is not an implementation of any single published
+    algorithm.
 
-    For standard watershed, each pixel carries a lexicographic path-cost key
-    ``(L, D)``: ``L`` is the minimax path cost from the nearest marker (the
-    flooding level at which the pixel is reached) and ``D`` is the number of
-    steps taken since the path last rose to that level, i.e. breadth-first
-    order within a flooding level. This mirrors the order in which
-    scikit-image's priority queue (ordered by value, then insertion age)
-    floods the image. This is the lexicographic path cost with which Lotufo
-    and Falcão [6]_ showed the ordered-queue watershed to be a shortest-path
-    forest; a sequential FIFO priority queue keeps ``D`` implicitly [7]_,
-    whereas a parallel relaxation has to store it. Keys are relaxed in
-    parallel until no key decreases.
-    The key strictly increases along every step, so the relaxation has a
-    unique fixed point that does not depend on the order of updates: the
-    block-asynchronous and global kernels, and repeated runs, give identical
-    labels even though updates are applied in place without synchronization.
-    Each pixel then takes the label of its first neighbor (in a fixed
-    neighbor order) with the smallest key, which is resolved by pointer
-    jumping toward the markers. The result matches scikit-image except where
-    neighbors are tied in both ``L`` and ``D`` (for example between
-    equidistant markers on a plateau), where the fixed neighbor order rather
-    than the full priority-queue insertion order decides, and where rounding
-    the image to float32 merges distinct values.
+    - **Model.** Marker-controlled watershed segmentation [1]_ computed by
+      flooding from the markers [2]_, with the semantics of scikit-image's
+      priority-queue implementation: pixels are flooded in order of value,
+      and ties are broken first-in-first-out.
+    - **Path cost.** That flooding order is expressed as the lexicographic
+      path cost of Lotufo and Falcão [3]_, written explicitly as
+      ``C = [M, d]`` by Felkel et al. [4]_. Each pixel carries a key
+      ``(L, D)``: ``L`` is the minimax path cost from a marker (the flooding
+      level at which the pixel is reached) and ``D`` is the number of steps
+      since the path last rose to that level. The labels are the root labels
+      of the resulting optimum-path forest, as in the image foresting
+      transform [5]_.
+    - **Parallel relaxation.** Instead of using a priority queue, every
+      pixel repeatedly takes the best key offered by its neighbors, in the
+      spirit of the Ford-Bellman cellular-automaton watersheds of Kauffmann
+      and Piché [6]_, [7]_. (Their 2008 method relaxes a summed
+      topographic-distance cost rather than the minimax cost used here.)
+    - **Block-asynchronous tiling.** For 2D and 3D images, a tile plus a
+      one-pixel halo is relaxed in shared memory until it stops changing,
+      and the kernel is relaunched until no tile changes, following the
+      block-asynchronous cellular automata of Quesada-Barriuso et al. [8]_.
+      Their watershed is unseeded (it floods from all regional minima),
+      updates each tile in synchronous steps, and orders plateaus by a
+      separately computed distance to the plateau's lower border, with a
+      correction across tiles to avoid artifacts. Here, keys are updated in
+      place, so threads and tiles may read keys written by others in the
+      same step, plateaus are ordered by ``D``, and no correction is needed
+      because the result does not depend on the update order (see below).
+    - **Specific to this implementation.** ``D``, which a sequential
+      FIFO queue keeps implicitly [4]_, is stored explicitly and packed
+      together with an order-preserving encoding of ``L`` into one 64-bit
+      integer, so keys are compared and updated as single integers. The
+      root labels are computed after the keys converge, from each pixel's
+      lowest-key neighbor, by pointer jumping [9]_. Pixels (global kernel)
+      and tiles (block-asynchronous kernel) are skipped unless a neighbor
+      improved its key in the previous or current launch, similar to the
+      active-vertex masks of GPU shortest-path relaxation [10]_ and the
+      pixel activation map of the GPU image foresting transform [11]_.
 
-    The block-asynchronous kernel follows the plain tiled/shared-memory
-    update pattern from [2]_. It does not implement the artifact-free
-    distance correction proposed there; the step count ``D`` serves the same
-    purpose.
+    Because the key strictly increases along every step, the relaxation has
+    a unique fixed point that does not depend on the order of updates. The
+    block-asynchronous and global kernels, and repeated runs, therefore give
+    identical labels even though updates are applied in place without
+    synchronization, and ``use_block_async``, ``inner_iterations`` and
+    ``convergence_check_interval`` only affect performance. Each pixel takes
+    the label of its first neighbor (in a fixed neighbor order) with the
+    smallest key. The result matches scikit-image except where neighbors are
+    tied in both ``L`` and ``D`` (the tie zones of the optimum-path forest,
+    for example between equidistant markers on a plateau), where the fixed
+    neighbor order rather than the full priority-queue insertion order
+    decides, and where rounding the image to float32 merges distinct values.
 
-    The compact watershed extension follows the scikit-image approach [5]_,
+    The compact watershed extension follows the scikit-image approach [12]_,
     adding a distance penalty to encourage more regularly-shaped regions. This
     is useful for superpixel generation. Because the cost of reaching a pixel
     then depends on the marker it is reached from, the keys no longer have a
     unique fixed point, so compact watershed uses a double-buffered (Jacobi)
-    relaxation of labels, keys and source markers instead. Candidates with
-    equal priority are again ranked by the offering neighbor's key. The
-    result is deterministic, but because a pixel keeps the source marker it
-    was first reached from with its final priority, it can differ more from
-    scikit-image near region boundaries and can leave small groups of pixels
-    disconnected from the rest of their region.
+    relaxation of labels, keys and source markers instead, again skipping
+    pixels whose neighborhood did not change. Candidates with equal priority
+    are ranked by the offering neighbor's key. The result is deterministic,
+    but because a pixel keeps the source marker it was first reached from
+    with its final priority, it can differ more from scikit-image near region
+    boundaries and can leave small groups of pixels disconnected from the
+    rest of their region.
 
     Watershed lines are computed after convergence: a non-marker pixel
     becomes part of the line if a neighbor with a different label was reached
-    earlier (smaller key or priority, with ties broken by label value).
-    scikit-image instead creates lines during flooding, so line pixels can
-    differ.
+    earlier (smaller key), with ties broken by label value. scikit-image
+    instead creates lines during flooding, so line pixels can differ.
 
     References
     ----------
@@ -420,35 +410,59 @@ def watershed(
            Journal of Visual Communication and Image Representation, 1(1),
            pp. 21-46.
            :DOI:`10.1016/1047-3203(90)90014-M`
-    .. [2] P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D
-           watershed on graphics processing unit: block-asynchronous approaches
-           based on cellular automata, Computers & Electrical Engineering,
-           Volume 39, Issue 8, 2013, pp. 2638-2655, ISSN 0045-7906,
-           :DOI:`10.1016/j.compeleceng.2013.04.020`
-    .. [3] Kauffmann, C., & Piché, N. (2008). Cellular automaton for ultra-fast
-           watershed transform on GPU, 2008 19th International Conference on
-           Pattern Recognition (ICPR), Tampa, FL, USA, 2008, pp. 1-4.
-           :DOI:`10.1109/ICPR.2008.4761628`
-    .. [4] Kauffmann, C., & Piché, N. (2010). Seeded ND medical image
-           segmentation by cellular automaton on GPU, International Journal of
-           Computer Assisted Radiology and Surgery, Volume 5, Issue 3, 2010,
-           pp. 251-262.
-           :DOI:`10.1007/s11548-009-0392-0`
-    .. [5] Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive
-           SLIC: On Improving Trade-offs of Superpixel Segmentation Algorithms,
-           2014 22nd International Conference on Pattern Recognition (ICPR),
-           Stockholm, Sweden, 2014, pp. 996-1001
-           :DOI:`10.1109/ICPR.2014.181`
-    .. [6] Lotufo, R., & Falcão, A. (2000). The ordered queue and the
+    .. [2] Beucher, S., & Meyer, F. (1993). The morphological approach to
+           segmentation: the watershed transformation. In E. R. Dougherty
+           (Ed.), Mathematical Morphology in Image Processing, pp. 433-481.
+           Marcel Dekker.
+    .. [3] Lotufo, R., & Falcão, A. (2000). The ordered queue and the
            optimality of the watershed approaches. In Mathematical Morphology
            and its Applications to Image and Signal Processing (ISMM),
            pp. 341-350.
            :DOI:`10.1007/0-306-47025-X_37`
-    .. [7] Felkel, P., Bruckschwaiger, M., & Wegenkittl, R. (2001).
+    .. [4] Felkel, P., Bruckschwaiger, M., & Wegenkittl, R. (2001).
            Implementation and complexity of the watershed-from-markers
            algorithm computed as a minimal cost forest. Computer Graphics
            Forum, 20(3), pp. 26-35.
            :DOI:`10.1111/1467-8659.00495`
+    .. [5] Falcão, A. X., Stolfi, J., & Lotufo, R. A. (2004). The image
+           foresting transform: theory, algorithms, and applications. IEEE
+           Transactions on Pattern Analysis and Machine Intelligence, 26(1),
+           pp. 19-29.
+           :DOI:`10.1109/TPAMI.2004.1261076`
+    .. [6] Kauffmann, C., & Piché, N. (2008). Cellular automaton for ultra-fast
+           watershed transform on GPU, 2008 19th International Conference on
+           Pattern Recognition (ICPR), Tampa, FL, USA, 2008, pp. 1-4.
+           :DOI:`10.1109/ICPR.2008.4761628`
+    .. [7] Kauffmann, C., & Piché, N. (2010). Seeded ND medical image
+           segmentation by cellular automaton on GPU, International Journal of
+           Computer Assisted Radiology and Surgery, Volume 5, Issue 3, 2010,
+           pp. 251-262.
+           :DOI:`10.1007/s11548-009-0392-0`
+    .. [8] P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D
+           watershed on graphics processing unit: block-asynchronous approaches
+           based on cellular automata, Computers & Electrical Engineering,
+           Volume 39, Issue 8, 2013, pp. 2638-2655, ISSN 0045-7906,
+           :DOI:`10.1016/j.compeleceng.2013.04.020`
+    .. [9] Hillis, W. D., & Steele, G. L. (1986). Data parallel algorithms.
+           Communications of the ACM, 29(12), pp. 1170-1183.
+           :DOI:`10.1145/7902.7903`
+    .. [10] Harish, P., & Narayanan, P. J. (2007). Accelerating large graph
+            algorithms on the GPU using CUDA. In High Performance Computing
+            (HiPC 2007), Lecture Notes in Computer Science, vol. 4873,
+            pp. 197-208.
+            :DOI:`10.1007/978-3-540-77220-0_21`
+    .. [11] Gonçalves, H., de Vasconcelos, G. Q., Rangel, P., Carvalho, M.,
+            Archilha, N., & Spina, T. (2019). cudaIFT: 180x faster image
+            foresting transform for waterpixel estimation using CUDA. In
+            Proceedings of the 14th International Joint Conference on Computer
+            Vision, Imaging and Computer Graphics Theory and Applications
+            (VISAPP), pp. 395-404.
+            :DOI:`10.5220/0007402703950404`
+    .. [12] Neubert, P., & Protzel, P. (2014). Compact Watershed and
+            Preemptive SLIC: On Improving Trade-offs of Superpixel
+            Segmentation Algorithms, 2014 22nd International Conference on
+            Pattern Recognition (ICPR), Stockholm, Sweden, 2014, pp. 996-1001
+            :DOI:`10.1109/ICPR.2014.181`
 
     Examples
     --------

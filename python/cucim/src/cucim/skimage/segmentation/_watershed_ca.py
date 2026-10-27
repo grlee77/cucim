@@ -1,24 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Watershed segmentation using cellular-automaton-style relaxation.
+"""Watershed segmentation by parallel path-cost relaxation (global kernels).
 
-This module implements a GPU-parallel watershed relaxation inspired by
-cellular automaton (CA) watershed work, including:
-
-P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D watershed on
-graphics processing unit: block-asynchronous approaches based on cellular
-automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
-pp. 2638-2655, ISSN 0045-7906,
-:DOI:`10.1016/j.compeleceng.2013.04.020`
-
-There is also an earlier publication for CA-based watershed using graphics
-shaders:
-
-Kauffmann, C., & Piché, N. (2008). Cellular automaton for ultra-fast watershed
-transform on GPU, 2008 19th International Conference on Pattern Recognition
-(ICPR), Tampa, FL, USA, 2008, pp. 1-4.
-:DOI:`10.1109/ICPR.2008.4761628`
+This module implements the global-memory kernels: the nD key relaxation for
+standard watershed, label resolution, and compact watershed. The relaxation
+is in the spirit of the cellular-automaton (Ford-Bellman) GPU watersheds of
+Kauffmann and Piché (2008, 2010). See the Notes and References of
+`watershed` for how each part relates to the literature.
 
 Standard watershed (``compactness == 0``)
 -----------------------------------------
@@ -28,23 +17,13 @@ Each pixel carries a 64-bit path-cost key compared lexicographically::
 
 ``L`` is the minimax path cost from the nearest marker (the flooding level at
 which the pixel is reached) and ``D`` counts the steps taken since the path
-last rose to level ``L``. ``D`` is the analogue of scikit-image's FIFO
-``age`` tie-break: within a flooding level, pixels are reached in
-breadth-first order from where the flood entered that level. Markers have
-``D == 0`` and every other reached pixel has ``D >= 1``. This is the
-lexicographic watershed cost of Lotufo and Falcão (stated explicitly as
-``C = [M, d]`` by Felkel et al., who note that a sequential FIFO queue keeps
-the second component implicitly, while a parallel relaxation must store it):
-
-Lotufo, R., & Falcão, A. (2000). The ordered queue and the optimality of the
-watershed approaches. In Mathematical Morphology and its Applications to Image
-and Signal Processing (ISMM), pp. 341-350.
-:DOI:`10.1007/0-306-47025-X_37`
-
-Felkel, P., Bruckschwaiger, M., & Wegenkittl, R. (2001). Implementation and
-complexity of the watershed-from-markers algorithm computed as a minimal cost
-forest. Computer Graphics Forum, 20(3), pp. 26-35.
-:DOI:`10.1111/1467-8659.00495`
+last rose to level ``L``. Markers have ``D == 0`` and every other reached
+pixel has ``D >= 1``. This is the lexicographic watershed cost of Lotufo and
+Falcão (2000), written as ``C = [M, d]`` by Felkel et al. (2001), who note
+that a sequential FIFO queue keeps the second component implicitly; it is
+the analogue of scikit-image's FIFO ``age`` tie-break. A parallel relaxation
+has no queue, so ``D`` is stored explicitly, and packing both components into
+one integer makes every comparison and update a single 64-bit operation.
 
 The relaxation computes, for every unlabeled pixel ``q``::
 
@@ -54,33 +33,32 @@ This extension is monotone and strictly increases the key along every edge,
 so the system has a unique fixed point. It is reached by any update order
 (double-buffered, in-place, or block-asynchronous), which is what makes the
 result deterministic even though the kernels update keys in place without
-synchronization. Both kernels also skip pixels (or tiles) whose neighbors did
-not improve in the previous or current launch, since nothing they read can
-have changed. Labels are resolved afterwards: each pixel's parent is its
-first neighbor (in a fixed order) holding the minimal key, and the parent
-pointers are followed to a marker by pointer jumping. This reproduces
-scikit-image's choice of the first-popped neighbor up to ties in the full
-priority-queue order.
+synchronization. Both kernels skip pixels (or tiles) unless a neighbor
+improved in the previous or current launch, since otherwise nothing they
+read can have changed; this is the same idea as the active-vertex masks of
+GPU shortest-path relaxation (Harish and Narayanan, 2007) and the pixel
+activation map of cudaIFT (Gonçalves et al., 2019).
+
+Labels are resolved afterwards, as root labels of the optimum-path forest of
+the image foresting transform (Falcão et al., 2004): each pixel's parent is
+its first neighbor (in a fixed order) holding the minimal key, and the parent
+pointers are followed to a marker by pointer jumping (Hillis and Steele,
+1986). This reproduces scikit-image's choice of the first-popped neighbor up
+to ties in the full priority-queue order.
 
 Compact watershed (``compactness > 0``)
 ---------------------------------------
 The priority of reaching a pixel ``q`` from a neighbor ``p`` is
 ``max(image[q] + compactness * |q - source(p)|, P(p))``, where ``source(p)``
-is the marker ``p`` was reached from. It depends on that marker, so it is not
-a path cost and the fixed point is not unique. The compact path therefore
-uses a double-buffered (Jacobi) relaxation of labels, keys and source
-coordinates, which is deterministic for a given input. Keys have the same
-``(P, D)`` layout as above, and candidates with equal priority are ranked by
-the offering neighbor's key, approximating scikit-image's FIFO tie-break. A
-per-pixel "changed in the previous sweep" flag lets quiet regions skip both
-the neighbor scan and the copy between buffers. It follows the scikit-image
-approach, based on:
-
-Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive SLIC: On
-Improving Trade-offs of Superpixel Segmentation Algorithms, 2014 22nd
-International Conference on Pattern Recognition (ICPR), Stockholm, Sweden,
-2014, pp. 996-1001
-:DOI:`10.1109/ICPR.2014.181`
+is the marker ``p`` was reached from (following scikit-image's
+implementation of Neubert and Protzel, 2014). It depends on that marker, so
+it is not a path cost and the fixed point is not unique. The compact path
+therefore uses a double-buffered (Jacobi) relaxation of labels, keys and
+source coordinates, which is deterministic for a given input. Keys have the
+same ``(P, D)`` layout as above, and candidates with equal priority are
+ranked by the offering neighbor's key, approximating scikit-image's FIFO
+tie-break. A per-pixel "changed in the previous sweep" flag lets quiet
+regions skip both the neighbor scan and the copy between buffers.
 
 See `_watershed_ca_block_async.py` for the shared-memory tiled variant of the
 standard-watershed key relaxation used for 2D and 3D images.
