@@ -21,6 +21,13 @@ and convergence is reached through repeated kernel launches. It does not
 include the artifact-free distance-correction scheme from Section 4.3; the
 step count in the keys plays that role instead.
 
+Each tile records the last launch in which it improved a key. A block only
+relaxes its tile if the tile or one of its neighboring tiles (which supply
+its halo) improved in the previous or the current launch; otherwise nothing
+it reads can have changed since it last converged, and it exits before
+loading the tile. Late in the relaxation only the tiles around the moving
+flood front do any work.
+
 Updates within a tile and halo reads across tiles are unsynchronized, but
 keys only ever decrease toward the unique fixed point of the relaxation, so
 the converged keys (and hence the labels) are identical to those of the
@@ -53,6 +60,13 @@ DEFAULT_INNER_ITERATIONS_3D = 32
 @cp.memoize(for_each_device=True)
 def _get_block_key_relax_kernel(ndim, connectivity, inner_iterations, tile):
     """Get the shared-memory tiled key relaxation kernel for 2D or 3D.
+
+    ``tile_stamp`` holds, per tile, the last launch index in which the tile
+    improved any key (0 initially). A block skips its tile unless the stamp
+    of the tile or of a neighboring tile is at least ``launch - 1``. A change
+    made by a neighboring tile after this block read its halo is therefore
+    picked up in the next launch, and a converged launch (no improvement in
+    any tile) implies every tile is at the fixed point.
 
     Parameters
     ----------
@@ -133,6 +147,32 @@ def _get_block_key_relax_kernel(ndim, connectivity, inner_iterations, tile):
         )
     )
 
+    # Neighbor tile offsets from ``tid`` in base 3 (last axis fastest), and
+    # the flat tile index in the CUDA grid.
+    tile_lines = ["int _rem = tid;"]
+    for j in range(ndim - 1, -1, -1):
+        tile_lines.append(
+            f"const int b_{j} = {block_axes[ndim - 1 - j]} + _rem % 3 - 1;"
+        )
+        tile_lines.append("_rem /= 3;")
+    grid_axes = ["gridDim.x", "gridDim.y", "gridDim.z"]
+    tile_bounds = " && ".join(
+        f"b_{j} >= 0 && b_{j} < {grid_axes[ndim - 1 - j]}" for j in axes
+    )
+    tile_index = "b_0"
+    tile_flat = block_axes[ndim - 1]
+    for j in range(1, ndim):
+        tile_index = f"({tile_index}) * {grid_axes[ndim - 1 - j]} + b_{j}"
+        tile_flat = (
+            f"({tile_flat}) * {grid_axes[ndim - 1 - j]} + "
+            f"{block_axes[ndim - 1 - j]}"
+        )
+    tile_lines.append(
+        f"if ({tile_bounds}) "
+        f"neighborhood_changed = tile_stamp[{tile_index}] >= launch - 1;"
+    )
+    tile_neighbor_code = "\n        ".join(tile_lines)
+
     name = f"watershed_key_relax_block_{ndim}d"
     kernel_code = (
         _KERNEL_PREAMBLE
@@ -143,6 +183,8 @@ void {name}(
     const unsigned int* __restrict__ cost,
     unsigned long long* keys,
     int* __restrict__ changed,
+    int* tile_stamp,
+    int launch,
     {dim_params}
 ) {{
     __shared__ unsigned long long s_key[{shared_size}];
@@ -151,6 +193,18 @@ void {name}(
     {thread_coords}
     {origins}
     const int tid = {tid_expr};
+
+    // ========================================
+    // Phase 0: Skip tiles with a quiet neighborhood
+    // ========================================
+    // One thread per tile in the 3^{ndim} neighborhood (including this one)
+    // checks whether that tile improved a key in the previous or current
+    // launch.
+    int neighborhood_changed = 0;
+    if (tid < {3**ndim}) {{
+        {tile_neighbor_code}
+    }}
+    if (!__syncthreads_or(neighborhood_changed)) return;
 
     // ========================================
     // Phase 1: Cooperative load of tile + halo
@@ -209,6 +263,7 @@ void {name}(
         keys[{flat_global("p")}] = my_key;
     }}
     if (__syncthreads_or(any_improved) && tid == 0) {{
+        tile_stamp[{tile_flat}] = launch;
         *changed = 1;
     }}
 }}
@@ -252,10 +307,26 @@ def _relax_keys_block_async(
         for s, t in zip(reversed(image_shape), reversed(tile))
     )
     changed = cp.zeros(1, dtype=cp.int32)
-    args = (cost, keys, changed, *(int(s) for s in image_shape))
+    # Launches are numbered from 1, so the initial stamps of 0 make every
+    # tile active in the first launch.
+    tile_stamp = cp.zeros(math.prod(grid_size), dtype=cp.int32)
+    dim_args = tuple(int(s) for s in image_shape)
+    launch_index = [0]
 
     def launch():
-        kernel(grid_size, block_size, args)
+        launch_index[0] += 1
+        kernel(
+            grid_size,
+            block_size,
+            (
+                cost,
+                keys,
+                changed,
+                tile_stamp,
+                cp.int32(launch_index[0]),
+                *dim_args,
+            ),
+        )
 
     # Each launch is expensive (it reloads a shared-memory tile + halo and
     # runs many local iterations) and launches are comparatively few, so a

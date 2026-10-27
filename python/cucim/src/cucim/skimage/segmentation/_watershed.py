@@ -374,7 +374,11 @@ def watershed(
     steps taken since the path last rose to that level, i.e. breadth-first
     order within a flooding level. This mirrors the order in which
     scikit-image's priority queue (ordered by value, then insertion age)
-    floods the image. Keys are relaxed in parallel until no key decreases.
+    floods the image. This is the lexicographic path cost with which Lotufo
+    and Falcão [6]_ showed the ordered-queue watershed to be a shortest-path
+    forest; a sequential FIFO priority queue keeps ``D`` implicitly [7]_,
+    whereas a parallel relaxation has to store it. Keys are relaxed in
+    parallel until no key decreases.
     The key strictly increases along every step, so the relaxation has a
     unique fixed point that does not depend on the order of updates: the
     block-asynchronous and global kernels, and repeated runs, give identical
@@ -435,6 +439,16 @@ def watershed(
            2014 22nd International Conference on Pattern Recognition (ICPR),
            Stockholm, Sweden, 2014, pp. 996-1001
            :DOI:`10.1109/ICPR.2014.181`
+    .. [6] Lotufo, R., & Falcão, A. (2000). The ordered queue and the
+           optimality of the watershed approaches. In Mathematical Morphology
+           and its Applications to Image and Signal Processing (ISMM),
+           pp. 341-350.
+           :DOI:`10.1007/0-306-47025-X_37`
+    .. [7] Felkel, P., Bruckschwaiger, M., & Wegenkittl, R. (2001).
+           Implementation and complexity of the watershed-from-markers
+           algorithm computed as a minimal cost forest. Computer Graphics
+           Forum, 20(3), pp. 26-35.
+           :DOI:`10.1111/1467-8659.00495`
 
     Examples
     --------

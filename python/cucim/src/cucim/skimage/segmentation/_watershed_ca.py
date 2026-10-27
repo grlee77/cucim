@@ -31,7 +31,20 @@ which the pixel is reached) and ``D`` counts the steps taken since the path
 last rose to level ``L``. ``D`` is the analogue of scikit-image's FIFO
 ``age`` tie-break: within a flooding level, pixels are reached in
 breadth-first order from where the flood entered that level. Markers have
-``D == 0`` and every other reached pixel has ``D >= 1``.
+``D == 0`` and every other reached pixel has ``D >= 1``. This is the
+lexicographic watershed cost of Lotufo and Falcão (stated explicitly as
+``C = [M, d]`` by Felkel et al., who note that a sequential FIFO queue keeps
+the second component implicitly, while a parallel relaxation must store it):
+
+Lotufo, R., & Falcão, A. (2000). The ordered queue and the optimality of the
+watershed approaches. In Mathematical Morphology and its Applications to Image
+and Signal Processing (ISMM), pp. 341-350.
+:DOI:`10.1007/0-306-47025-X_37`
+
+Felkel, P., Bruckschwaiger, M., & Wegenkittl, R. (2001). Implementation and
+complexity of the watershed-from-markers algorithm computed as a minimal cost
+forest. Computer Graphics Forum, 20(3), pp. 26-35.
+:DOI:`10.1111/1467-8659.00495`
 
 The relaxation computes, for every unlabeled pixel ``q``::
 
@@ -41,7 +54,9 @@ This extension is monotone and strictly increases the key along every edge,
 so the system has a unique fixed point. It is reached by any update order
 (double-buffered, in-place, or block-asynchronous), which is what makes the
 result deterministic even though the kernels update keys in place without
-synchronization. Labels are resolved afterwards: each pixel's parent is its
+synchronization. Both kernels also skip pixels (or tiles) whose neighbors did
+not improve in the previous or current launch, since nothing they read can
+have changed. Labels are resolved afterwards: each pixel's parent is its
 first neighbor (in a fixed order) holding the minimal key, and the parent
 pointers are followed to a marker by pointer jumping. This reproduces
 scikit-image's choice of the first-popped neighbor up to ties in the full
@@ -423,11 +438,23 @@ def _get_key_relax_kernel(ndim, connectivity):
     Keys are updated in place. Concurrent launches of other threads may be
     observed or not; either way the keys decrease monotonically toward the
     unique fixed point (see the module docstring).
+
+    ``stamp`` holds, per pixel, the index (mod 256) of the last launch in
+    which the pixel's key improved; it starts at 0 and launches are numbered
+    from 1. A pixel is only re-evaluated if a neighbor improved in the
+    previous or the current launch, because otherwise none of its candidates
+    can have changed since it was last evaluated. Wrapped stamps can only
+    cause extra (harmless) evaluations, never missed ones.
     """
     dim_params, size_expr, coord_code, neighbor_loop = _generate_neighbor_loop(
         ndim,
         connectivity,
         "unsigned long long nkey = keys[nidx]; if (nkey < best) best = nkey;",
+    )
+    _, _, _, stamp_loop = _generate_neighbor_loop(
+        ndim,
+        connectivity,
+        "neighbor_changed |= (unsigned char)(now - stamp[nidx]) <= 1;",
     )
     kernel_code = (
         _KERNEL_PREAMBLE
@@ -437,16 +464,24 @@ extern "C" __global__
 void watershed_key_relax(
     const unsigned int* __restrict__ cost,
     unsigned long long* keys,
+    unsigned char* stamp,
     int* __restrict__ changed,
+    int launch,
     {dim_params}
 ) {{
     {_FLAT_INDEX_CODE.format(size_expr=size_expr)}
 
+    {coord_code}
+
+    // Skip pixels whose neighbors did not improve recently.
+    const unsigned char now = (unsigned char)launch;
+    bool neighbor_changed = false;
+    {stamp_loop}
+    if (!neighbor_changed) return;
+
     unsigned int my_cost = cost[idx];
     unsigned long long my_key = keys[idx];
     if (my_cost == WS_COST_MASKED || ws_is_marker(my_key)) return;
-
-    {coord_code}
 
     unsigned long long best = WS_KEY_UNREACHED;
     {neighbor_loop}
@@ -455,6 +490,7 @@ void watershed_key_relax(
     unsigned long long new_key = ws_extend_key(best, my_cost);
     if (new_key < my_key) {{
         keys[idx] = new_key;
+        stamp[idx] = now;
         *changed = 1;
     }}
 }}
@@ -572,10 +608,19 @@ def _relax_keys_global(
     blocks = (size + threads_per_block - 1) // threads_per_block
     kernel = _get_key_relax_kernel(ndim, connectivity)
     changed = cp.zeros(1, dtype=cp.int32)
-    args = (cost, keys, changed, *(int(s) for s in image_shape))
+    # Launches are numbered from 1, so the initial stamps of 0 make every
+    # pixel active in the first launch.
+    stamp = cp.zeros(size, dtype=cp.uint8)
+    dim_args = tuple(int(s) for s in image_shape)
+    launch_index = [0]
 
     def launch():
-        kernel((blocks,), (threads_per_block,), args)
+        launch_index[0] += 1
+        kernel(
+            (blocks,),
+            (threads_per_block,),
+            (cost, keys, stamp, changed, cp.int32(launch_index[0]), *dim_args),
+        )
 
     # Each launch is cheap, so the per-batch host sync dominates; checking
     # every 8th launch recovers most of that cost.
