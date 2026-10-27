@@ -42,8 +42,8 @@ activation map of cudaIFT (Gonçalves et al., 2019).
 Labels are resolved afterwards, as root labels of the optimum-path forest of
 the image foresting transform (Falcão et al., 2004): each pixel's parent is
 its first neighbor (in a fixed order) holding the minimal key, and the parent
-pointers are followed to a marker by pointer jumping (Hillis and Steele,
-1986). This reproduces scikit-image's choice of the first-popped neighbor up
+pointers are followed to a marker by pointer jumping
+(https://en.wikipedia.org/wiki/Pointer_jumping). This reproduces scikit-image's choice of the first-popped neighbor up
 to ties in the full priority-queue order.
 
 Compact watershed (``compactness > 0``)

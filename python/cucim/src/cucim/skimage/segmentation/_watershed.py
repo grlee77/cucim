@@ -412,11 +412,12 @@ def watershed(
            :DOI:`10.1016/1047-3203(90)90014-M`
     .. [2] Beucher, S., & Meyer, F. (1993). The morphological approach to
            segmentation: the watershed transformation. In E. R. Dougherty
-           (Ed.), Mathematical Morphology in Image Processing, pp. 433-481.
-           Marcel Dekker.
+           (Ed.), Mathematical Morphology in Image Processing, Marcel Dekker
+           Inc., New York, pp. 433-481.
     .. [3] Lotufo, R., & Falcão, A. (2000). The ordered queue and the
            optimality of the watershed approaches. In Mathematical Morphology
-           and its Applications to Image and Signal Processing (ISMM),
+           and its Applications to Image and Signal Processing (ISMM).
+           Computational Imaging and Vision, vol 18. Springer, Boston, MA,
            pp. 341-350.
            :DOI:`10.1007/0-306-47025-X_37`
     .. [4] Felkel, P., Bruckschwaiger, M., & Wegenkittl, R. (2001).
@@ -443,9 +444,7 @@ def watershed(
            based on cellular automata, Computers & Electrical Engineering,
            Volume 39, Issue 8, 2013, pp. 2638-2655, ISSN 0045-7906,
            :DOI:`10.1016/j.compeleceng.2013.04.020`
-    .. [9] Hillis, W. D., & Steele, G. L. (1986). Data parallel algorithms.
-           Communications of the ACM, 29(12), pp. 1170-1183.
-           :DOI:`10.1145/7902.7903`
+    .. [9] https://en.wikipedia.org/wiki/Pointer_jumping
     .. [10] Harish, P., & Narayanan, P. J. (2007). Accelerating large graph
             algorithms on the GPU using CUDA. In High Performance Computing
             (HiPC 2007), Lecture Notes in Computer Science, vol. 4873,
