@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Block-asynchronous watershed using cellular-automaton-style relaxation.
+"""Block-asynchronous key relaxation for standard 2D and 3D watershed.
 
-The `_watershed_ca.py` module implements the base GPU relaxation. The
-block-asynchronous variant here is inspired by:
+The `_watershed_ca.py` module describes the lexicographic path-cost keys and
+implements the global-memory nD relaxation. The block-asynchronous variant
+here is inspired by:
 
 P. Quesada-Barriuso, D.B. Heras, F. Argüello, Efficient 2D and 3D watershed on
 graphics processing unit: block-asynchronous approaches based on cellular
@@ -12,749 +13,255 @@ automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
 pp. 2638-2655, ISSN 0045-7906,
 :DOI:`10.1016/j.compeleceng.2013.04.020`
 
-The structure follows the plain block-asynchronous approach from Section 4.2:
-each block loads a tile plus halo into shared memory, performs several local
-CA-like relaxation iterations, writes the tile back to global memory, and
-converges through repeated outer kernel launches. This is not a literal
-implementation of the paper's hill-climbing plateau automaton, and it does not
-include the artifact-free distance-correction scheme from Section 4.3.
+The structure follows the plain block-asynchronous approach from Section 4.2
+of that paper: each block loads a tile plus a one-pixel halo into shared
+memory, performs local relaxation iterations until the tile stops changing
+(or an iteration cap is reached), writes improved keys back to global memory,
+and convergence is reached through repeated kernel launches. It does not
+include the artifact-free distance-correction scheme from Section 4.3; the
+step count in the keys plays that role instead.
 
-Both the shared-memory tile updates and cross-block halo exchanges are
-in-place. CUDA does not define a total order for the resulting concurrent
-reads and writes, so labels near competing basin boundaries can vary between
-runs. This is an intentional performance trade-off of this opt-in path; use
-the synchronous implementation when deterministic output is required.
+Updates within a tile and halo reads across tiles are unsynchronized, but
+keys only ever decrease toward the unique fixed point of the relaxation, so
+the converged keys (and hence the labels) are identical to those of the
+global-memory kernel and do not depend on GPU scheduling.
+"""
 
-The implementation is adapted to cuCIM/scikit-image semantics: marker labels
-are propagated by path priority, optional age values break equal-priority
-plateau ties, and 2D/3D connectivities follow ndimage conventions. Compact
-watershed is handled only by the synchronous/global-relaxation path.
-
-"""  # noqa: E501
+import math
 
 import cupy as cp
 
 from ._watershed_ca import (
-    _DTYPE_TO_CTYPE,
     _KERNEL_PREAMBLE,
+    _KEY_PREAMBLE,
     _get_neighbor_offsets,
-    _get_watershed_init_kernel,
+    _launch_until_converged,
 )
 
-# Block-asynchronous watershed kernel constants
-TILE_W = 32  # 2D tile width (must match block size)
-TILE_H = 32  # 2D tile height (must match block size)
-TILE_3D = 8  # 3D tile size per dimension (8x8x8 = 512 threads)
-HALO = 1  # Halo size (1 pixel for immediate neighbors)
+# Tile shapes (in C order) processed by one thread block. Each thread owns
+# one pixel of the tile; the shared-memory tile adds a one-pixel halo.
+TILE_2D = (16, 32)
+TILE_3D = (8, 8, 8)
+HALO = 1
 
-
-def _get_max_outer_iterations(max_iterations, inner_iterations):
-    """Return a safe launch bound for cross-tile propagation.
-
-    ``inner_iterations`` is intentionally not used to reduce this bound:
-    shared-memory iterations only propagate within a tile, while tile halos
-    are refreshed from global memory between kernel launches.
-    """
-    return max_iterations
-
-
-class _TiledArray:
-    """Descriptor for an array that participates in shared-memory tiling.
-
-    Parameters
-    ----------
-    gname : str
-        Global memory variable name in the kernel.
-    sname : str
-        Shared memory variable name.
-    ctype : str
-        C type string (e.g. "float", "int").
-    default : str
-        C literal for out-of-bounds default value.
-    readonly : bool
-        If True, this array is not written back in Phase 3.
-    """
-
-    __slots__ = ("gname", "sname", "ctype", "default", "readonly")
-
-    def __init__(self, gname, sname, ctype, default, readonly=False):
-        self.gname = gname
-        self.sname = sname
-        self.ctype = ctype
-        self.default = default
-        self.readonly = readonly
-
-
-def _gen_tiled_load(arrays, sidx, gidx):
-    """Generate load (in-bounds) and default (out-of-bounds) CUDA code
-    for all tiled arrays at a given shared/global index expression."""
-    load = "\n        ".join(
-        f"{a.sname}[{sidx}] = {a.gname}[{gidx}];" for a in arrays
-    )
-    default = "\n        ".join(
-        f"{a.sname}[{sidx}] = {a.default};" for a in arrays
-    )
-    return load, default
-
-
-def _get_tiled_arrays(label_ctype, use_age):
-    """Return descriptors for arrays participating in shared-memory tiling."""
-    arrays = [
-        _TiledArray("labels", "s_labels", label_ctype, "0"),
-        _TiledArray("state", "s_state", "unsigned char", "0"),
-        _TiledArray("priority", "s_priority", "float", "0.0f"),
-        _TiledArray("image", "s_image", "float", "0.0f", readonly=True),
-    ]
-    if use_age:
-        arrays.append(_TiledArray("age", "s_age", "int", "2147483647"))
-    return arrays
-
-
-def _gen_tiled_kernel_fragments(arrays, shared_size):
-    """Generate declaration, parameter, and writeback fragments."""
-    shared_decls = "\n    ".join(
-        f"__shared__ {a.ctype} {a.sname}[{shared_size}];" for a in arrays
-    )
-    kernel_params = "\n    ".join(
-        f"{'const ' if a.readonly else ''}{a.ctype}* __restrict__ {a.gname},"
-        for a in arrays
-    )
-    writeback_code = "\n        ".join(
-        f"{a.gname}[gidx] = {a.sname}[sidx];" for a in arrays if not a.readonly
-    )
-    return shared_decls, kernel_params, writeback_code
-
-
-def _gen_cooperative_load_fragments(arrays):
-    """Generate in-bounds/default fragments for cooperative 1D halo loads."""
-    coop_load = "\n            ".join(
-        f"{a.sname}[s] = {a.gname}[gidx];" for a in arrays
-    )
-    coop_default = "\n            ".join(
-        f"{a.sname}[s] = {a.default};" for a in arrays
-    )
-    return coop_load, coop_default
-
-
-def _gen_best_state_init_code(label_ctype, use_age):
-    """Generate per-pixel best-state initialization."""
-    if use_age:
-        return (
-            "float best_priority = s_priority[sidx];\n"
-            "            int best_age = s_age[sidx];\n"
-            f"            {label_ctype} best_label = 0;\n"
-            "            int found_label = 0;"
-        )
-
-    return (
-        "float best_priority = s_priority[sidx];\n"
-        "            \n"
-        f"            {label_ctype} best_label = 0;\n"
-        "            int found_label = 0;"
-    )
-
-
-def _gen_inner_update_code(use_age):
-    """Generate the shared-memory update after neighbor inspection."""
-    if use_age:
-        inner_cmp = (
-            "if (found_label && best_label != 0 && "
-            "(s_labels[sidx] == 0 || "
-            "best_priority < s_priority[sidx] || "
-            "(best_priority == s_priority[sidx] "
-            "&& best_age < s_age[sidx])))"
-        )
-        age_inner_update = "s_age[sidx] = best_age;"
-    else:
-        inner_cmp = (
-            "if (found_label && best_label != 0 "
-            "&& (s_labels[sidx] == 0 "
-            "|| best_priority < s_priority[sidx]))"
-        )
-        age_inner_update = ""
-
-    return f"""{inner_cmp} {{
-                s_labels[sidx] = best_label;
-                s_priority[sidx] = best_priority;
-                {age_inner_update}
-                my_changed = 1;
-            }}"""
-
-
-def _gen_neighbor_check_code(label_ctype, neighbor_index_code, use_age):
-    """Generate the common neighbor-inspection body."""
-    if use_age:
-        age_read_n = "int nage = s_age[nsidx];"
-        age_new_n = "int new_age = nage + 1;"
-        better_cmp = (
-            "if (!found_label || new_priority < best_priority ||\n"
-            "                        (new_priority == best_priority "
-            "&& new_age < best_age))"
-        )
-        age_update_n = "best_age = new_age;"
-    else:
-        age_read_n = ""
-        age_new_n = ""
-        better_cmp = "if (!found_label || new_priority < best_priority)"
-        age_update_n = ""
-
-    neighbor_code = ""
-    for nsidx_code in neighbor_index_code:
-        neighbor_code += f"""
-            {{
-                {nsidx_code}
-
-                {label_ctype} nlabel = s_labels[nsidx];
-                float npriority = s_priority[nsidx];
-                {age_read_n}
-
-                if (nlabel != 0) {{
-                    float new_priority = my_image;
-                    if (new_priority < npriority) {{
-                        new_priority = npriority;
-                    }}
-
-                    {age_new_n}
-
-                    {better_cmp} {{
-                        best_priority = new_priority;
-                        {age_update_n}
-                        best_label = nlabel;
-                        found_label = 1;
-                    }}
-                }}
-            }}
-"""
-    return neighbor_code
+# Default caps on shared-memory iterations per launch. Blocks exit the inner
+# loop early once their tile stops changing.
+DEFAULT_INNER_ITERATIONS_2D = 64
+DEFAULT_INNER_ITERATIONS_3D = 32
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_block_async_kernel_2d(
-    connectivity=1,
-    inner_iterations=16,
-    use_age=False,
-    label_ctype="cuda::std::int32_t",
-):
-    """Get block-asynchronous iteration kernel for 2D CA-watershed.
-
-    This kernel uses shared memory tiling to reduce global memory traffic.
-    Each block loads a tile + halo into shared memory and performs multiple
-    local iterations before writing back to global memory, reducing the
-    number of global synchronization rounds.
-
-    Based on the plain block-asynchronous approach described in Section 4.2
-    of Quesada-Barriuso, Heras & Argüello (2013), "Efficient 2D and 3D
-    watershed on graphics processing unit: block-asynchronous approaches
-    based on cellular automata". This is not the artifact-free
-    distance-correction variant from Section 4.3 of that paper.
+def _get_block_key_relax_kernel(ndim, connectivity, inner_iterations, tile):
+    """Get the shared-memory tiled key relaxation kernel for 2D or 3D.
 
     Parameters
     ----------
+    ndim : int
+        Number of dimensions (2 or 3).
     connectivity : int
-        1 for 4-connectivity, 2 for 8-connectivity
+        Neighborhood connectivity (1 to ndim).
     inner_iterations : int
-        Number of iterations to perform within each block before
-        synchronizing with global memory.
-    use_age : bool
-        If True, include age array for tie-breaking.
-    label_ctype : str
-        C type for label arrays.
+        Maximum number of shared-memory iterations per launch.
+    tile : tuple of int
+        Tile shape in C order. The last axis maps to ``threadIdx.x``.
 
     Returns
     -------
     kernel : cupy.RawKernel
         Compiled CUDA kernel
     """
-    neighbors = _get_neighbor_offsets(2, connectivity)
+    ext = [t + 2 * HALO for t in tile]
+    shared_size = math.prod(ext)
+    num_threads = math.prod(tile)
+    shared_strides = [math.prod(ext[j + 1 :]) for j in range(ndim)]
 
-    shared_w = TILE_W + 2 * HALO
-    shared_h = TILE_H + 2 * HALO
-    shared_size = f"{shared_w} * {shared_h}"
+    # The last array axis maps to x, the one before it to y, then z.
+    thread_axes = ["threadIdx.x", "threadIdx.y", "threadIdx.z"]
+    block_axes = ["blockIdx.x", "blockIdx.y", "blockIdx.z"]
+    axes = range(ndim)
 
-    arrays = _get_tiled_arrays(label_ctype, use_age)
-    shared_decls, kernel_params, writeback_code = _gen_tiled_kernel_fragments(
-        arrays, shared_size
+    thread_coords = "\n    ".join(
+        f"const int t_{j} = {thread_axes[ndim - 1 - j]};" for j in axes
     )
+    # Global coordinate of shared-memory element 0 along each axis.
+    origins = "\n    ".join(
+        f"const int o_{j} = {block_axes[ndim - 1 - j]} * {tile[j]} - {HALO};"
+        for j in axes
+    )
+    tid_expr = "t_0"
+    for j in range(1, ndim):
+        tid_expr = f"({tid_expr}) * {tile[j]} + t_{j}"
 
-    # --- Phase 1: Tile + halo loading ---
-    load_sections = []
+    # Decompose a linear shared index ``s`` into per-axis shared coordinates.
+    decompose = ["int _rem = s;"]
+    for j in range(ndim - 1, 0, -1):
+        decompose.append(f"const int sc_{j} = _rem % {ext[j]};")
+        decompose.append(f"_rem /= {ext[j]};")
+    decompose.append("const int sc_0 = _rem;")
+    decompose = "\n        ".join(decompose)
 
-    # Main tile
-    main_load, main_default = _gen_tiled_load(arrays, "sidx", "gidx")
-    load_sections.append(f"""
-    // Load main tile
-    if (gx < width && gy < height) {{
-        int gidx = gy * width + gx;
-        {main_load}
-    }} else {{
-        {main_default}
-    }}""")
+    def flat_global(coord):
+        expr = f"{coord}_0"
+        for j in range(1, ndim):
+            expr = f"({expr}) * dim_{j} + {coord}_{j}"
+        return expr
 
-    # 2D halo regions: 4 edges + 4 corners
-    halo_defs = [
-        (
-            "Left",
-            "tx == 0",
-            f"gx - {HALO}",
-            "gy",
-            f"sy * {shared_w} + (sx - {HALO})",
-        ),
-        (
-            "Right",
-            f"tx == {TILE_W - 1}",
-            f"gx + {HALO}",
-            "gy",
-            f"sy * {shared_w} + (sx + {HALO})",
-        ),
-        (
-            "Top",
-            "ty == 0",
-            "gx",
-            f"gy - {HALO}",
-            f"(sy - {HALO}) * {shared_w} + sx",
-        ),
-        (
-            "Bottom",
-            f"ty == {TILE_H - 1}",
-            "gx",
-            f"gy + {HALO}",
-            f"(sy + {HALO}) * {shared_w} + sx",
-        ),
-        (
-            "Top-left",
-            "tx == 0 && ty == 0",
-            f"gx - {HALO}",
-            f"gy - {HALO}",
-            f"(sy - {HALO}) * {shared_w} + (sx - {HALO})",
-        ),
-        (
-            "Top-right",
-            f"tx == {TILE_W - 1} && ty == 0",
-            f"gx + {HALO}",
-            f"gy - {HALO}",
-            f"(sy - {HALO}) * {shared_w} + (sx + {HALO})",
-        ),
-        (
-            "Bottom-left",
-            f"tx == 0 && ty == {TILE_H - 1}",
-            f"gx - {HALO}",
-            f"gy + {HALO}",
-            f"(sy + {HALO}) * {shared_w} + (sx - {HALO})",
-        ),
-        (
-            "Bottom-right",
-            f"tx == {TILE_W - 1} && ty == {TILE_H - 1}",
-            f"gx + {HALO}",
-            f"gy + {HALO}",
-            f"(sy + {HALO}) * {shared_w} + (sx + {HALO})",
-        ),
-    ]  # noqa: E501
-
-    for name, cond, hx_expr, hy_expr, hsidx_expr in halo_defs:
-        hload, hdefault = _gen_tiled_load(arrays, "hsidx", "hidx")
-        load_sections.append(f"""
-    // {name} halo
-    if ({cond}) {{
-        int hx = {hx_expr};
-        int hy = {hy_expr};
-        int hsidx = {hsidx_expr};
-        if (hx >= 0 && hx < width && hy >= 0 && hy < height) {{
-            int hidx = hy * width + hx;
-            {hload}
-        }} else {{
-            {hdefault}
-        }}
-    }}""")
-
-    all_loads = "\n".join(load_sections)
-
-    best_state_init_code = _gen_best_state_init_code(label_ctype, use_age)
-    inner_update_code = _gen_inner_update_code(use_age)
-    neighbor_index_code = [
-        (
-            f"int nsx = sx + ({dx});\n"
-            f"                int nsy = sy + ({dy});\n"
-            f"                int nsidx = nsy * {shared_w} + nsx;"
+    def in_bounds(coord):
+        return " && ".join(
+            f"{coord}_{j} >= 0 && {coord}_{j} < dim_{j}" for j in axes
         )
-        for dy, dx in neighbors
-    ]
-    neighbor_code = _gen_neighbor_check_code(
-        label_ctype, neighbor_index_code, use_age
+
+    load_coords = "\n        ".join(
+        f"const int g_{j} = o_{j} + sc_{j};" for j in axes
+    )
+    own_coords = "\n        ".join(
+        f"const int p_{j} = o_{j} + {HALO} + t_{j};" for j in axes
+    )
+    sidx_expr = " + ".join(
+        f"(t_{j} + {HALO}) * {shared_strides[j]}" for j in axes
+    )
+    dim_params = ", ".join(f"int dim_{j}" for j in axes)
+
+    neighbor_min = "\n".join(
+        f"""                {{
+                    unsigned long long nkey = s_key[sidx + ({offset})];
+                    if (nkey < best) best = nkey;
+                }}"""
+        for offset in (
+            sum(o * s for o, s in zip(off, shared_strides))
+            for off in _get_neighbor_offsets(ndim, connectivity)
+        )
     )
 
-    # --- Assemble kernel ---
+    name = f"watershed_key_relax_block_{ndim}d"
     kernel_code = (
         _KERNEL_PREAMBLE
+        + _KEY_PREAMBLE
         + f"""
 extern "C" __global__
-void watershed_block_async_2d(
-    {kernel_params}
-    int* __restrict__ global_changed,
-    int width,
-    int height
+void {name}(
+    const unsigned int* __restrict__ cost,
+    unsigned long long* keys,
+    int* __restrict__ changed,
+    {dim_params}
 ) {{
-    {shared_decls}
-    __shared__ int s_changed;
+    __shared__ unsigned long long s_key[{shared_size}];
+    __shared__ unsigned int s_cost[{shared_size}];
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int gx = blockIdx.x * {TILE_W} + tx;
-    int gy = blockIdx.y * {TILE_H} + ty;
-    int sx = tx + {HALO};
-    int sy = ty + {HALO};
-    int sidx = sy * {shared_w} + sx;
+    {thread_coords}
+    {origins}
+    const int tid = {tid_expr};
 
     // ========================================
     // Phase 1: Cooperative load of tile + halo
     // ========================================
-    {all_loads}
-
-    __syncthreads();
-
-    // ========================================
-    // Phase 2: Inner iterations in shared memory
-    // ========================================
-
-    float my_image = s_image[sidx];
-    int my_changed = 0;
-
-    for (int iter = 0; iter < {inner_iterations}; iter++) {{
-        if (s_state[sidx] == 2) {{  // UNLABELED
-            {best_state_init_code}
-
-            {neighbor_code}
-
-            {inner_update_code}
-        }}
-
-        __syncthreads();
-    }}
-
-    // ========================================
-    // Phase 3: Write back to global memory
-    // ========================================
-
-    if (gx < width && gy < height) {{
-        int gidx = gy * width + gx;
-        {writeback_code}
-    }}
-
-    if (tx == 0 && ty == 0) {{
-        s_changed = 0;
-    }}
-    __syncthreads();
-
-    if (my_changed) {{
-        atomicAdd(&s_changed, 1);
-    }}
-    __syncthreads();
-
-    if (tx == 0 && ty == 0 && s_changed > 0) {{
-        atomicAdd(global_changed, s_changed);
-    }}
-}}
-"""
-    )  # noqa: E501
-
-    return cp.RawKernel(kernel_code, "watershed_block_async_2d")
-
-
-@cp.memoize(for_each_device=True)
-def _get_watershed_block_async_kernel_3d(
-    connectivity=1,
-    inner_iterations=8,
-    use_age=False,
-    label_ctype="cuda::std::int32_t",
-):
-    """Get block-asynchronous iteration kernel for 3D CA-watershed.
-
-    Uses cooperative 1D halo loading: all threads in the block
-    collaboratively load the entire shared memory tile (main + halo)
-    via a linear sweep. This avoids enumerating 26 separate halo
-    regions and generalizes cleanly to 3D.
-
-    Based on the plain block-asynchronous approach (Section 4.2) of
-    Quesada-Barriuso, Heras & Argüello (2013); not the artifact-free
-    distance-correction variant from Section 4.3 of that paper.
-
-    Parameters
-    ----------
-    connectivity : int
-        1 (6-conn), 2 (18-conn), or 3 (26-conn).
-    inner_iterations : int
-        Number of local iterations before global sync.
-    use_age : bool
-        If True, include age array for tie-breaking.
-    label_ctype : str
-        C type for label arrays.
-    """
-    neighbors = _get_neighbor_offsets(3, connectivity)
-
-    T = TILE_3D
-    H = HALO
-    shared_x = T + 2 * H
-    shared_y = T + 2 * H
-    shared_z = T + 2 * H
-    shared_total = shared_x * shared_y * shared_z
-    num_threads = T * T * T
-
-    arrays = _get_tiled_arrays(label_ctype, use_age)
-    shared_decls, kernel_params, writeback_code = _gen_tiled_kernel_fragments(
-        arrays, shared_total
-    )
-
-    # --- Phase 1: Cooperative 1D halo loading ---
-    coop_load, coop_default = _gen_cooperative_load_fragments(arrays)
-
-    best_state_init_code = _gen_best_state_init_code(label_ctype, use_age)
-    inner_update_code = _gen_inner_update_code(use_age)
-    neighbor_index_code = [
-        (
-            f"int nsidx = (sz + ({dz})) * {shared_y * shared_x}\n"
-            f"                          + (sy + ({dy})) * {shared_x}\n"
-            f"                          + (sx + ({dx}));"
-        )
-        for dz, dy, dx in neighbors
-    ]
-    neighbor_code = _gen_neighbor_check_code(
-        label_ctype, neighbor_index_code, use_age
-    )
-
-    kernel_code = (
-        _KERNEL_PREAMBLE
-        + f"""
-extern "C" __global__
-void watershed_block_async_3d(
-    {kernel_params}
-    int* __restrict__ global_changed,
-    int dim_0,  // depth (slowest)
-    int dim_1,  // height
-    int dim_2   // width (fastest)
-) {{
-    {shared_decls}
-    __shared__ int s_changed;
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int tz = threadIdx.z;
-    int tid = (tz * {T} + ty) * {T} + tx;
-
-    // Global coordinates of this thread's main-tile voxel
-    int gx = blockIdx.x * {T} + tx;
-    int gy = blockIdx.y * {T} + ty;
-    int gz = blockIdx.z * {T} + tz;
-
-    // Shared memory coordinates (offset by halo)
-    int sx = tx + {H};
-    int sy = ty + {H};
-    int sz = tz + {H};
-    int sidx = (sz * {shared_y} + sy) * {shared_x} + sx;
-
-    // ========================================
-    // Phase 1: Cooperative load of tile + halo
-    // ========================================
-    // All threads cooperatively load all {shared_total} shared elements
-    // via a 1D linear sweep. This cleanly handles the 26 halo regions
-    // without enumerating each one.
-
-    for (int s = tid; s < {shared_total}; s += {num_threads}) {{
-        // Convert linear shared index to 3D shared coords
-        int s_sz = s / {shared_y * shared_x};
-        int s_sy = (s / {shared_x}) % {shared_y};
-        int s_sx = s % {shared_x};
-
-        // Corresponding global coords (subtract halo, add block offset)
-        int g_x = blockIdx.x * {T} + s_sx - {H};
-        int g_y = blockIdx.y * {T} + s_sy - {H};
-        int g_z = blockIdx.z * {T} + s_sz - {H};
-
-        if (g_x >= 0 && g_x < dim_2 &&
-            g_y >= 0 && g_y < dim_1 &&
-            g_z >= 0 && g_z < dim_0) {{
-            int gidx = (g_z * dim_1 + g_y) * dim_2 + g_x;
-            {coop_load}
+    // Out-of-image elements act as masked pixels: they never update and are
+    // never the minimal neighbor.
+    for (int s = tid; s < {shared_size}; s += {num_threads}) {{
+        {decompose}
+        {load_coords}
+        if ({in_bounds("g")}) {{
+            int gidx = {flat_global("g")};
+            s_key[s] = keys[gidx];
+            s_cost[s] = cost[gidx];
         }} else {{
-            {coop_default}
+            s_key[s] = WS_KEY_UNREACHED;
+            s_cost[s] = WS_COST_MASKED;
         }}
     }}
-
     __syncthreads();
 
     // ========================================
-    // Phase 2: Inner iterations in shared memory
+    // Phase 2: Relax keys in shared memory
     // ========================================
-
-    float my_image = s_image[sidx];
-    int my_changed = 0;
+    // Halo elements stay fixed during the launch; tile elements are updated
+    // in place until no thread in the block improves its key.
+    const int sidx = {sidx_expr};
+    const unsigned int my_cost = s_cost[sidx];
+    const unsigned long long initial_key = s_key[sidx];
+    const bool active = my_cost != WS_COST_MASKED && !ws_is_marker(initial_key);
+    unsigned long long my_key = initial_key;
 
     for (int iter = 0; iter < {inner_iterations}; iter++) {{
-        if (s_state[sidx] == 2) {{  // UNLABELED
-            {best_state_init_code}
-
-            {neighbor_code}
-
-            {inner_update_code}
+        int improved = 0;
+        if (active) {{
+            unsigned long long best = WS_KEY_UNREACHED;
+{neighbor_min}
+            if (best != WS_KEY_UNREACHED) {{
+                unsigned long long new_key = ws_extend_key(best, my_cost);
+                if (new_key < my_key) {{
+                    my_key = new_key;
+                    s_key[sidx] = new_key;
+                    improved = 1;
+                }}
+            }}
         }}
-
-        __syncthreads();
+        if (!__syncthreads_or(improved)) break;
     }}
 
     // ========================================
-    // Phase 3: Write back to global memory
+    // Phase 3: Write improved keys back
     // ========================================
-
-    if (gx < dim_2 && gy < dim_1 && gz < dim_0) {{
-        int gidx = (gz * dim_1 + gy) * dim_2 + gx;
-        {writeback_code}
+    // Only in-image pixels can be active, so the write is in bounds.
+    const bool any_improved = my_key < initial_key;
+    if (any_improved) {{
+        {own_coords}
+        keys[{flat_global("p")}] = my_key;
     }}
-
-    if (tid == 0) {{
-        s_changed = 0;
-    }}
-    __syncthreads();
-
-    if (my_changed) {{
-        atomicAdd(&s_changed, 1);
-    }}
-    __syncthreads();
-
-    if (tid == 0 && s_changed > 0) {{
-        atomicAdd(global_changed, s_changed);
+    if (__syncthreads_or(any_improved) && tid == 0) {{
+        *changed = 1;
     }}
 }}
 """
     )
+    return cp.RawKernel(kernel_code, name)
 
-    return cp.RawKernel(kernel_code, "watershed_block_async_3d")
 
-
-def _watershed_standard_block_async(
-    image_flat,
-    markers,
-    mask_flat,
-    has_mask,
-    connectivity,
+def _relax_keys_block_async(
+    cost,
+    keys,
     ndim,
+    connectivity,
     image_shape,
-    size,
-    blocks,
-    threads_per_block,
     max_iterations,
     inner_iterations=None,
-    use_age=False,
-    label_dtype=cp.int32,
     convergence_check_interval=None,
-    **kwargs,
 ):
-    """Run standard watershed with block-asynchronous algorithm.
-
-    Uses shared memory tiling to reduce global memory traffic.
-    Each block performs multiple iterations locally before synchronizing.
-    Supports 2D and 3D images.
-    """
-    label_ctype = _DTYPE_TO_CTYPE[cp.dtype(label_dtype)]
-
-    labels = cp.zeros(size, dtype=label_dtype)
-    state = cp.zeros(size, dtype=cp.uint8)
-    priority = cp.zeros(size, dtype=cp.float32)
-    changed = cp.zeros(1, dtype=cp.int32)
-
-    if use_age:
-        age = cp.zeros(size, dtype=cp.int32)
-    else:
-        age = None
-
-    init_kernel = _get_watershed_init_kernel(
-        use_age=use_age, label_ctype=label_ctype
-    )
-
-    init_args = [image_flat, markers.ravel(), labels, state, priority]
-    if use_age:
-        init_args.append(age)
-    init_args.extend([mask_flat, has_mask, int(size)])
-
-    init_kernel(
-        (blocks,),
-        (threads_per_block,),
-        tuple(init_args),
-    )
-
+    """Relax path-cost keys in place with the tiled 2D/3D kernel."""
     if ndim == 2:
+        tile = TILE_2D
         if inner_iterations is None:
-            inner_iterations = 16
-        step_kernel = _get_watershed_block_async_kernel_2d(
-            connectivity,
-            inner_iterations,
-            use_age=use_age,
-            label_ctype=label_ctype,
-        )
-        height, width = image_shape
-        block_size = (TILE_W, TILE_H)
-        grid_size = (
-            (width + TILE_W - 1) // TILE_W,
-            (height + TILE_H - 1) // TILE_H,
-        )
-        # Args match kernel param order from arrays table:
-        # labels, state, priority, image, [age], global_changed, width, height
-        step_args = [labels, state, priority, image_flat]
-        if use_age:
-            step_args.append(age)
-        step_args.extend([changed, int(width), int(height)])
-
+            inner_iterations = DEFAULT_INNER_ITERATIONS_2D
     elif ndim == 3:
+        tile = TILE_3D
         if inner_iterations is None:
-            inner_iterations = 8
-        step_kernel = _get_watershed_block_async_kernel_3d(
-            connectivity,
-            inner_iterations,
-            use_age=use_age,
-            label_ctype=label_ctype,
-        )
-        T = TILE_3D
-        depth, height, width = image_shape
-        block_size = (T, T, T)
-        grid_size = (
-            (width + T - 1) // T,
-            (height + T - 1) // T,
-            (depth + T - 1) // T,
-        )
-        # Args match 3D kernel param order:
-        # labels, state, priority, image, [age],
-        # global_changed, dim_0, dim_1, dim_2
-        step_args = [labels, state, priority, image_flat]
-        if use_age:
-            step_args.append(age)
-        step_args.extend([changed, int(depth), int(height), int(width)])
+            inner_iterations = DEFAULT_INNER_ITERATIONS_3D
     else:
         raise NotImplementedError(
             f"Block-async only supports 2D and 3D, got {ndim}D"
         )
 
-    step_args = tuple(step_args)
-
-    # Keep the conservative global bound used by the synchronous
-    # implementation; convergence still terminates early in the normal case.
-    max_outer_iterations = _get_max_outer_iterations(
-        max_iterations, inner_iterations
+    kernel = _get_block_key_relax_kernel(
+        ndim, connectivity, inner_iterations, tile
     )
+    # CUDA block/grid dimensions are ordered (x, y, z), i.e. reversed with
+    # respect to the C-order image axes.
+    block_size = tuple(reversed(tile))
+    grid_size = tuple(
+        (int(s) + t - 1) // t
+        for s, t in zip(reversed(image_shape), reversed(tile))
+    )
+    changed = cp.zeros(1, dtype=cp.int32)
+    args = (cost, keys, changed, *(int(s) for s in image_shape))
 
-    # Batch ``convergence_check_interval`` outer launches between convergence
-    # checks to reduce device->host syncs (see _watershed_synchronous for the
-    # rationale). ``changed`` is reset once per batch and accumulates across
-    # the batch's launches. Unlike the synchronous path, each launch here is
-    # expensive (it reloads a shared-memory tile + halo) and the launches are
-    # comparatively few, so a wasted launch costs more than a sync; the
-    # default therefore checks after every launch.
+    def launch():
+        kernel(grid_size, block_size, args)
+
+    # Each launch is expensive (it reloads a shared-memory tile + halo and
+    # runs many local iterations) and launches are comparatively few, so a
+    # wasted launch costs more than a sync; check after every launch.
     if convergence_check_interval is None:
         convergence_check_interval = 1
-    launched = 0
-    while launched < max_outer_iterations:
-        changed[0] = 0
-        batch = min(convergence_check_interval, max_outer_iterations - launched)
-        for _ in range(batch):
-            step_kernel(grid_size, block_size, step_args)
-        launched += batch
-        if changed[0] == 0:
-            break
-
-    return labels, state, priority, changed
+    _launch_until_converged(
+        launch, changed, max_iterations, convergence_check_interval
+    )

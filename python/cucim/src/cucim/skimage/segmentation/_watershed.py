@@ -21,10 +21,12 @@ transform on GPU, 2008 19th International Conference on Pattern Recognition
 :DOI:`10.1109/ICPR.2008.4761628`
 
 This code is not an exact reproduction of those papers' synchronous or
-hill-climbing plateau automata. It adapts CA-style local relaxation to the
+hill-climbing plateau automata. It adapts CA-style parallel relaxation to the
 scikit-image watershed API, including arbitrary markers, masks,
-n-dimensional connectivity, optional age-based tie-breaking, and a compact
-watershed extension.
+n-dimensional connectivity and a compact watershed extension. Standard
+watershed relaxes lexicographic path-cost keys that encode scikit-image's
+flooding order and have a unique fixed point, so the result is deterministic
+for any update order (see `_watershed_ca.py`).
 
 The marker-controlled watershed model follows the morphological flooding
 formulation of Meyer and Beucher:
@@ -51,18 +53,15 @@ from ..morphology.extrema import local_minima
 from ..util._regular_grid import regular_seeds
 from ._watershed_ca import (
     _DTYPE_TO_CTYPE,
+    _FLAT_INDEX_CODE,
     _KERNEL_PREAMBLE,
-    _generate_coord_code,
-    _generate_neighbor_nidx,
-    _get_neighbor_offsets,
-    _watershed_synchronous,
+    _generate_neighbor_loop,
+    _init_keys,
+    _labels_from_keys,
+    _relax_keys_global,
+    _watershed_compact,
 )
-from ._watershed_ca_block_async import (
-    TILE_3D,
-    TILE_H,
-    TILE_W,
-    _watershed_standard_block_async,
-)
+from ._watershed_ca_block_async import _relax_keys_block_async
 
 #########################################
 # Watershed line post-processing kernel #
@@ -70,16 +69,18 @@ from ._watershed_ca_block_async import (
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_line_kernel(ndim, connectivity=1, label_ctype="int32_t"):
+def _get_watershed_line_kernel(
+    ndim, connectivity=1, label_ctype="int32_t", cost_ctype="float"
+):
     """Get post-processing kernel to create 1-pixel watershed lines.
 
-    After the CA iteration has converged and all pixels have final labels,
+    After the relaxation has converged and all pixels have final labels,
     this kernel identifies boundary pixels. To produce 1-pixel-wide lines
-    (rather than 2-pixel), only the pixel that arrived "later" in the
-    flooding (higher priority) is set to 0. For equal priorities, the
-    pixel with the higher label value is zeroed as a consistent
-    tie-breaker. Marker pixels are copied through unchanged, so—as in
-    scikit-image—adjacent marker regions may not have a separating line.
+    (rather than 2-pixel), only the pixel that was reached "later" in the
+    flooding (larger cost) is set to 0. For equal costs, the pixel with the
+    higher label value is zeroed as a consistent tie-breaker. Marker pixels
+    are copied through unchanged, so (as in scikit-image) adjacent marker
+    regions may not have a separating line.
 
     Uses a 1D grid for all dimensionalities.
 
@@ -91,30 +92,24 @@ def _get_watershed_line_kernel(ndim, connectivity=1, label_ctype="int32_t"):
         Neighborhood connectivity.
     label_ctype : str
         C type string for label arrays (e.g. "int32_t", "int8_t").
+    cost_ctype : str
+        C type of the per-pixel cost: the 64-bit path-cost key for standard
+        watershed or the float priority for compact watershed.
     """
     L = label_ctype
-    dim_names, dim_params, size_expr, coord_code = _generate_coord_code(ndim)
-    neighbors = _get_neighbor_offsets(ndim, connectivity)
-    neighbor_info = _generate_neighbor_nidx(ndim, dim_names, neighbors)
-
-    neighbor_check = ""
-    for nc_decl_str, bounds_str, nidx_expr in neighbor_info:
-        neighbor_check += f"""
-        {{
-            {nc_decl_str}
-            if ({bounds_str}) {{
-                int nidx = {nidx_expr};
-                {L} nlabel = labels_in[nidx];
-                if (nlabel != 0 && nlabel != my_label) {{
-                    float npri = priority[nidx];
-                    if (npri < my_pri ||
-                        (npri == my_pri && nlabel < my_label)) {{
-                        is_boundary = 1;
-                    }}
+    C = cost_ctype
+    dim_params, size_expr, coord_code, neighbor_loop = _generate_neighbor_loop(
+        ndim,
+        connectivity,
+        f"""{L} nlabel = labels_in[nidx];
+            if (nlabel != 0 && nlabel != my_label) {{
+                {C} ncost = cost[nidx];
+                if (ncost < my_cost ||
+                    (ncost == my_cost && nlabel < my_label)) {{
+                    is_boundary = 1;
                 }}
-            }}
-        }}
-"""
+            }}""",
+    )
 
     kernel_code = (
         _KERNEL_PREAMBLE
@@ -122,27 +117,25 @@ def _get_watershed_line_kernel(ndim, connectivity=1, label_ctype="int32_t"):
 extern "C" __global__
 void watershed_line(
     const {L}* __restrict__ labels_in,
-    const float* __restrict__ priority,
-    const unsigned char* __restrict__ state,
+    const {C}* __restrict__ cost,
+    const {L}* __restrict__ markers,
     {L}* __restrict__ labels_out,
     {dim_params}
 ) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = {size_expr};
-    if (idx >= size) return;
-
-    {coord_code}
+    {_FLAT_INDEX_CODE.format(size_expr=size_expr)}
 
     {L} my_label = labels_in[idx];
-    if (state[idx] == 1 || my_label == 0) {{
+    if (markers[idx] != 0 || my_label == 0) {{
         // Markers are fixed inputs and must never become watershed lines.
         labels_out[idx] = my_label;
         return;
     }}
 
-    float my_pri = priority[idx];
+    {coord_code}
+
+    {C} my_cost = cost[idx];
     int is_boundary = 0;
-    {neighbor_check}
+    {neighbor_loop}
 
     labels_out[idx] = is_boundary ? 0 : my_label;
 }}
@@ -163,6 +156,13 @@ def _validate_inputs(image, markers, mask, connectivity):
         )
 
     ndim = image.ndim
+
+    # The kernels use 32-bit flat indices.
+    if image.size >= 2**31:
+        raise ValueError(
+            "watershed supports images with fewer than 2**31 elements, got "
+            f"{image.size}"
+        )
 
     # Check connectivity - must be an integer
     if not isinstance(connectivity, (int, np.integer, cp.integer)):
@@ -194,14 +194,15 @@ def _validate_inputs(image, markers, mask, connectivity):
                 f"mask shape {mask.shape} must match image shape {image.shape}"
             )
 
-        mask = mask.astype(cp.uint8)
+        # Any non-zero value is inside the mask, as in scikit-image.
+        mask = mask.astype(bool, copy=False)
 
     # Handle markers
     if markers is None:
         # Auto-detect markers from local minima (matching scikit-image)
         markers_bool = local_minima(image, connectivity=connectivity)
         if mask is not None:
-            markers_bool = markers_bool * mask.astype(bool)
+            markers_bool &= mask
         footprint = ndi.generate_binary_structure(ndim, connectivity)
         markers = ndi.label(markers_bool, structure=footprint)[0]
     elif not isinstance(markers, (cp.ndarray, list, tuple)):
@@ -212,13 +213,13 @@ def _validate_inputs(image, markers, mask, connectivity):
         # device->host sync) is deferred to this branch.
         n_markers = int(markers)
         if mask is not None:
-            n_pixels = int(cp.sum(mask))
+            n_pixels = int(cp.count_nonzero(mask))
             if n_pixels == 0:
                 markers = cp.zeros(image.shape, dtype=cp.int32)
             else:
                 n_markers = int(n_markers / (n_pixels / image.size))
                 markers = regular_seeds(image.shape, n_markers)
-                markers *= mask.astype(markers.dtype)
+                markers = cp.where(mask, markers, 0)
         else:
             markers = regular_seeds(image.shape, n_markers)
     else:
@@ -235,7 +236,7 @@ def _validate_inputs(image, markers, mask, connectivity):
             )
 
         if mask is not None:
-            markers = markers * mask.astype(markers.dtype)
+            markers = cp.where(mask, markers, 0)
 
     return image, markers, mask, connectivity
 
@@ -249,26 +250,25 @@ def watershed(
     compactness=0,
     watershed_line=False,
     *,
-    use_block_async=False,
-    use_age=False,
+    use_block_async=None,
     inner_iterations=None,
     convergence_check_interval=None,
 ):
     """Watershed segmentation using cellular-automaton-style relaxation.
 
     This function implements a GPU-accelerated watershed transform using
-    CA-inspired local relaxation of marker labels and path priorities. It is
-    designed to follow the scikit-image watershed API rather than reproduce one
-    paper verbatim, supporting arbitrary markers, masks, n-dimensional
-    connectivity, optional plateau tie-breaking, and compact watershed.
+    CA-inspired parallel relaxation of path costs. It follows the
+    scikit-image watershed API rather than reproducing one paper verbatim,
+    supporting arbitrary markers, masks, n-dimensional connectivity, watershed
+    lines and compact watershed.
 
     Parameters
     ----------
     image : cupy.ndarray, shape (M, N[, ...])
         Input image (typically a gradient magnitude or distance transform).
         Lower values have higher priority for watershed expansion.
-        n-dimensional images are supported (the opt-in block-asynchronous
-        path is limited to 2D and 3D; see ``use_block_async``).
+        n-dimensional images with fewer than ``2**31`` elements are
+        supported. The image is processed in single precision (float32).
     markers : int, cupy.ndarray of int, or None, optional
         The desired number of basins, or an array marking the basins with
         the values to be assigned in the label matrix. Zero means not a
@@ -300,13 +300,13 @@ def watershed(
         pixel) is supported. Passing any other value raises
         :class:`NotImplementedError`.
     mask : cupy.ndarray of bool, shape (M, N[, ...]), optional
-        If provided, only pixels/voxels where mask is True will be segmented.
-        Useful for restricting watershed to regions of interest. Default is
-        None (the whole image is segmented).
+        If provided, only pixels/voxels where mask is True (non-zero) will be
+        segmented. Useful for restricting watershed to regions of interest.
+        Default is None (the whole image is segmented).
     compactness : float, optional
         Use compact watershed with given compactness parameter.
         Higher values give more regularly-shaped basins. When compactness
-        is non-zero, the priority is computed as:
+        is positive, the priority is computed as:
             priority = (
                 image[pixel] + compactness * euclidean_distance(pixel, marker)
             )
@@ -315,33 +315,25 @@ def watershed(
     watershed_line : bool, optional
         If True, a one-pixel wide line separates the regions obtained by
         the watershed algorithm. The line has the label 0. This is
-        implemented as a post-processing step after the CA iteration
+        implemented as a post-processing step after the relaxation
         converges (see Notes). Default is False.
-    use_block_async : bool, optional
-        Opt-in faster algorithm variant for standard watershed. If False
-        (default), uses the synchronous double-buffered relaxation. If True,
-        uses a block-asynchronous algorithm with shared-memory tiling, which
-        is faster for larger images but only approximately matches the
-        synchronous result (tile-local updates are applied before global
-        synchronization). Concurrent in-place updates make this mode
-        non-deterministic, so repeated calls may differ near competing basin
-        boundaries. Use the default synchronous mode when reproducibility is
-        required. Only implemented for 2D and 3D images and only affects the
-        standard watershed (compactness=0); it is ignored (with a warning)
-        otherwise.
-    use_age : bool, optional
-        If True, use an age (hop distance) counter as a tie-breaker when two
-        labels arrive at a pixel with equal priority, producing fairer splits
-        on plateau regions. Only affects the block-asynchronous path
-        (``use_block_async=True``); it is a no-op for the default synchronous
-        path, which already yields the closest-marker assignment on plateaus
-        by construction. Default is False.
+    use_block_async : bool or None, optional
+        Selects the kernel used for standard watershed (``compactness=0``).
+        If True, a block-asynchronous kernel relaxes shared-memory tiles
+        (plus halo) for many local iterations per launch; it is available
+        for 2D and 3D images. If False, a global-memory kernel performing
+        one relaxation step per launch is used. If None (default), the
+        block-asynchronous kernel is used for 2D and 3D images and the
+        global kernel otherwise. Both kernels converge to the same unique
+        solution, so this setting only affects performance. Passing True
+        when it does not apply (``compactness > 0`` or an image that is not
+        2D/3D) warns and falls back to the global kernel.
     inner_iterations : int or None, optional
-        Number of iterations to perform within each block before writing back
-        to global memory (block-async mode only).
-        If None (default), uses 16 for 2D and 8 for 3D. Lower values
-        improve agreement with the synchronous path at the cost of
-        reduced performance. Has no effect when use_block_async=False.
+        Maximum number of shared-memory iterations each block performs per
+        launch of the block-asynchronous kernel. A block stops early once
+        its tile stops changing. If None (default), uses 64 for 2D and 32
+        for 3D. Only affects performance, and has no effect when the
+        block-asynchronous kernel is not used.
     convergence_check_interval : int or None, optional
         Number of relaxation kernel launches to perform between successive
         convergence checks. Each check reads a device flag back to the host,
@@ -351,9 +343,9 @@ def watershed(
         ``convergence_check_interval - 1`` extra launches after convergence.
         Because the relaxation is idempotent at its fixed point, those extra
         launches are no-ops and never change the result. If None (default),
-        a value tuned to the algorithm is used: 8 for the synchronous path
+        a value tuned to the kernel is used: 8 for the global kernels
         (many cheap launches, where syncs dominate) and 1 for the
-        block-asynchronous path (few, expensive launches, where extra
+        block-asynchronous kernel (few, expensive launches, where extra
         launches cost more than the syncs saved). Must be >= 1 if given.
 
     Returns
@@ -381,22 +373,47 @@ def watershed(
     MorphoLibJ and scikit-image. This implementation is related to the
     CA-watershed and Ford-Bellman-style GPU relaxations described in [2]_,
     [3]_, and [4]_, but it is not an exact implementation of the synchronous
-    or hill-climbing plateau automata from those papers. It instead propagates
-    marker labels by repeatedly relaxing a path priority, similar in spirit to
-    seeded watershed but structured for GPU-wide parallel updates.
+    or hill-climbing plateau automata from those papers.
 
-    The block-asynchronous path follows the plain tiled/shared-memory update
-    pattern from [2]_. It does not implement the artifact-free distance
-    correction proposed there; the optional ``use_age`` value is a
-    scikit-image-oriented plateau tie-breaker, not that correction scheme.
-    Updates within and between blocks are applied in place without a global
-    ordering, so their relative visibility depends on GPU scheduling. This
-    improves throughput but means that ``use_block_async=True`` does not
-    guarantee deterministic labels, even when ``use_age=True``.
+    For standard watershed, each pixel carries a lexicographic path-cost key
+    ``(L, D)``: ``L`` is the minimax path cost from the nearest marker (the
+    flooding level at which the pixel is reached) and ``D`` is the number of
+    steps taken since the path last rose to that level, i.e. breadth-first
+    order within a flooding level. This mirrors the order in which
+    scikit-image's priority queue (ordered by value, then insertion age)
+    floods the image. Keys are relaxed in parallel until no key decreases.
+    The key strictly increases along every step, so the relaxation has a
+    unique fixed point that does not depend on the order of updates: the
+    block-asynchronous and global kernels, and repeated runs, give identical
+    labels even though updates are applied in place without synchronization.
+    Each pixel then takes the label of its first neighbor (in a fixed
+    neighbor order) with the smallest key, which is resolved by pointer
+    jumping toward the markers. The result matches scikit-image except where
+    neighbors are tied in both ``L`` and ``D`` (for example between
+    equidistant markers on a plateau), where the fixed neighbor order rather
+    than the full priority-queue insertion order decides, and where rounding
+    the image to float32 merges distinct values.
+
+    The block-asynchronous kernel follows the plain tiled/shared-memory
+    update pattern from [2]_. It does not implement the artifact-free
+    distance correction proposed there; the step count ``D`` serves the same
+    purpose.
 
     The compact watershed extension follows the scikit-image approach [5]_,
     adding a distance penalty to encourage more regularly-shaped regions. This
-    is useful for superpixel generation.
+    is useful for superpixel generation. Because the cost of reaching a pixel
+    then depends on the marker it is reached from, compact watershed uses a
+    double-buffered (Jacobi) relaxation of labels and priorities instead.
+    It is deterministic, but because a pixel keeps the source marker it was
+    first reached from with its final priority, it can differ more from
+    scikit-image near region boundaries and can leave small groups of pixels
+    disconnected from the rest of their region.
+
+    Watershed lines are computed after convergence: a non-marker pixel
+    becomes part of the line if a neighbor with a different label was reached
+    earlier (smaller key or priority, with ties broken by label value).
+    scikit-image instead creates lines during flooding, so line pixels can
+    differ.
 
     References
     ----------
@@ -449,12 +466,12 @@ def watershed(
     >>> labels.shape
     (10, 10)
     >>> cp.unique(labels)
-    array([1, 2])
+    array([1, 2], dtype=int32)
 
     Apply compact watershed for more regular regions:
 
-    >>> labels_compact = segmentation.watershed(-image,
-    >>>                                         markers, compactness=0.1)
+    >>> labels_compact = segmentation.watershed(-image, markers,
+    ...                                         compactness=0.1)
     """
     if offset is not None:
         # `offset` is accepted only to keep the positional argument order
@@ -510,98 +527,95 @@ def watershed(
         markers = markers.astype(label_dtype)
 
     ndim = image.ndim
+    compact = compactness > 0
 
-    # Get dimensions
-    size = image.size
+    # The block-asynchronous kernel is only implemented for standard 2D/3D
+    # watershed. An explicit request that cannot be honored warns and falls
+    # back to the global kernel.
+    block_async_supported = not compact and ndim in (2, 3)
+    if use_block_async is None:
+        use_block_async = block_async_supported
+    elif use_block_async and not block_async_supported:
+        if compact:
+            reason = "use_block_async is not supported with compactness > 0"
+        else:
+            reason = f"use_block_async is only supported for 2D/3D, got {ndim}D"
+        warnings.warn(
+            f"{reason}; falling back to the global kernel.", stacklevel=2
+        )
+        use_block_async = False
 
-    # Prepare mask
+    image_flat = cp.ascontiguousarray(image).ravel()
+    markers_flat = cp.ascontiguousarray(markers).ravel()
     if mask is not None:
-        mask_flat = cp.ascontiguousarray(mask.ravel())
-        has_mask = cp.int32(1)
+        mask_flat = cp.ascontiguousarray(mask).view(cp.uint8).ravel()
+        has_mask = 1
     else:
-        # Create a dummy array filled with 1s (all pixels valid)
-        mask_flat = cp.ones(size, dtype=cp.uint8)
-        has_mask = cp.int32(0)
+        # Never read when has_mask is 0.
+        mask_flat = cp.empty(1, dtype=cp.uint8)
+        has_mask = 0
 
-    # Thread/block configuration
-    threads_per_block = 256
-    blocks = (size + threads_per_block - 1) // threads_per_block
-
-    # Using image.size as the bound guarantees the result is never silently
-    # truncated; the loop still exits early as soon as it converges, so this
-    # ceiling has no effect on the common case.
+    # Every relaxation launch reaches at least one more step along each
+    # optimal path, so image.size launches always suffice. The loops exit as
+    # soon as they converge, so this ceiling has no effect in practice.
     max_iterations = int(image.size)
 
-    # Ensure image is contiguous and flat for kernel
-    image_flat = cp.ascontiguousarray(image.ravel())
-
-    # Block-async is an opt-in fast path, only available for 2D/3D
-    # non-compact watershed. When requested but not applicable, warn and fall
-    # back to the synchronous (double-buffered) path.
-    if use_block_async:
-        reason = None
-        if compactness != 0:
-            reason = "use_block_async is not supported with compactness > 0"
-        elif ndim not in (2, 3):
-            reason = f"use_block_async is only supported for 2D/3D, got {ndim}D"
-        else:
-            _min_ba = max(TILE_W, TILE_H) if ndim == 2 else TILE_3D
-            if min(image.shape) < _min_ba:
-                reason = (
-                    f"use_block_async=True requires image dimensions >= "
-                    f"{_min_ba} for {ndim}D; got image shape {image.shape}"
-                )
-        if reason is not None:
-            warnings.warn(
-                f"{reason}; falling back to synchronous.",
-                stacklevel=2,
-            )
-            use_block_async = False
-
-    label_ctype = _DTYPE_TO_CTYPE[label_dtype]
-
-    # common kwargs shared across all watershed implementations
-    common_kwargs = dict(
-        image_flat=image_flat,
-        markers=markers,
-        mask_flat=mask_flat,
-        has_mask=has_mask,
-        connectivity=connectivity,
-        size=size,
-        blocks=blocks,
-        threads_per_block=threads_per_block,
-        max_iterations=max_iterations,
-        label_dtype=label_dtype,
-        convergence_check_interval=convergence_check_interval,
-    )
-
-    if use_block_async and ndim in (2, 3) and compactness == 0:
-        labels, state, priority, changed = _watershed_standard_block_async(
-            **common_kwargs,
-            ndim=ndim,
-            image_shape=image.shape,
-            use_age=use_age,
-            inner_iterations=inner_iterations,
+    if compact:
+        labels, cost = _watershed_compact(
+            image_flat,
+            markers_flat,
+            mask_flat,
+            has_mask,
+            connectivity,
+            ndim,
+            image.shape,
+            max_iterations,
+            compactness,
+            convergence_check_interval=convergence_check_interval,
         )
+        cost_ctype = "float"
     else:
-        labels, state, priority, changed = _watershed_synchronous(
-            **common_kwargs,
-            compactness=compactness,
+        cost, keys = _init_keys(image_flat, markers_flat, mask_flat, has_mask)
+        relax_kwargs = dict(
             ndim=ndim,
+            connectivity=connectivity,
             image_shape=image.shape,
+            max_iterations=max_iterations,
+            convergence_check_interval=convergence_check_interval,
         )
+        if use_block_async:
+            _relax_keys_block_async(
+                cost, keys, inner_iterations=inner_iterations, **relax_kwargs
+            )
+        else:
+            _relax_keys_global(cost, keys, **relax_kwargs)
+        labels = _labels_from_keys(
+            cost, keys, markers_flat, ndim, connectivity, image.shape
+        )
+        cost = keys
+        cost_ctype = "unsigned long long"
 
     # Post-processing: create watershed lines if requested
     if watershed_line:
         labels_out = cp.empty_like(labels)
         wl_kernel = _get_watershed_line_kernel(
-            ndim, connectivity, label_ctype=label_ctype
+            ndim,
+            connectivity,
+            label_ctype=_DTYPE_TO_CTYPE[label_dtype],
+            cost_ctype=cost_ctype,
         )
-        dim_args = tuple(int(s) for s in image.shape)
+        threads_per_block = 256
+        blocks = (image.size + threads_per_block - 1) // threads_per_block
         wl_kernel(
             (blocks,),
             (threads_per_block,),
-            (labels, priority, state, labels_out, *dim_args),
+            (
+                labels,
+                cost,
+                markers_flat,
+                labels_out,
+                *(int(s) for s in image.shape),
+            ),
         )
         labels = labels_out
 

@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 import math
@@ -194,7 +194,7 @@ def regular_seeds(ar_shape, n_points, dtype=cp.int32):
            [0, 1, 0, 2, 0],
            [0, 0, 0, 0, 0],
            [0, 3, 0, 4, 0],
-           [0, 0, 0, 0, 0]])
+           [0, 0, 0, 0, 0]], dtype=int32)
     """
     ar_shape = tuple(int(s) for s in ar_shape)
     ndim = len(ar_shape)

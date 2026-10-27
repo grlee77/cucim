@@ -7,7 +7,10 @@ Tests adapted from scikit-image's test_watershed.py. Original test names
 are preserved in docstrings for traceability.
 """
 
+import math
+
 import cupy as cp
+import numpy as np
 import pytest
 from cupyx.scipy import ndimage as ndi
 
@@ -15,13 +18,8 @@ import cucim.skimage.measure
 from cucim.skimage._shared.filters import gaussian
 from cucim.skimage.feature import peak_local_max
 from cucim.skimage.measure import label
-from cucim.skimage.segmentation._watershed import (
-    _get_neighbor_offsets,
-    watershed,
-)
-from cucim.skimage.segmentation._watershed_ca_block_async import (
-    _get_max_outer_iterations,
-)
+from cucim.skimage.segmentation import watershed
+from cucim.skimage.segmentation._watershed_ca import _get_neighbor_offsets
 
 # fmt: off
 blob = cp.array([[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],  # noqa: E501
@@ -46,6 +44,18 @@ blob = cp.array([[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 25
                  [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],  # noqa: E501
                  [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]])  # noqa: E501
 # fmt: on
+
+
+def _smooth_image_and_markers(shape, n_markers, seed=0):
+    """Smooth random image with single-pixel markers at random locations."""
+    rng = np.random.default_rng(seed)
+    image = ndi.gaussian_filter(
+        cp.asarray(rng.standard_normal(shape)), 2
+    ).astype(cp.float32)
+    flat = rng.choice(math.prod(shape), n_markers, replace=False)
+    markers = cp.zeros(math.prod(shape), dtype=cp.int32)
+    markers[cp.asarray(flat)] = cp.arange(1, n_markers + 1, dtype=cp.int32)
+    return image, markers.reshape(shape)
 
 
 # -----------------------------------------------------------------
@@ -100,12 +110,7 @@ def test_barrier_with_8conn():
 
 
 def test_barrier_with_4conn():
-    """skimage: test_watershed02 - barrier with 4-connectivity.
-
-    The CA-watershed may differ from scikit-image at barrier corners
-    where tie-breaking depends on priority queue temporal ordering
-    that the parallel algorithm cannot replicate exactly.
-    """
+    """skimage: test_watershed02 - barrier with 4-connectivity."""
     # fmt: off
     data = cp.array(
         [[0, 0, 0, 0, 0, 0, 0],
@@ -149,9 +154,8 @@ def test_barrier_with_4conn():
          [-1, -1, -1, -1, -1, -1, -1]]
     )
     # fmt: on
-    out = watershed(data, markers, use_age=True)
-    num_diff = int(cp.sum(out != expected))
-    assert num_diff <= 4
+    out = watershed(data, markers)
+    cp.testing.assert_array_equal(out, expected)
 
 
 def test_two_basins_with_barrier_4conn():
@@ -441,16 +445,13 @@ def test_plateau_closest_seed():
     )
     dmin = cp.min(d, 2)
 
-    # With age-based tie-breaking, every pixel is assigned to its
-    # closest seed (exact match on flat images).
-    out_age = watershed(image, markers, connectivity=1, use_age=True)
-    assert cp.all(d[i, j, out_age[i, j] - 1] == dmin)
-
-    # Without age, the CA-watershed may assign a few boundary pixels
-    # to a non-closest seed due to tie-breaking differences.
-    out = watershed(image, markers, connectivity=1)
-    num_wrong = int(cp.sum(d[i, j, out[i, j] - 1] != dmin))
-    assert num_wrong <= 16
+    # Steps within a flooding level are counted breadth-first, so on a
+    # plateau every pixel is assigned to a closest seed.
+    for use_block_async in (False, True):
+        out = watershed(
+            image, markers, connectivity=1, use_block_async=use_block_async
+        )
+        assert cp.all(d[i, j, out[i, j] - 1] == dmin)
 
 
 def test_watershed_line_areas():
@@ -486,7 +487,7 @@ def test_watershed_line_areas():
 @pytest.mark.parametrize(
     "watershed_kwargs",
     [
-        pytest.param({}, id="synchronous"),
+        pytest.param({"use_block_async": False}, id="global"),
         pytest.param({"compactness": 0.1}, id="compact"),
         pytest.param({"use_block_async": True}, id="block-async"),
     ],
@@ -556,9 +557,7 @@ def test_compact_watershed():
         ],
         dtype=int,
     )
-    # Dividing line may not exactly match scikit-image
-    num_differences = int(cp.sum(normal != expected_skimage))
-    assert num_differences <= 5
+    cp.testing.assert_array_equal(normal, expected_skimage)
 
 
 def test_compact_watershed_uses_marker_image_value_as_initial_cost():
@@ -577,7 +576,6 @@ def test_compact_watershed_uses_marker_image_value_as_initial_cost():
 # -----------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="cuCIM algorithm is not expected to match this result")
 def test_watershed_with_markers_offset():
     """skimage: test_watershed_with_markers_offset (gh-6632 / gh-7661)."""
     x, y = cp.indices((80, 80))
@@ -613,8 +611,7 @@ def test_watershed_simple_basin_overspill():
                          [2, 2, 2, 2, 2, 2, 2, 2, 2]])
     # fmt: on
     result = watershed(image, markers=markers)
-    num_diff = int(cp.sum(result != expected))
-    assert num_diff <= 2
+    cp.testing.assert_array_equal(result, expected)
 
     # Scenario 2 (1D with mask)
     image = -cp.array([1, 2, 2, 2, 2, 2, 3])
@@ -624,11 +621,6 @@ def test_watershed_simple_basin_overspill():
     cp.testing.assert_array_equal(result, expected)
 
 
-@pytest.mark.skip(
-    reason=(
-        "CA-watershed tie-breaking differs from scikit-image on 1D plateaus"
-    )
-)
 def test_watershed_evenly_distributed_overspill():
     """skimage: test_watershed_evenly_distributed_overspill."""
     # Scenario 1: markers start with the same value
@@ -798,19 +790,14 @@ def test_convergence_check_interval_invalid(interval):
 def test_convergence_check_interval_matches(use_block_async, interval):
     """Batching convergence checks must not change the result.
 
-    A single marker makes the label fixed point independent of block update
-    ordering; only the number of host syncs and no-op launches should differ.
+    Only the number of host syncs and no-op launches should differ.
     """
-    shape = (64, 64)
-    image = cp.zeros(shape)
-    markers = cp.zeros(shape, dtype=cp.int32)
-    markers[16, 16] = 1
+    image, markers = _smooth_image_and_markers((64, 64), 8)
 
     ref = watershed(
         image,
         markers,
         connectivity=1,
-        use_age=True,
         use_block_async=use_block_async,
         convergence_check_interval=1,
     )
@@ -818,7 +805,6 @@ def test_convergence_check_interval_matches(use_block_async, interval):
         image,
         markers,
         connectivity=1,
-        use_age=True,
         use_block_async=use_block_async,
         convergence_check_interval=interval,
     )
@@ -826,7 +812,7 @@ def test_convergence_check_interval_matches(use_block_async, interval):
 
 
 def test_convergence_check_interval_matches_compact():
-    """Batching must not change the compact (synchronous) watershed result."""
+    """Batching must not change the compact watershed result."""
     image = cp.zeros((5, 6))
     image[:, 3] = 2
     image[:, 4:] = 1
@@ -875,13 +861,9 @@ def test_single_marker():
 @pytest.mark.parametrize(
     "watershed_kwargs",
     [
-        pytest.param({}, id="synchronous"),
+        pytest.param({"use_block_async": False}, id="global"),
         pytest.param({"compactness": 0.1}, id="compact"),
         pytest.param({"use_block_async": True}, id="block-async"),
-        pytest.param(
-            {"use_block_async": True, "use_age": True},
-            id="block-async-age",
-        ),
     ],
 )
 def test_reachable_float64_values_overflowing_float32_are_labeled(
@@ -969,19 +951,6 @@ def test_numpy_input_rejected():
     # NumPy markers should be rejected
     with pytest.raises(TypeError):
         watershed(image_cp, markers_np)
-
-
-def test_block_async_small_image_warning():
-    """Forcing use_block_async=True on a small image should warn and
-    fall back to the synchronous path, producing correct results."""
-    image = cp.zeros((10, 10), dtype=cp.float32)
-    markers = cp.zeros((10, 10), dtype=cp.int32)
-    markers[2, 2] = 1
-    markers[8, 8] = 2
-    with pytest.warns(UserWarning, match="use_block_async=True requires"):
-        out = watershed(image, markers, use_block_async=True)
-    assert out.shape == (10, 10)
-    assert set(cp.unique(out).tolist()) == {1, 2}
 
 
 # -----------------------------------------------------------------
@@ -1124,15 +1093,75 @@ class TestNeighborOffsets:
 
 
 # -----------------------------------------------------------------
-# Parametrized tests for block-async vs synchronous code paths
+# Global vs. block-asynchronous kernels
 # -----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("use_block_async", [True, False])
-@pytest.mark.parametrize("use_age", [True, False])
-def test_block_async_vs_sync_large_image(use_block_async, use_age):
-    """Watershed on a large image should converge and produce valid labels
-    for all code path combinations."""
+@pytest.mark.parametrize(
+    "shape, connectivity",
+    [
+        ((96, 80), 1),
+        ((96, 80), 2),
+        ((5, 200), 1),
+        ((3, 3), 2),
+        ((24, 20, 28), 1),
+        ((24, 20, 28), 2),
+        ((24, 20, 28), 3),
+        ((2, 40, 3), 1),
+    ],
+)
+def test_kernels_identical(shape, connectivity):
+    """All update orders converge to the same unique fixed point."""
+    image, markers = _smooth_image_and_markers(
+        shape, max(2, math.prod(shape) // 50)
+    )
+    ref = watershed(image, markers, connectivity, use_block_async=False)
+    for kwargs in (
+        {"use_block_async": True},
+        {"use_block_async": True, "inner_iterations": 1},
+        {"use_block_async": False, "convergence_check_interval": 1},
+    ):
+        out = watershed(image, markers, connectivity, **kwargs)
+        cp.testing.assert_array_equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    "shape, connectivity",
+    [((128, 96), 1), ((128, 96), 2), ((32, 28, 24), 1), ((32, 28, 24), 3)],
+)
+@pytest.mark.parametrize("use_block_async", [False, True])
+def test_regions_are_connected(shape, connectivity, use_block_async):
+    """Each region is connected to (and contains) its single-pixel marker."""
+    image, markers = _smooth_image_and_markers(shape, 40)
+    out = watershed(
+        image, markers, connectivity, use_block_async=use_block_async
+    )
+    footprint = ndi.generate_binary_structure(len(shape), connectivity)
+    components, n_components = ndi.label(out > 0, structure=footprint)
+    # Relabel each (label, component) pair; connected regions give one
+    # component per label.
+    pairs = cp.unique(out.astype(cp.int64) * (n_components + 1) + components)
+    assert pairs.size == int(markers.max())
+
+
+@pytest.mark.parametrize(
+    "shape, connectivity",
+    [((128, 96), 1), ((128, 96), 2), ((32, 28, 24), 1), ((32, 28, 24), 3)],
+)
+def test_matches_skimage_on_smooth_image(shape, connectivity):
+    """Without plateaus, the result matches scikit-image exactly."""
+    from skimage.segmentation import watershed as watershed_cpu
+
+    image, markers = _smooth_image_and_markers(shape, 40)
+    expected = watershed_cpu(
+        cp.asnumpy(image), cp.asnumpy(markers), connectivity=connectivity
+    )
+    out = watershed(image, markers, connectivity)
+    cp.testing.assert_array_equal(out, expected)
+
+
+def test_large_image_all_labeled():
+    """A larger image converges with every pixel labeled."""
     image = cp.zeros((256, 256))
     rng = cp.random.default_rng(42)
     coords = rng.integers(0, 256, (20, 2))
@@ -1142,13 +1171,7 @@ def test_block_async_vs_sync_large_image(use_block_async, use_age):
         markers[x, y] = i + 1
     image = gaussian(image, sigma=4, mode="reflect")
 
-    out = watershed(
-        image,
-        markers,
-        connectivity=2,
-        use_block_async=use_block_async,
-        use_age=use_age,
-    )
+    out = watershed(image, markers, connectivity=2)
     assert out.shape == (256, 256)
     assert int(cp.sum(out == 0)) == 0
     assert len(cp.unique(out)) == 20
@@ -1157,11 +1180,8 @@ def test_block_async_vs_sync_large_image(use_block_async, use_age):
 # use size > 48 for markers, but also test odd sizes
 @pytest.mark.parametrize("shape", ((64, 64), (49, 75)))
 @pytest.mark.parametrize("use_block_async", [True, False])
-def test_age_tie_breaking_assigns_a_closest_marker(shape, use_block_async):
-    """Both paths assign each pixel to a closest marker on a flat image.
-
-    The choice among equidistant markers is unspecified in block-async mode.
-    """
+def test_plateau_assigns_a_closest_marker(shape, use_block_async):
+    """Both kernels assign each pixel to a closest marker on a flat image."""
     image = cp.zeros(shape)
     markers = cp.zeros(shape, dtype=cp.int32)
     markers[16, 16] = 1
@@ -1174,13 +1194,10 @@ def test_age_tie_breaking_assigns_a_closest_marker(shape, use_block_async):
         markers,
         connectivity=1,
         use_block_async=use_block_async,
-        use_age=True,
     )
-    # Verify every pixel is assigned to its closest marker.
     # d[:,:,k] = Euclidean distance from each pixel to marker k+1.
     # dmin = minimum distance to any marker at each pixel.
     # d[i, j, out[i,j]-1] = distance to the *assigned* marker.
-    # Age tie-breaking ensures the assigned marker is one of the closest.
     i, j = cp.mgrid[0 : shape[0], 0 : shape[1]]
     d = cp.dstack(
         [
@@ -1192,15 +1209,29 @@ def test_age_tie_breaking_assigns_a_closest_marker(shape, use_block_async):
     assert cp.all(d[i, j, out[i, j] - 1] == dmin)
 
 
-def test_block_async_launch_bound_ignores_inner_iterations():
-    """Tile-local iterations cannot replace global halo refreshes."""
-    assert _get_max_outer_iterations(4096, 4096) == 4096
+@pytest.mark.parametrize(
+    "kwargs, shape, match",
+    [
+        ({"compactness": 0.1}, (16, 16), "compactness"),
+        ({}, (40,), "2D/3D"),
+        ({}, (4, 4, 4, 4), "2D/3D"),
+    ],
+)
+def test_block_async_unsupported_warns(kwargs, shape, match):
+    """Forcing use_block_async=True where it does not apply warns and falls
+    back to the global kernel."""
+    image = cp.zeros(shape, dtype=cp.float32)
+    markers = cp.zeros(shape, dtype=cp.int32)
+    markers[(0,) * len(shape)] = 1
+    markers[(-1,) * len(shape)] = 2
+    with pytest.warns(UserWarning, match=match):
+        out = watershed(image, markers, use_block_async=True, **kwargs)
+    assert set(cp.unique(out).tolist()) == {1, 2}
 
 
 @pytest.mark.parametrize("use_block_async", [True, False])
 def test_block_async_watershed_line(use_block_async):
-    """Watershed line post-processing should work with both code paths."""
-    # Use image >= 32x32 so block-async is valid
+    """Watershed line post-processing should work with both kernels."""
     image = cp.zeros((64, 64), dtype=cp.float32)
     image[:, 32] = 1.0  # vertical barrier
     markers = cp.zeros((64, 64), dtype=cp.int32)
@@ -1213,9 +1244,11 @@ def test_block_async_watershed_line(use_block_async):
         watershed_line=True,
         use_block_async=use_block_async,
     )
-    assert int(cp.sum(out == 0)) > 0
-    unique = set(cp.unique(out).tolist())
-    assert 1 in unique and 2 in unique
+    # The barrier column is reached last from either side and becomes the
+    # line.
+    cp.testing.assert_array_equal(out[:, 32], 0)
+    assert cp.all(out[:, :32] == 1)
+    assert cp.all(out[:, 33:] == 2)
 
 
 @pytest.mark.parametrize("use_block_async", [True, False])
@@ -1232,7 +1265,6 @@ def test_block_async_3d(use_block_async):
         image,
         markers,
         use_block_async=use_block_async,
-        use_age=True,
     )
     assert out.shape == (16, 16, 16)
     assert set(cp.unique(out).tolist()) == {1, 2, 3, 4}
@@ -1257,15 +1289,11 @@ def test_block_async_3d_with_mask(use_block_async):
     assert set(cp.unique(out[mask]).tolist()) == {1, 2}
 
 
-def test_block_async_3d_vs_sync_realistic():
-    """Block-async and synchronous 3D watershed should produce mostly the
-    same result on a realistic image generated from binary blobs with
-    distance-transform markers.
-
-    Both paths use use_age=True to reduce plateau tie-breaking differences.
-    """
+def test_block_async_3d_vs_global_realistic():
+    """Block-async and global 3D watershed give identical results on a
+    realistic image generated from binary blobs with distance-transform
+    markers."""
     from cucim.skimage.data import binary_blobs
-    from cucim.skimage.feature import peak_local_max
 
     shape = (32, 32, 32)
     blobs = binary_blobs(max(shape), n_dim=3, rng=5)
@@ -1287,24 +1315,8 @@ def test_block_async_3d_vs_sync_realistic():
     n_markers = int(markers.max())
     assert n_markers >= 2, "Need at least 2 markers for a meaningful test"
 
-    common = dict(markers=markers, mask=mask, use_age=True)
-    out_sync = watershed(image, use_block_async=False, **common)
+    common = dict(markers=markers, mask=mask)
+    out_global = watershed(image, use_block_async=False, **common)
     out_ba = watershed(image, use_block_async=True, **common)
-
-    # Both should produce the same set of labels
-    assert set(cp.unique(out_sync).tolist()) == set(cp.unique(out_ba).tolist())
-
-    # Background (outside mask) should be unlabeled in both
-    assert cp.all(out_sync[~mask] == 0)
-    assert cp.all(out_ba[~mask] == 0)
-
-    # The vast majority of foreground pixels should agree.
-    # Allow up to 5% disagreement at tile boundaries.
-    foreground = mask
-    n_foreground = int(cp.sum(foreground))
-    n_disagree = int(cp.sum(out_sync[foreground] != out_ba[foreground]))
-    disagree_pct = n_disagree / n_foreground
-    assert disagree_pct < 0.05, (
-        f"{n_disagree}/{n_foreground} ({disagree_pct:.1%}) pixels disagree "
-        f"between block-async and synchronous"
-    )
+    cp.testing.assert_array_equal(out_ba, out_global)
+    assert cp.all(out_global[~mask] == 0)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
@@ -99,7 +99,11 @@ class MorphGeodesicBench(ImageBench):
 
 class WatershedBench(ImageBench):
     # kwargs that only apply to the cuCIM implementation (not scikit-image)
-    _gpu_only_kwargs = {"use_block_async", "use_age", "inner_iterations"}
+    _gpu_only_kwargs = {
+        "use_block_async",
+        "inner_iterations",
+        "convergence_check_interval",
+    }
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -285,7 +289,8 @@ def main(args):
             False,
         ),
         # _watershed.py
-        # Standard watershed: compare block-async vs synchronous (2D/3D only)
+        # Standard watershed: compare the block-async and global kernels
+        # (block-async is only available for 2D/3D)
         (
             "watershed",
             dict(compactness=0),
@@ -293,7 +298,7 @@ def main(args):
             False,
             True,
         ),
-        # Compact watershed: various compactness values (always synchronous)
+        # Compact watershed: various compactness values (global kernel only)
         (
             "watershed",
             dict(),
