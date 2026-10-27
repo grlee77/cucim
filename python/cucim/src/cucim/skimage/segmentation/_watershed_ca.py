@@ -44,8 +44,11 @@ the image foresting transform (Falcão et al., 2004): each pixel's parent is
 its first neighbor (in a fixed order) holding the minimal key, and the parent
 pointers are followed to a marker by pointer jumping
 (https://en.wikipedia.org/wiki/Pointer_jumping), as in the path-reducing GPU
-watershed of Yeghiazaryan and Voiculescu (WACV 2018). This reproduces scikit-image's choice of the first-popped neighbor up
-to ties in the full priority-queue order.
+watershed of Yeghiazaryan and Voiculescu (WACV 2018): each thread walks its
+own chain for a bounded number of steps per launch, replacing every pointer
+it passes with its grandparent (path halving). This reproduces
+scikit-image's choice of the first-popped neighbor up to ties in the full
+priority-queue order.
 
 Compact watershed (``compactness > 0``)
 ---------------------------------------
@@ -69,7 +72,6 @@ only needed for higher-dimensional images or when explicitly requested.
 """
 
 import itertools
-import math
 
 import cupy as cp
 
@@ -530,42 +532,68 @@ void watershed_parent(
     return cp.RawKernel(kernel_code, "watershed_parent")
 
 
-@cp.memoize(for_each_device=True)
-def _get_pointer_jump_kernel():
-    """Get the kernel replacing each parent with its grandparent.
+# Maximum number of pointer steps one thread takes per resolve launch.
+_RESOLVE_MAX_STEPS = 16
 
-    Updates are in place; reading a parent that was already advanced in the
-    same launch only speeds up convergence to the root (marker).
+
+@cp.memoize(for_each_device=True)
+def _get_resolve_labels_kernel(label_ctype):
+    """Get the kernel that follows each pixel's parent chain to its marker.
+
+    Each thread walks from its pixel toward the root (a marker, which is its
+    own parent) for at most ``max_steps`` steps, replacing every pointer it
+    passes with its grandparent (path halving, a form of pointer jumping).
+    It then points its own pixel at the farthest ancestor it reached. Once
+    the root is reached, the root marker's label is written; otherwise
+    ``changed`` is set and a further launch continues from the advanced
+    pointer. Every pointer value a thread reads, stale or freshly written by
+    another thread, is an ancestor on the same chain, so the labels do not
+    depend on scheduling. Since each launch advances every pointer by at
+    least ``max_steps`` (ever longer) hops, the number of launches grows only
+    logarithmically with the chain length, while bounding the walk keeps a
+    single very long chain from serializing a launch.
     """
-    return cp.RawKernel(
-        r"""
+    L = label_ctype
+    kernel_code = (
+        _KERNEL_PREAMBLE
+        + f"""
 extern "C" __global__
-void watershed_pointer_jump(int* parent, int* __restrict__ changed, int size) {
+void watershed_resolve_labels(
+    int* parent,
+    const {L}* __restrict__ markers,
+    {L}* __restrict__ labels,
+    int* __restrict__ changed,
+    int max_steps,
+    int size
+) {{
     long long _gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (_gid >= size) return;
     int idx = (int)_gid;
-    int p = parent[idx];
-    if (p < 0) return;
-    int pp = parent[p];
-    if (pp != p) {
-        parent[idx] = pp;
-        *changed = 1;
-    }
-}
-""",
-        "watershed_pointer_jump",
+    int up = parent[idx];
+    if (up < 0) {{
+        // Masked or never reached from a marker.
+        labels[idx] = 0;
+        return;
+    }}
+    int node = idx;
+    for (int step = 0; step < max_steps; step++) {{
+        int up2 = parent[up];
+        if (up2 == up) {{
+            // ``up`` is the root marker.
+            if (up != parent[idx]) parent[idx] = up;
+            labels[idx] = markers[up];
+            return;
+        }}
+        parent[node] = up2;
+        node = up2;
+        up = parent[node];
+    }}
+    parent[idx] = up;
+    *changed = 1;
+}}
+"""
     )
-
-
-@cp.memoize(for_each_device=True)
-def _get_root_label_kernel():
-    """Elementwise kernel reading each pixel's label from its root marker."""
-    return cp.ElementwiseKernel(
-        "int32 root, raw M markers",
-        "M label",
-        "label = (root >= 0) ? markers[root] : (M)0;",
-        "cucim_watershed_root_label",
-    )
+    return cp.RawKernel(kernel_code, "watershed_resolve_labels")
 
 
 def _init_keys(image_flat, markers_flat, mask_flat, has_mask):
@@ -614,7 +642,7 @@ def _relax_keys_global(
 
 
 def _labels_from_keys(cost, keys, markers_flat, ndim, connectivity, shape):
-    """Resolve labels from converged keys via parent pointer jumping."""
+    """Resolve labels from converged keys via the parent forest."""
     size = cost.size
     threads_per_block = 256
     blocks = (size + threads_per_block - 1) // threads_per_block
@@ -625,19 +653,27 @@ def _labels_from_keys(cost, keys, markers_flat, ndim, connectivity, shape):
         (blocks,), (threads_per_block,), (cost, keys, parent, *dim_args)
     )
 
-    # Each jump at least halves the remaining distance to the root, so the
-    # number of launches is logarithmic in the depth of the parent forest.
-    jump_kernel = _get_pointer_jump_kernel()
+    labels = cp.empty(size, dtype=markers_flat.dtype)
+    resolve_kernel = _get_resolve_labels_kernel(
+        _DTYPE_TO_CTYPE[markers_flat.dtype]
+    )
     changed = cp.zeros(1, dtype=cp.int32)
-    jump_args = (parent, changed, cp.int32(size))
+    resolve_args = (
+        parent,
+        markers_flat,
+        labels,
+        changed,
+        cp.int32(_RESOLVE_MAX_STEPS),
+        cp.int32(size),
+    )
 
     def launch():
-        jump_kernel((blocks,), (threads_per_block,), jump_args)
+        resolve_kernel((blocks,), (threads_per_block,), resolve_args)
 
-    max_jumps = max(1, math.ceil(math.log2(size))) + 1
-    _launch_until_converged(launch, changed, max_jumps, 4)
-
-    return _get_root_label_kernel()(parent, markers_flat)
+    # Typically one or two launches; a chain as long as the whole image
+    # still needs only a handful. Check after every launch.
+    _launch_until_converged(launch, changed, max(1, size), 1)
+    return labels
 
 
 ###################################

@@ -374,7 +374,10 @@ def watershed(
       resolved to the markers by pointer jumping [9]_, as in the
       path-reducing GPU watershed of Yeghiazaryan and Voiculescu [10]_,
       which reduces steepest-descent label paths to direct pointers with
-      ``label(p) = label(label(p))`` in a logarithmic number of steps.
+      ``label(p) = label(label(p))``, a bounded number of times between
+      synchronizations. Here each thread walks its own chain for at most 16
+      steps per launch, replacing every pointer it passes with its
+      grandparent (path halving), so most images need one or two launches.
     - **Skipping quiet regions.** Pixels (global kernel) and tiles
       (block-asynchronous kernel) are skipped unless a neighbor improved its
       key in the previous or current launch, similar to the active-vertex

@@ -1184,6 +1184,29 @@ def test_compact_close_to_skimage_on_smooth_image(
     assert mismatch < 0.005
 
 
+@pytest.mark.parametrize("use_block_async", [None, False])
+def test_long_parent_chains(use_block_async):
+    """Parent chains much longer than one resolve launch's step budget are
+    still resolved to the right marker (flat image, markers at the ends)."""
+    from skimage.segmentation import watershed as watershed_cpu
+
+    image = cp.zeros(5001, dtype=cp.float32)
+    markers = cp.zeros(image.shape, dtype=cp.int32)
+    markers[0] = 1
+    markers[-1] = 2
+    out = watershed(image, markers, use_block_async=use_block_async)
+    expected = watershed_cpu(cp.asnumpy(image), cp.asnumpy(markers))
+    cp.testing.assert_array_equal(out, expected)
+    assert int(cp.sum(out == 1)) == 2501
+
+    # A single marker in a corner gives chains as long as the image diagonal.
+    image = cp.zeros((300, 200), dtype=cp.float32)
+    markers = cp.zeros(image.shape, dtype=cp.int32)
+    markers[0, 0] = 7
+    out = watershed(image, markers, use_block_async=use_block_async)
+    cp.testing.assert_array_equal(out, cp.full(image.shape, 7, dtype=cp.int32))
+
+
 def test_large_image_all_labeled():
     """A larger image converges with every pixel labeled."""
     image = cp.zeros((256, 256))
