@@ -305,10 +305,9 @@ def watershed(
         ``convergence_check_interval - 1`` extra launches after convergence.
         Because the relaxation is idempotent at its fixed point, those extra
         launches are no-ops and never change the result. If None (default),
-        a value tuned to the kernel is used: 8 for the global kernels
-        (many cheap launches, where syncs dominate) and 1 for the
-        block-asynchronous kernel (few, expensive launches, where extra
-        launches cost more than the syncs saved). Must be >= 1 if given.
+        a value tuned to the kernel is used: 8 for the global kernels and 4
+        for the block-asynchronous kernel, whose launches past convergence
+        are cheap because every tile is then skipped. Must be >= 1 if given.
 
     Returns
     -------
