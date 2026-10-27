@@ -13,18 +13,21 @@ automata, Computers & Electrical Engineering, Volume 39, Issue 8, 2013,
 pp. 2638-2655, ISSN 0045-7906,
 :DOI:`10.1016/j.compeleceng.2013.04.020`
 
-As there, each block loads a tile plus a one-pixel halo into shared memory,
-iterates until the tile is stable (here, or until an iteration cap is
-reached), writes the tile back to global memory, and the kernel is
-relaunched until no tile changes. The rest differs from that paper:
+As in the plain block-asynchronous algorithm of its Section 4.2, each block
+loads a tile plus a one-pixel halo into shared memory, iterates until the tile
+is stable (here, or until an iteration cap is reached), writes the tile back
+to global memory, and the kernel is relaunched until no tile changes. The rest
+differs from that paper:
 
 - Their watershed is an unseeded hill-climbing cellular automaton that
   floods from all regional minima; this one relaxes path-cost keys from
   markers.
-- They update each tile in synchronous steps and note that the plain
-  block-asynchronous scheme is non-deterministic and may introduce
-  artifacts on plateaus, which their artifact-free variant fixes with a
-  separately computed plateau distance and a correction across tiles. Here
+- They update each tile in synchronous steps with the halo held fixed
+  during a launch, and note that their underlying automaton is
+  non-deterministic. Because data then propagate at different speeds inside
+  and across tiles, watershed lines on plateaus are misplaced; the
+  artifact-free variant of their Section 4.3 fixes this with a separately
+  computed distance to the plateau's lower border. Here
   keys are updated in place, so threads may read keys their neighbors wrote
   in the same step and tiles read halos that other tiles are changing,
   plateaus are ordered by the step count in the keys, and because the

@@ -351,31 +351,41 @@ def watershed(
     - **Parallel relaxation.** Instead of using a priority queue, every
       pixel repeatedly takes the best key offered by its neighbors, in the
       spirit of the Ford-Bellman cellular-automaton watersheds of Kauffmann
-      and Piché [6]_, [7]_. (Their 2008 method relaxes a summed
-      topographic-distance cost rather than the minimax cost used here.)
+      and Piché [6]_, [7]_. (Both relax a summed path cost, a weighted or
+      topographic distance, rather than the minimax cost used here, with
+      synchronous double-buffered updates.)
     - **Block-asynchronous tiling.** For images with at most three
       dimensions of size greater than one (dimensions of size one are
       dropped, and a 1D image is processed as a single row), a tile plus a
       one-pixel halo is relaxed in shared memory until it stops changing,
       and the kernel is relaunched until no tile changes, following the
-      block-asynchronous cellular automata of Quesada-Barriuso et al. [8]_.
-      Their watershed is unseeded (it floods from all regional minima),
-      updates each tile in synchronous steps, and orders plateaus by a
-      separately computed distance to the plateau's lower border, with a
-      correction across tiles to avoid artifacts. Here, keys are updated in
+      block-asynchronous cellular automaton of Quesada-Barriuso et al.
+      (Section 4.2 of [8]_). Their watershed is unseeded (it floods from all
+      regional minima) and updates each tile in synchronous steps with its
+      halo held fixed. Because data then propagate at different speeds
+      inside and across tiles, watershed lines on plateaus are misplaced,
+      which their artifact-free variant (Section 4.3) corrects with a
+      separately computed distance to the plateau's lower border. Here, keys are updated in
       place, so threads and tiles may read keys written by others in the
       same step, plateaus are ordered by ``D``, and no correction is needed
       because the result does not depend on the update order (see below).
+    - **Label resolution.** After the keys converge, each pixel's parent is
+      its first neighbor with the smallest key, and the parent chains are
+      resolved to the markers by pointer jumping [9]_, as in the
+      path-reducing GPU watershed of Yeghiazaryan and Voiculescu [10]_,
+      which reduces steepest-descent label paths to direct pointers with
+      ``label(p) = label(label(p))`` in a logarithmic number of steps.
+    - **Skipping quiet regions.** Pixels (global kernel) and tiles
+      (block-asynchronous kernel) are skipped unless a neighbor improved its
+      key in the previous or current launch, similar to the active-vertex
+      masks of GPU shortest-path relaxation [11]_ and the pixel activation
+      map of the GPU image foresting transform [12]_.
     - **Specific to this implementation.** ``D``, which a sequential
       FIFO queue keeps implicitly [4]_, is stored explicitly and packed
       together with an order-preserving encoding of ``L`` into one 64-bit
-      integer, so keys are compared and updated as single integers. The
-      root labels are computed after the keys converge, from each pixel's
-      lowest-key neighbor, by pointer jumping [9]_. Pixels (global kernel)
-      and tiles (block-asynchronous kernel) are skipped unless a neighbor
-      improved its key in the previous or current launch, similar to the
-      active-vertex masks of GPU shortest-path relaxation [10]_ and the
-      pixel activation map of the GPU image foresting transform [11]_.
+      integer, so keys are compared and updated as single integers and the
+      relaxation has a unique fixed point that any update order reaches.
+      Quiet tiles are detected with per-tile launch stamps.
 
     Because the key strictly increases along every step, the relaxation has
     a unique fixed point that does not depend on the order of updates. The
@@ -390,7 +400,7 @@ def watershed(
     neighbor order rather than the full priority-queue insertion order
     decides, and where rounding the image to float32 merges distinct values.
 
-    The compact watershed extension follows the scikit-image approach [12]_,
+    The compact watershed extension follows the scikit-image approach [13]_,
     adding a distance penalty to encourage more regularly-shaped regions. This
     is useful for superpixel generation. Because the cost of reaching a pixel
     then depends on the marker it is reached from, the keys no longer have a
@@ -449,19 +459,23 @@ def watershed(
            Volume 39, Issue 8, 2013, pp. 2638-2655, ISSN 0045-7906,
            :DOI:`10.1016/j.compeleceng.2013.04.020`
     .. [9] https://en.wikipedia.org/wiki/Pointer_jumping
-    .. [10] Harish, P., & Narayanan, P. J. (2007). Accelerating large graph
+    .. [10] Yeghiazaryan, V., & Voiculescu, I. (2018). Path reducing
+            watershed for the GPU. In 2018 IEEE Winter Conference on
+            Applications of Computer Vision (WACV), pp. 577-585.
+            :DOI:`10.1109/WACV.2018.00069`
+    .. [11] Harish, P., & Narayanan, P. J. (2007). Accelerating large graph
             algorithms on the GPU using CUDA. In High Performance Computing
             (HiPC 2007), Lecture Notes in Computer Science, vol. 4873,
             pp. 197-208.
             :DOI:`10.1007/978-3-540-77220-0_21`
-    .. [11] Gonçalves, H., de Vasconcelos, G. Q., Rangel, P., Carvalho, M.,
+    .. [12] Gonçalves, H., de Vasconcelos, G. Q., Rangel, P., Carvalho, M.,
             Archilha, N., & Spina, T. (2019). cudaIFT: 180x faster image
             foresting transform for waterpixel estimation using CUDA. In
             Proceedings of the 14th International Joint Conference on Computer
             Vision, Imaging and Computer Graphics Theory and Applications
             (VISAPP), pp. 395-404.
             :DOI:`10.5220/0007402703950404`
-    .. [12] Neubert, P., & Protzel, P. (2014). Compact Watershed and
+    .. [13] Neubert, P., & Protzel, P. (2014). Compact Watershed and
             Preemptive SLIC: On Improving Trade-offs of Superpixel
             Segmentation Algorithms, 2014 22nd International Conference on
             Pattern Recognition (ICPR), Stockholm, Sweden, 2014, pp. 996-1001
