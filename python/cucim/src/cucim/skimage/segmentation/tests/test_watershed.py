@@ -1160,6 +1160,29 @@ def test_matches_skimage_on_smooth_image(shape, connectivity):
     cp.testing.assert_array_equal(out, expected)
 
 
+@pytest.mark.parametrize(
+    "shape, connectivity",
+    [((128, 96), 1), ((128, 96), 2), ((32, 28, 24), 1), ((32, 28, 24), 3)],
+)
+@pytest.mark.parametrize("compactness", [0.1, 1.0])
+def test_compact_close_to_skimage_on_smooth_image(
+    shape, connectivity, compactness
+):
+    """Compact watershed differs from scikit-image only at a few pixels."""
+    from skimage.segmentation import watershed as watershed_cpu
+
+    image, markers = _smooth_image_and_markers(shape, 40)
+    expected = watershed_cpu(
+        cp.asnumpy(image),
+        cp.asnumpy(markers),
+        connectivity=connectivity,
+        compactness=compactness,
+    )
+    out = watershed(image, markers, connectivity, compactness=compactness)
+    mismatch = float(cp.mean(out != cp.asarray(expected)))
+    assert mismatch < 0.005
+
+
 def test_large_image_all_labeled():
     """A larger image converges with every pixel labeled."""
     image = cp.zeros((256, 256))

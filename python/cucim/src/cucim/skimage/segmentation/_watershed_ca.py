@@ -49,11 +49,17 @@ priority-queue order.
 
 Compact watershed (``compactness > 0``)
 ---------------------------------------
-The cost of reaching a pixel depends on the marker it is reached from, so it
-is not a path cost and the fixed point is not unique. The compact path keeps
-a double-buffered (Jacobi) relaxation of labels, priorities and source
-coordinates, which is deterministic for a given input. It follows the
-scikit-image approach, based on:
+The priority of reaching a pixel ``q`` from a neighbor ``p`` is
+``max(image[q] + compactness * |q - source(p)|, P(p))``, where ``source(p)``
+is the marker ``p`` was reached from. It depends on that marker, so it is not
+a path cost and the fixed point is not unique. The compact path therefore
+uses a double-buffered (Jacobi) relaxation of labels, keys and source
+coordinates, which is deterministic for a given input. Keys have the same
+``(P, D)`` layout as above, and candidates with equal priority are ranked by
+the offering neighbor's key, approximating scikit-image's FIFO tie-break. A
+per-pixel "changed in the previous sweep" flag lets quiet regions skip both
+the neighbor scan and the copy between buffers. It follows the scikit-image
+approach, based on:
 
 Neubert, P., & Protzel, P. (2014). Compact Watershed and Preemptive SLIC: On
 Improving Trade-offs of Superpixel Segmentation Algorithms, 2014 22nd
@@ -607,14 +613,17 @@ def _labels_from_keys(cost, keys, markers_flat, ndim, connectivity, shape):
     return _get_root_label_kernel()(parent, markers_flat)
 
 
-#####################################
+###################################
 # Compact n-dimensional watershed #
-#####################################
+###################################
 
 
 @cp.memoize(for_each_device=True)
 def _get_compact_init_kernel(ndim, label_ctype="cuda::std::int32_t"):
     """Get initialization kernel for compact CA-watershed.
+
+    Markers get key ``ordered_cost(image) << 32`` (step count 0) and their
+    own coordinates as source; other pixels start unreached.
 
     Parameters
     ----------
@@ -634,6 +643,7 @@ def _get_compact_init_kernel(ndim, label_ctype="cuda::std::int32_t"):
 
     kernel_code = (
         _KERNEL_PREAMBLE
+        + _KEY_PREAMBLE
         + f"""
 extern "C" __global__
 void watershed_compact_init(
@@ -641,7 +651,7 @@ void watershed_compact_init(
     const {L}* markers,
     {L}* labels,
     unsigned char* state,
-    float* priority,
+    unsigned long long* keys,
     {src_params},
     const unsigned char* mask,
     int has_mask,
@@ -654,7 +664,7 @@ void watershed_compact_init(
     if (has_mask && !mask[idx]) {{
         labels[idx] = 0;
         state[idx] = 0;
-        priority[idx] = 0.0f;
+        keys[idx] = WS_KEY_UNREACHED;
         {src_init_unset}
         return;
     }}
@@ -664,12 +674,12 @@ void watershed_compact_init(
     if (marker_label != 0) {{
         labels[idx] = marker_label;
         state[idx] = 1;  // LABELED
-        priority[idx] = image[idx];
+        keys[idx] = ((unsigned long long)ws_ordered_cost(image[idx])) << 32;
         {src_init_marker}
     }} else {{
         labels[idx] = 0;
         state[idx] = 2;  // UNLABELED
-        priority[idx] = 3.4028235e+38f;  // FLT_MAX
+        keys[idx] = WS_KEY_UNREACHED;
         {src_init_unset}
     }}
 }}
@@ -689,13 +699,28 @@ def _get_compact_step_kernel(
     Uses a 1D grid for all dimensionalities, recovering nD coordinates
     from the flat index for neighbor bounds checking.
 
+    Each pixel holds a key ``(P, D)`` like the standard-watershed key, where
+    ``P`` is the compact priority. A neighbor ``p`` offers the candidate
+    priority ``max(image[q] + compactness * |q - source(p)|, P(p))``.
+    Candidates are compared by priority first and then by the neighbor's own
+    key, which approximates the order in which scikit-image's priority queue
+    would have popped those neighbors (its FIFO ``age`` tie-break). A pixel
+    only updates when its key strictly decreases.
+
     The relaxation is double-buffered (a synchronous-CA / Jacobi update):
-    the kernel reads from input arrays (``labels_in``/``priority_in``/...)
-    and writes to separate output arrays (``labels_out``/...), copying
-    unchanged cells through, and the caller swaps the buffers each
-    iteration. Because the compact cost depends on the source marker, its
-    fixed point depends on the update order; double buffering keeps the
-    result deterministic.
+    the kernel reads from input arrays (``labels_in``/``keys_in``/...) and
+    writes to separate output arrays (``labels_out``/...), and the caller
+    swaps the buffers each iteration. Because the compact cost depends on the
+    source marker, its fixed point depends on the update order; double
+    buffering keeps the result deterministic.
+
+    To avoid streaming every cell through memory on every sweep, a
+    double-buffered ``changed`` byte records whether each cell changed in the
+    previous sweep. A cell whose neighbors did not change cannot find a new
+    candidate and skips the neighbor scan, and a cell that did not change in
+    the previous sweep already holds its value in the output buffer and
+    skips the copy-through. Both shortcuts leave the result of every sweep
+    unchanged.
 
     Parameters
     ----------
@@ -722,7 +747,7 @@ def _get_compact_step_kernel(
     best_src_decls = "\n    ".join(
         f"int best_src_{j} = -1;" for j in range(ndim)
     )
-    final_src_updates = "\n            ".join(
+    final_src_updates = "\n        ".join(
         f"{w}[idx] = best_src_{j};" for j, w in enumerate(src_w)
     )
 
@@ -730,7 +755,7 @@ def _get_compact_step_kernel(
     # update copy their input forward.
     copy_lines = [
         "labels_out[idx] = labels_in[idx];",
-        "priority_out[idx] = priority_in[idx];",
+        "keys_out[idx] = my_key;",
     ]
     copy_lines.extend(f"{w}[idx] = {r}[idx];" for r, w in zip(src_r, src_w))
     copy_through = "\n        ".join(copy_lines)
@@ -755,25 +780,33 @@ def _get_compact_step_kernel(
             {dist_decls}
             float euclidean_dist = sqrtf({dist_terms});
 
-            float new_priority = my_image + compactness * euclidean_dist;
+            // Enforce monotonicity: never cheaper than the neighbor itself.
+            unsigned long long nkey = keys_in[nidx];
+            unsigned int npriority = (unsigned int)(nkey >> 32);
+            unsigned int priority = ws_ordered_cost(
+                my_image + compactness * euclidean_dist
+            );
+            if (priority < npriority) priority = npriority;
 
-            // Enforce monotonicity
-            float neighbor_priority = priority_in[nidx];
-            if (new_priority < neighbor_priority) {{
-                new_priority = neighbor_priority;
-            }}
-
-            if (!found_label || new_priority < best_priority) {{
-                best_priority = new_priority;
+            if (priority < best_priority ||
+                (priority == best_priority && nkey < best_nkey)) {{
+                best_priority = priority;
+                best_nkey = nkey;
                 best_label = nlabel;
                 {best_src_updates}
-                found_label = 1;
             }}
             }}""",
     )
 
+    _, _, _, neighbor_changed_loop = _generate_neighbor_loop(
+        ndim,
+        connectivity,
+        "neighbor_changed |= changed_in[nidx] != 0;",
+    )
+
     kernel_code = (
         _KERNEL_PREAMBLE
+        + _KEY_PREAMBLE
         + f"""
 extern "C" __global__
 void watershed_compact_step(
@@ -781,45 +814,70 @@ void watershed_compact_step(
     const unsigned char* __restrict__ state,
     const {L}* __restrict__ labels_in,
     {L}* __restrict__ labels_out,
-    const float* __restrict__ priority_in,
-    float* __restrict__ priority_out,
+    const unsigned long long* __restrict__ keys_in,
+    unsigned long long* __restrict__ keys_out,
     {src_params},
+    const unsigned char* __restrict__ changed_in,
+    unsigned char* __restrict__ changed_out,
     int* __restrict__ changed,
     float compactness,
     {dim_params}
 ) {{
     {_FLAT_INDEX_CODE.format(size_expr=size_expr)}
 
+    // The output buffers hold this cell's value from before the previous
+    // sweep, so they only need refreshing if the cell changed in that sweep.
+    bool changed_prev = changed_in[idx] != 0;
+    changed_out[idx] = 0;
     if (state[idx] != 2) {{
         // Fixed (marker/masked) cell: copy through unchanged.
-        {copy_through}
+        if (changed_prev) {{
+            unsigned long long my_key = keys_in[idx];
+            {copy_through}
+        }}
         return;
     }}
 
     {coord_code}
 
+    // Candidates only change if a neighbor changed in the previous sweep.
+    bool neighbor_changed = false;
+    {neighbor_changed_loop}
+    if (!neighbor_changed) {{
+        if (changed_prev) {{
+            unsigned long long my_key = keys_in[idx];
+            {copy_through}
+        }}
+        return;
+    }}
+
+    unsigned long long my_key = keys_in[idx];
     float my_image = image[idx];
-    float best_priority = priority_in[idx];
+    unsigned int best_priority = WS_COST_MASKED;
+    unsigned long long best_nkey = WS_KEY_UNREACHED;
     {L} best_label = 0;
     {best_src_decls}
-    int found_label = 0;
 
     {neighbor_loop}
 
-    if (found_label && best_label != 0) {{
-        // A first arrival must label the cell even when its priority is
-        // FLT_MAX, infinity, or otherwise not strictly ordered.
-        if (labels_in[idx] == 0 || best_priority < priority_in[idx]) {{
+    if (best_label != 0) {{
+        unsigned long long new_key =
+            (best_priority == (unsigned int)(best_nkey >> 32))
+                ? best_nkey + 1ull
+                : ((((unsigned long long)best_priority) << 32) | 1ull);
+        if (new_key < my_key) {{
             labels_out[idx] = best_label;
-            priority_out[idx] = best_priority;
+            keys_out[idx] = new_key;
             {final_src_updates}
-
+            changed_out[idx] = 1;
             *changed = 1;
             return;
         }}
     }}
-    // No improvement this sweep: copy through unchanged.
-    {copy_through}
+    // No improvement this sweep: copy through unchanged if needed.
+    if (changed_prev) {{
+        {copy_through}
+    }}
 }}
 """
     )
@@ -846,8 +904,8 @@ def _watershed_compact(
 
     Returns
     -------
-    labels, priority : cupy.ndarray
-        Flat label array (marker dtype) and final float32 priorities.
+    labels, keys : cupy.ndarray
+        Flat label array (marker dtype) and final uint64 priority keys.
     """
     size = image_flat.size
     label_dtype = markers_flat.dtype
@@ -858,7 +916,7 @@ def _watershed_compact(
 
     labels = cp.empty(size, dtype=label_dtype)
     state = cp.empty(size, dtype=cp.uint8)
-    priority = cp.empty(size, dtype=cp.float32)
+    keys = cp.empty(size, dtype=cp.uint64)
     sources = [cp.empty(size, dtype=cp.int32) for _ in range(ndim)]
 
     _get_compact_init_kernel(ndim, label_ctype)(
@@ -869,7 +927,7 @@ def _watershed_compact(
             markers_flat,
             labels,
             state,
-            priority,
+            keys,
             *sources,
             mask_flat,
             cp.int32(has_mask),
@@ -880,10 +938,10 @@ def _watershed_compact(
     step_kernel = _get_compact_step_kernel(ndim, connectivity, label_ctype)
 
     # Per-cell state that is read and written each iteration, in the order
-    # the kernel expects: labels, priority, sources... Every output cell is
-    # overwritten each sweep (updated or copied through), so the output
-    # buffers need no initialization.
-    bufs = {"read": [labels, priority, *sources]}
+    # the kernel expects: labels, keys, sources..., changed flags. Marking
+    # every cell as changed makes the first sweep evaluate and copy all
+    # cells, so the output buffers need no initialization.
+    bufs = {"read": [labels, keys, *sources, cp.ones(size, dtype=cp.uint8)]}
     bufs["write"] = [cp.empty_like(b) for b in bufs["read"]]
     changed = cp.zeros(1, dtype=cp.int32)
     trailing = (changed, cp.float32(compactness), *dim_args)

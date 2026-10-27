@@ -69,15 +69,13 @@ from ._watershed_ca_block_async import _relax_keys_block_async
 
 
 @cp.memoize(for_each_device=True)
-def _get_watershed_line_kernel(
-    ndim, connectivity=1, label_ctype="int32_t", cost_ctype="float"
-):
+def _get_watershed_line_kernel(ndim, connectivity=1, label_ctype="int32_t"):
     """Get post-processing kernel to create 1-pixel watershed lines.
 
     After the relaxation has converged and all pixels have final labels,
     this kernel identifies boundary pixels. To produce 1-pixel-wide lines
     (rather than 2-pixel), only the pixel that was reached "later" in the
-    flooding (larger cost) is set to 0. For equal costs, the pixel with the
+    flooding (larger key) is set to 0. For equal keys, the pixel with the
     higher label value is zeroed as a consistent tie-breaker. Marker pixels
     are copied through unchanged, so (as in scikit-image) adjacent marker
     regions may not have a separating line.
@@ -92,20 +90,15 @@ def _get_watershed_line_kernel(
         Neighborhood connectivity.
     label_ctype : str
         C type string for label arrays (e.g. "int32_t", "int8_t").
-    cost_ctype : str
-        C type of the per-pixel cost: the 64-bit path-cost key for standard
-        watershed or the float priority for compact watershed.
     """
     L = label_ctype
-    C = cost_ctype
     dim_params, size_expr, coord_code, neighbor_loop = _generate_neighbor_loop(
         ndim,
         connectivity,
         f"""{L} nlabel = labels_in[nidx];
             if (nlabel != 0 && nlabel != my_label) {{
-                {C} ncost = cost[nidx];
-                if (ncost < my_cost ||
-                    (ncost == my_cost && nlabel < my_label)) {{
+                unsigned long long nkey = keys[nidx];
+                if (nkey < my_key || (nkey == my_key && nlabel < my_label)) {{
                     is_boundary = 1;
                 }}
             }}""",
@@ -117,7 +110,7 @@ def _get_watershed_line_kernel(
 extern "C" __global__
 void watershed_line(
     const {L}* __restrict__ labels_in,
-    const {C}* __restrict__ cost,
+    const unsigned long long* __restrict__ keys,
     const {L}* __restrict__ markers,
     {L}* __restrict__ labels_out,
     {dim_params}
@@ -133,7 +126,7 @@ void watershed_line(
 
     {coord_code}
 
-    {C} my_cost = cost[idx];
+    unsigned long long my_key = keys[idx];
     int is_boundary = 0;
     {neighbor_loop}
 
@@ -402,10 +395,12 @@ def watershed(
     The compact watershed extension follows the scikit-image approach [5]_,
     adding a distance penalty to encourage more regularly-shaped regions. This
     is useful for superpixel generation. Because the cost of reaching a pixel
-    then depends on the marker it is reached from, compact watershed uses a
-    double-buffered (Jacobi) relaxation of labels and priorities instead.
-    It is deterministic, but because a pixel keeps the source marker it was
-    first reached from with its final priority, it can differ more from
+    then depends on the marker it is reached from, the keys no longer have a
+    unique fixed point, so compact watershed uses a double-buffered (Jacobi)
+    relaxation of labels, keys and source markers instead. Candidates with
+    equal priority are again ranked by the offering neighbor's key. The
+    result is deterministic, but because a pixel keeps the source marker it
+    was first reached from with its final priority, it can differ more from
     scikit-image near region boundaries and can leave small groups of pixels
     disconnected from the rest of their region.
 
@@ -561,7 +556,7 @@ def watershed(
     max_iterations = int(image.size)
 
     if compact:
-        labels, cost = _watershed_compact(
+        labels, keys = _watershed_compact(
             image_flat,
             markers_flat,
             mask_flat,
@@ -573,7 +568,6 @@ def watershed(
             compactness,
             convergence_check_interval=convergence_check_interval,
         )
-        cost_ctype = "float"
     else:
         cost, keys = _init_keys(image_flat, markers_flat, mask_flat, has_mask)
         relax_kwargs = dict(
@@ -592,8 +586,6 @@ def watershed(
         labels = _labels_from_keys(
             cost, keys, markers_flat, ndim, connectivity, image.shape
         )
-        cost = keys
-        cost_ctype = "unsigned long long"
 
     # Post-processing: create watershed lines if requested
     if watershed_line:
@@ -602,7 +594,6 @@ def watershed(
             ndim,
             connectivity,
             label_ctype=_DTYPE_TO_CTYPE[label_dtype],
-            cost_ctype=cost_ctype,
         )
         threads_per_block = 256
         blocks = (image.size + threads_per_block - 1) // threads_per_block
@@ -611,7 +602,7 @@ def watershed(
             (threads_per_block,),
             (
                 labels,
-                cost,
+                keys,
                 markers_flat,
                 labels_out,
                 *(int(s) for s in image.shape),
