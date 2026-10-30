@@ -1,0 +1,190 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+// Kernels of the taxicab and chessboard (chamfer) distance transforms.
+//
+// NDIM (the number of dimensions of the image) and BIG (the value that marks
+// "no background found yet") are defined by the Python code before this file.
+//
+// Taxicab: one pass per axis over every line of the array, computing
+//     g(x) = min over x' of ( |x - x'| + f(x') )
+// as a forward and a backward sweep (g[i] = min(f[i], g[i-1] + 1)).
+//
+// Chessboard: the chessboard distance of a pixel is the smallest r for which
+// the box of radius r around it contains a background pixel. The number of
+// background pixels in a box is read from a summed-area table, and r is found
+// by a binary search between bounds that follow from the taxicab distance d1
+// (ceil(d1 / NDIM) <= r <= d1).
+//
+// This is an initial implementation: the line passes use one thread per line,
+// which is not coalesced for the last (contiguous) axis.
+
+// Number of background pixels in the box [lo, hi) of the image, from the
+// summed-area table `sat` (an array with one more entry than the image along
+// every axis, with a zero at index 0). Inclusion-exclusion over the 2**NDIM
+// corners of the box.
+__device__ long long box_count(const int *sat, const long long *sat_strides,
+                               const long long *lo, const long long *hi)
+{
+    long long total = 0;
+    for (int mask = 0; mask < (1 << NDIM); ++mask) {
+        long long offset = 0;
+        int sign = 1;
+        for (int d = 0; d < NDIM; ++d) {
+            if ((mask >> d) & 1) {
+                offset += hi[d] * sat_strides[d];
+            } else {
+                offset += lo[d] * sat_strides[d];
+                sign = -sign;
+            }
+        }
+        total += sign * static_cast<long long>(sat[offset]);
+    }
+    return total;
+}
+
+extern "C" {
+
+// One pass of the taxicab transform along one axis. `dist` has the shape
+// (outer, n, inner) and is modified in place. There is one thread per line.
+__global__ void l1_pass(int *dist, long long n, long long inner,
+                        long long lines)
+{
+    long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= lines)
+        return;
+    long long base = (t / inner) * n * inner + t % inner;
+
+    int g = BIG;
+    for (long long i = 0; i < n; ++i) {
+        long long k = base + i * inner;
+        g = min(dist[k], g + 1);
+        dist[k] = g;
+    }
+    g = BIG;
+    for (long long i = n - 1; i >= 0; --i) {
+        long long k = base + i * inner;
+        g = min(dist[k], g + 1);
+        dist[k] = g;
+    }
+}
+
+// The same, and `feature` (the flat index of a nearest background pixel) is
+// propagated with the distance.
+__global__ void l1_pass_feature(int *dist, int *feature, long long n,
+                                long long inner, long long lines)
+{
+    long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= lines)
+        return;
+    long long base = (t / inner) * n * inner + t % inner;
+
+    int g = BIG, gf = -1;
+    for (long long i = 0; i < n; ++i) {
+        long long k = base + i * inner;
+        int v = dist[k];
+        if (v <= g + 1) {
+            g = v;
+            gf = feature[k];
+        } else {
+            g = g + 1;
+            feature[k] = gf;
+        }
+        dist[k] = g;
+    }
+    g = BIG;
+    for (long long i = n - 1; i >= 0; --i) {
+        long long k = base + i * inner;
+        int v = dist[k];
+        if (g + 1 < v) {
+            v = g + 1;
+            dist[k] = v;
+            feature[k] = gf;
+        }
+        g = v;
+        gf = feature[k];
+    }
+}
+
+// Chessboard distance of every pixel. `dist1` is the taxicab distance (BIG or
+// more if the image has no background pixel), `sat` the summed-area table of
+// the background. If `return_indices` is not 0, the coordinates of a nearest
+// background pixel are written to indices[d * size + i].
+__global__ void chessboard(const int *sat, const int *dist1, int *out,
+                           int *indices, int return_indices,
+                           const long long *shape,
+                           const long long *sat_strides, long long size)
+{
+    long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size)
+        return;
+
+    long long p[NDIM], lo[NDIM], hi[NDIM], site[NDIM];
+    long long rest = i;
+    for (int d = NDIM - 1; d >= 0; --d) {
+        p[d] = rest % shape[d];
+        rest /= shape[d];
+        site[d] = p[d];
+    }
+
+    int d1 = dist1[i];
+    int result;
+    if (d1 >= BIG / 2) {
+        // no background pixel anywhere: the pixel is its own feature
+        result = -1;
+    } else if (d1 == 0) {
+        result = 0;
+    } else {
+        int r_lo = (d1 + NDIM - 1) / NDIM;
+        int r_hi = d1;
+        while (r_lo < r_hi) {
+            int r = (r_lo + r_hi) / 2;
+            for (int d = 0; d < NDIM; ++d) {
+                lo[d] = max(p[d] - r, 0LL);
+                hi[d] = min(p[d] + r + 1, shape[d]);
+            }
+            if (box_count(sat, sat_strides, lo, hi) > 0)
+                r_hi = r;
+            else
+                r_lo = r + 1;
+        }
+        result = r_lo;
+
+        if (return_indices) {
+            // Find a background pixel in the box of radius `result` with one
+            // binary search per axis. The first background pixel along the
+            // axis (in the box) is found with the counts of the part of the
+            // box before a coordinate, then the axis is fixed to it.
+            for (int d = 0; d < NDIM; ++d) {
+                lo[d] = max(p[d] - result, 0LL);
+                hi[d] = min(p[d] + result + 1, shape[d]);
+            }
+            for (int a = 0; a < NDIM; ++a) {
+                long long first = lo[a], last = hi[a] - 1;
+                long long axis_hi = hi[a];
+                while (first < last) {
+                    long long mid = (first + last) / 2;
+                    hi[a] = mid + 1;
+                    if (box_count(sat, sat_strides, lo, hi) > 0)
+                        last = mid;
+                    else
+                        first = mid + 1;
+                }
+                hi[a] = axis_hi;
+                site[a] = first;
+                lo[a] = first;
+                hi[a] = first + 1;
+            }
+        }
+    }
+
+    out[i] = result;
+    if (return_indices) {
+        for (int d = 0; d < NDIM; ++d)
+            indices[d * size + i] = static_cast<int>(site[d]);
+    }
+}
+
+}  // extern "C"
