@@ -43,6 +43,8 @@ def _get_chamfer_kernels(ndim):
         "l1_pass_feature",
         "l1_pass_warp",
         "l1_pass_feature_warp",
+        "sum_pass",
+        "sum_pass_warp",
         "chessboard",
     )
     return {name: module.get_function(name) for name in names}
@@ -139,11 +141,29 @@ def _chessboard(background, dist1, return_indices):
     ndim = background.ndim
     size = background.size
 
-    # Summed-area table with a leading zero along every axis.
-    sat = background.astype(cupy.int32)
-    for axis in range(ndim):
-        sat = cupy.cumsum(sat, axis=axis, dtype=cupy.int32)
-    sat = cupy.ascontiguousarray(cupy.pad(sat, [(1, 0)] * ndim))
+    # Summed-area table with a leading zero along every axis: the running sums
+    # along every axis of the background, in an array with one more element
+    # along each axis (the zeros stay zero in the sums).
+    sat_shape = tuple(n + 1 for n in shape)
+    sat = cupy.zeros(sat_shape, dtype=cupy.int32)
+    sat[(slice(1, None),) * ndim] = background
+    kernels = _get_chamfer_kernels(ndim)
+    for axis, n in enumerate(sat_shape):
+        inner = math.prod(sat_shape[axis + 1 :])
+        lines = math.prod(sat_shape[:axis]) * inner
+        if inner == 1 and n >= _WARP_MIN_LENGTH:
+            warps = _THREADS // 32
+            kernels["sum_pass_warp"](
+                ((lines + warps - 1) // warps,),
+                (_THREADS,),
+                (sat, np.int64(n), np.int64(lines)),
+            )
+        else:
+            kernels["sum_pass"](
+                ((lines + _THREADS - 1) // _THREADS,),
+                (_THREADS,),
+                (sat, np.int64(n), np.int64(inner), np.int64(lines)),
+            )
 
     out = cupy.empty(shape, dtype=cupy.int32)
     if return_indices:
@@ -153,7 +173,7 @@ def _chessboard(background, dist1, return_indices):
     shape_arg = cupy.asarray(shape, dtype=cupy.int64)
     sat_strides = cupy.asarray(_c_strides(sat.shape), dtype=cupy.int64)
 
-    kernel = _get_chamfer_kernels(ndim)["chessboard"]
+    kernel = kernels["chessboard"]
     kernel(
         ((size + _THREADS - 1) // _THREADS,),
         (_THREADS,),

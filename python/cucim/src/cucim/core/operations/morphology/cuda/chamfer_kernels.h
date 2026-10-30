@@ -219,6 +219,48 @@ __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
     }
 }
 
+// Running sums along one axis, in place (the passes that build the summed-area
+// table). `data` has the shape (outer, n, inner); one thread per line.
+__global__ void sum_pass(int *data, long long n, long long inner,
+                         long long lines)
+{
+    long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= lines)
+        return;
+    long long base = (t / inner) * n * inner + t % inner;
+    int total = 0;
+    for (long long i = 0; i < n; ++i) {
+        long long k = base + i * inner;
+        total += data[k];
+        data[k] = total;
+    }
+}
+
+// The same for the contiguous axis (inner == 1): one warp per line.
+__global__ void sum_pass_warp(int *data, long long n, long long lines)
+{
+    long long line = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) +
+                     threadIdx.x / 32;
+    if (line >= lines)
+        return;
+    int lane = threadIdx.x & 31;
+    int *row = data + line * n;
+    int carry = 0;
+    for (long long base = 0; base < n; base += 32) {
+        long long i = base + lane;
+        int w = (i < n) ? row[i] : 0;
+        for (int k = 1; k < 32; k <<= 1) {
+            int other = __shfl_up_sync(FULL_MASK, w, k);
+            if (lane >= k)
+                w += other;
+        }
+        w += carry;
+        carry = __shfl_sync(FULL_MASK, w, 31);
+        if (i < n)
+            row[i] = w;
+    }
+}
+
 // Chessboard distance of every pixel. `dist1` is the taxicab distance (BIG or
 // more if the image has no background pixel), `sat` the summed-area table of
 // the background. If `return_indices` is not 0, the coordinates of a nearest
