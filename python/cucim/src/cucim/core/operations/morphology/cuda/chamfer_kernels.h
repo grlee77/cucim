@@ -12,38 +12,11 @@
 //     g(x) = min over x' of ( |x - x'| + f(x') )
 // as a forward and a backward sweep (g[i] = min(f[i], g[i-1] + 1)).
 //
-// Chessboard: the chessboard distance of a pixel is the smallest r for which
-// the box of radius r around it contains a background pixel. The number of
-// background pixels in a box is read from a summed-area table, and r is found
-// by a binary search between bounds that follow from the taxicab distance d1
-// (ceil(d1 / NDIM) <= r <= d1).
+// Chessboard: the distance along the contiguous axis, then for every other axis
+// the transform min over x' of max(|x - x'|, f(x')) (see minmax_pass).
 //
-// This is an initial implementation: the line passes use one thread per line,
-// which is not coalesced for the last (contiguous) axis.
-
-// Number of background pixels in the box [lo, hi) of the image, from the
-// summed-area table `sat` (an array with one more entry than the image along
-// every axis, with a zero at index 0). Inclusion-exclusion over the 2**NDIM
-// corners of the box.
-__device__ long long box_count(const int *sat, const long long *sat_strides,
-                               const long long *lo, const long long *hi)
-{
-    long long total = 0;
-    for (int mask = 0; mask < (1 << NDIM); ++mask) {
-        long long offset = 0;
-        int sign = 1;
-        for (int d = 0; d < NDIM; ++d) {
-            if ((mask >> d) & 1) {
-                offset += hi[d] * sat_strides[d];
-            } else {
-                offset += lo[d] * sat_strides[d];
-                sign = -sign;
-            }
-        }
-        total += sign * static_cast<long long>(sat[offset]);
-    }
-    return total;
-}
+// The passes along the contiguous axis use one warp per line, the others one
+// thread per line (neighboring threads handle neighboring lines).
 
 // The distance that is stored by the last pass: with `final`, the pixels that no
 // background pixel reached get the value -1 (as in SciPy).
@@ -233,48 +206,6 @@ __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
     }
 }
 
-// Running sums along one axis, in place (the passes that build the summed-area
-// table). `data` has the shape (outer, n, inner); one thread per line.
-__global__ void sum_pass(int *data, long long n, long long inner,
-                         long long lines)
-{
-    long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= lines)
-        return;
-    long long base = (t / inner) * n * inner + t % inner;
-    int total = 0;
-    for (long long i = 0; i < n; ++i) {
-        long long k = base + i * inner;
-        total += data[k];
-        data[k] = total;
-    }
-}
-
-// The same for the contiguous axis (inner == 1): one warp per line.
-__global__ void sum_pass_warp(int *data, long long n, long long lines)
-{
-    long long line = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) +
-                     threadIdx.x / 32;
-    if (line >= lines)
-        return;
-    int lane = threadIdx.x & 31;
-    int *row = data + line * n;
-    int carry = 0;
-    for (long long base = 0; base < n; base += 32) {
-        long long i = base + lane;
-        int w = (i < n) ? row[i] : 0;
-        for (int k = 1; k < 32; k <<= 1) {
-            int other = __shfl_up_sync(FULL_MASK, w, k);
-            if (lane >= k)
-                w += other;
-        }
-        w += carry;
-        carry = __shfl_sync(FULL_MASK, w, 31);
-        if (i < n)
-            row[i] = w;
-    }
-}
-
 // Convert the flat (C-order) index of the feature of every pixel into
 // coordinates, written to indices[d * size + i].
 __global__ void flat_to_coordinates(const int *feature, int *indices,
@@ -290,82 +221,93 @@ __global__ void flat_to_coordinates(const int *feature, int *indices,
     }
 }
 
-// Chessboard distance of every pixel. `dist1` is the taxicab distance (BIG or
-// more if the image has no background pixel), `sat` the summed-area table of
-// the background. If `return_indices` is not 0, the coordinates of a nearest
-// background pixel are written to indices[d * size + i].
-__global__ void chessboard(const int *sat, const int *dist1, int *out,
-                           int *indices, int return_indices,
-                           const long long *shape,
-                           const long long *sat_strides, long long size)
+// One pass of the chessboard transform along one axis:
+//     out(x) = min over x' of max(|x - x'|, f(x'))
+// for every line of an array of the shape (outer, n, inner), one thread per
+// line. The sites before x (x' <= x) and the sites after x are handled by a
+// forward and a backward sweep. In the forward sweep a site x' is dominated, for
+// this x and every later x, by a later site x'' with f(x'') <= f(x'), because
+// it is closer. The sites that are not dominated are kept on a stack, with f
+// increasing from the bottom to the top (the bottom sites are the farthest ones
+// and have the smallest f). The value max(x - x', f(x')) over the stack falls
+// and then rises (x - x' falls and f rises along the stack), and its minimum
+// moves towards the top as x increases, so a pointer to the minimum only moves
+// forward (and is clamped when sites are popped): O(n) per line.
+//
+// `stack` is scratch memory of the size of the array. The sweeps read `f`
+// and write the result to `out` (the forward sweep writes the minimum over the
+// sites before x, the backward sweep takes the minimum with it), so `f` must not
+// be the same array as `out`. If `with_feature` is not 0, the feature of the
+// chosen site (`fin`, the flat index of a background pixel) is written to
+// `fout`; at equal distances the sites before x win.
+__global__ void minmax_pass(const int *__restrict__ f, int *__restrict__ out,
+                            const int *__restrict__ fin,
+                            int *__restrict__ fout, int *__restrict__ stack,
+                            long long n, long long inner, long long lines,
+                            int final, int with_feature)
 {
-    long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= size)
+    long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= lines)
         return;
+    long long base = (t / inner) * n * inner + t % inner;
 
-    long long p[NDIM], lo[NDIM], hi[NDIM], site[NDIM];
-    long long rest = i;
-    for (int d = NDIM - 1; d >= 0; --d) {
-        p[d] = rest % shape[d];
-        rest /= shape[d];
-        site[d] = p[d];
+    int top = 0, p = 0;
+    for (int i = 0; i < n; ++i) {
+        int fx = f[base + i * inner];
+        while (top > 0 && f[base + static_cast<long long>(stack[base + (top - 1) * inner]) * inner] >= fx)
+            --top;
+        int limit = top > 0 ? top - 1 : 0;
+        if (p > limit)
+            p = limit;
+        stack[base + top * inner] = i;
+        ++top;
+        int s = stack[base + p * inner];
+        int cur = max(i - s, f[base + static_cast<long long>(s) * inner]);
+        while (p + 1 < top) {
+            int s2 = stack[base + (p + 1) * inner];
+            int v2 = max(i - s2, f[base + static_cast<long long>(s2) * inner]);
+            if (v2 > cur)
+                break;
+            cur = v2;
+            s = s2;
+            ++p;
+        }
+        out[base + i * inner] = cur;
+        if (with_feature)
+            fout[base + i * inner] = fin[base + static_cast<long long>(s) * inner];
     }
 
-    int d1 = dist1[i];
-    int result;
-    if (d1 >= BIG / 2) {
-        // no background pixel anywhere: the pixel is its own feature
-        result = -1;
-    } else if (d1 == 0) {
-        result = 0;
-    } else {
-        int r_lo = (d1 + NDIM - 1) / NDIM;
-        int r_hi = d1;
-        while (r_lo < r_hi) {
-            int r = (r_lo + r_hi) / 2;
-            for (int d = 0; d < NDIM; ++d) {
-                lo[d] = max(p[d] - r, 0LL);
-                hi[d] = min(p[d] + r + 1, shape[d]);
-            }
-            if (box_count(sat, sat_strides, lo, hi) > 0)
-                r_hi = r;
-            else
-                r_lo = r + 1;
+    top = 0;
+    p = 0;
+    for (int i = n - 1; i >= 0; --i) {
+        int fx = f[base + i * inner];
+        while (top > 0 && f[base + static_cast<long long>(stack[base + (top - 1) * inner]) * inner] >= fx)
+            --top;
+        int limit = top > 0 ? top - 1 : 0;
+        if (p > limit)
+            p = limit;
+        stack[base + top * inner] = i;
+        ++top;
+        int s = stack[base + p * inner];
+        int cur = max(s - i, f[base + static_cast<long long>(s) * inner]);
+        while (p + 1 < top) {
+            int s2 = stack[base + (p + 1) * inner];
+            int v2 = max(s2 - i, f[base + static_cast<long long>(s2) * inner]);
+            if (v2 > cur)
+                break;
+            cur = v2;
+            s = s2;
+            ++p;
         }
-        result = r_lo;
-
-        if (return_indices) {
-            // Find a background pixel in the box of radius `result` with one
-            // binary search per axis. The first background pixel along the
-            // axis (in the box) is found with the counts of the part of the
-            // box before a coordinate, then the axis is fixed to it.
-            for (int d = 0; d < NDIM; ++d) {
-                lo[d] = max(p[d] - result, 0LL);
-                hi[d] = min(p[d] + result + 1, shape[d]);
-            }
-            for (int a = 0; a < NDIM; ++a) {
-                long long first = lo[a], last = hi[a] - 1;
-                long long axis_hi = hi[a];
-                while (first < last) {
-                    long long mid = (first + last) / 2;
-                    hi[a] = mid + 1;
-                    if (box_count(sat, sat_strides, lo, hi) > 0)
-                        last = mid;
-                    else
-                        first = mid + 1;
-                }
-                hi[a] = axis_hi;
-                site[a] = first;
-                lo[a] = first;
-                hi[a] = first + 1;
-            }
+        long long k = base + i * inner;
+        int before = out[k];
+        if (cur < before) {
+            if (with_feature)
+                fout[k] = fin[base + static_cast<long long>(s) * inner];
+        } else {
+            cur = before;
         }
-    }
-
-    out[i] = result;
-    if (return_indices) {
-        for (int d = 0; d < NDIM; ++d)
-            indices[d * size + i] = static_cast<int>(site[d]);
+        out[k] = finished(cur, final);
     }
 }
 
