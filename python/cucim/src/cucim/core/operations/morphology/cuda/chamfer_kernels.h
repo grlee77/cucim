@@ -232,85 +232,111 @@ __global__ void flat_to_coordinates(const int *feature, int *indices,
 // and have the smallest f). The value max(x - x', f(x')) over the stack falls
 // and then rises (x - x' falls and f rises along the stack), and its minimum
 // moves towards the top as x increases, so a pointer to the minimum only moves
-// forward (and is clamped when sites are popped): O(n) per line.
+// forward (and is clamped when sites are popped): O(n) per line. The stack holds
+// (position, f at the position) pairs.
+
+// A sweep over a line (`backward` or forward). It writes the minimum over the
+// sites that it has seen to `out`, and with `merge` takes the minimum with the
+// value that is already in `out` (from the other sweep) and applies `final`.
+// With `with_feature`, the feature `fin` of the chosen site is written to
+// `fout`; at equal distances the value in `out` wins.
+__device__ void minmax_sweep(const int *__restrict__ f, int *__restrict__ out,
+                             const int *__restrict__ fin,
+                             int *__restrict__ fout, int2 *__restrict__ stack,
+                             long long base, long long n, long long inner,
+                             int backward, int merge, int final,
+                             int with_feature)
+{
+    int top = 0, p = 0;
+    for (int step = 0; step < n; ++step) {
+        int i = backward ? static_cast<int>(n) - 1 - step : step;
+        long long k = base + i * inner;
+        int fx = f[k];
+        while (top > 0 && stack[base + (top - 1) * inner].y >= fx)
+            --top;
+        int limit = top > 0 ? top - 1 : 0;
+        if (p > limit)
+            p = limit;
+        stack[base + top * inner] = make_int2(i, fx);
+        ++top;
+        int2 site = stack[base + p * inner];
+        int cur = max(backward ? site.x - i : i - site.x, site.y);
+        while (p + 1 < top) {
+            int2 next = stack[base + (p + 1) * inner];
+            int v2 = max(backward ? next.x - i : i - next.x, next.y);
+            if (v2 > cur)
+                break;
+            cur = v2;
+            site = next;
+            ++p;
+        }
+        if (merge) {
+            int before = out[k];
+            if (cur < before) {
+                if (with_feature)
+                    fout[k] = fin[base + static_cast<long long>(site.x) * inner];
+            } else {
+                cur = before;
+            }
+            cur = finished(cur, final);
+        } else if (with_feature) {
+            fout[k] = fin[base + static_cast<long long>(site.x) * inner];
+        }
+        out[k] = cur;
+    }
+}
+
+// `stack` is scratch memory with two ints per element of the array. `f` must not
+// be the same array as `out`. If `with_feature` is not 0 the features (flat
+// indices of background pixels, in `fin`) of the chosen sites are written to
+// `fout`.
 //
-// `stack` is scratch memory with two ints per element of the array. The sweeps read `f`
-// and write the result to `out` (the forward sweep writes the minimum over the
-// sites before x, the backward sweep takes the minimum with it), so `f` must not
-// be the same array as `out`. If `with_feature` is not 0, the feature of the
-// chosen site (`fin`, the flat index of a background pixel) is written to
-// `fout`; at equal distances the sites before x win.
+// With `split` the two sweeps run in different threads (blockIdx.y is 0 for the
+// forward sweep, 1 for the backward sweep), which doubles the number of threads
+// when there are few lines. The backward sweep then writes to `out2` and
+// `fout2` and `stack` has room for two stacks; minmax_combine merges the
+// results.
 __global__ void minmax_pass(const int *__restrict__ f, int *__restrict__ out,
                             const int *__restrict__ fin,
-                            int *__restrict__ fout, int2 *__restrict__ stack,
+                            int *__restrict__ fout, int *__restrict__ out2,
+                            int *__restrict__ fout2, int2 *__restrict__ stack,
                             long long n, long long inner, long long lines,
-                            int final, int with_feature)
+                            int final, int with_feature, int split)
 {
     long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= lines)
         return;
     long long base = (t / inner) * n * inner + t % inner;
+    if (!split) {
+        minmax_sweep(f, out, fin, fout, stack, base, n, inner, 0, 0, 0,
+                     with_feature);
+        minmax_sweep(f, out, fin, fout, stack, base, n, inner, 1, 1, final,
+                     with_feature);
+    } else if (blockIdx.y == 0) {
+        minmax_sweep(f, out, fin, fout, stack, base, n, inner, 0, 0, 0,
+                     with_feature);
+    } else {
+        minmax_sweep(f, out2, fin, fout2, stack + lines * n, base, n, inner, 1,
+                     0, 0, with_feature);
+    }
+}
 
-    // The stack holds (position, f at the position).
-    int top = 0, p = 0;
-    for (int i = 0; i < n; ++i) {
-        int fx = f[base + i * inner];
-        while (top > 0 && stack[base + (top - 1) * inner].y >= fx)
-            --top;
-        int limit = top > 0 ? top - 1 : 0;
-        if (p > limit)
-            p = limit;
-        stack[base + top * inner] = make_int2(i, fx);
-        ++top;
-        int2 site = stack[base + p * inner];
-        int cur = max(i - site.x, site.y);
-        while (p + 1 < top) {
-            int2 next = stack[base + (p + 1) * inner];
-            int v2 = max(i - next.x, next.y);
-            if (v2 > cur)
-                break;
-            cur = v2;
-            site = next;
-            ++p;
-        }
-        out[base + i * inner] = cur;
+// Merge the forward result (out, fout) with the backward result (out2, fout2)
+// of minmax_pass into (out, fout), at equal distances the forward one wins.
+__global__ void minmax_combine(int *out, const int *out2, int *fout,
+                               const int *fout2, long long size, int final,
+                               int with_feature)
+{
+    long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size)
+        return;
+    int a = out[i], b = out2[i];
+    if (b < a) {
+        a = b;
         if (with_feature)
-            fout[base + i * inner] =
-                fin[base + static_cast<long long>(site.x) * inner];
+            fout[i] = fout2[i];
     }
-
-    top = 0;
-    p = 0;
-    for (int i = n - 1; i >= 0; --i) {
-        int fx = f[base + i * inner];
-        while (top > 0 && stack[base + (top - 1) * inner].y >= fx)
-            --top;
-        int limit = top > 0 ? top - 1 : 0;
-        if (p > limit)
-            p = limit;
-        stack[base + top * inner] = make_int2(i, fx);
-        ++top;
-        int2 site = stack[base + p * inner];
-        int cur = max(site.x - i, site.y);
-        while (p + 1 < top) {
-            int2 next = stack[base + (p + 1) * inner];
-            int v2 = max(next.x - i, next.y);
-            if (v2 > cur)
-                break;
-            cur = v2;
-            site = next;
-            ++p;
-        }
-        long long k = base + i * inner;
-        int before = out[k];
-        if (cur < before) {
-            if (with_feature)
-                fout[k] = fin[base + static_cast<long long>(site.x) * inner];
-        } else {
-            cur = before;
-        }
-        out[k] = finished(cur, final);
-    }
+    out[i] = finished(a, final);
 }
 
 }  // extern "C"

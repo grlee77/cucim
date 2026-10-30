@@ -19,6 +19,10 @@ _MAX_NDIM = 8
 
 _THREADS = 128
 
+# Below this number of lines a pass over the lines of an axis does not occupy
+# the GPU with one thread per line.
+_FEW_LINES = 1 << 17
+
 # The contiguous axis is processed with one warp per line when the lines are at
 # least this long (shorter lines leave most lanes of the warp idle).
 _WARP_MIN_LENGTH = 32
@@ -45,6 +49,7 @@ def _get_chamfer_kernels(ndim):
         "l1_pass_feature_warp",
         "flat_to_coordinates",
         "minmax_pass",
+        "minmax_combine",
     )
     return {name: module.get_function(name) for name in names}
 
@@ -166,31 +171,60 @@ def _chessboard_passes(dist, with_features):
     if ndim == 1:
         return dist, feature
     out = cupy.empty_like(dist)
-    stack = cupy.empty(shape + (2,), dtype=cupy.int32)
+    kernels = _get_chamfer_kernels(ndim)
+    # Without features, the arrays for them are not used.
     fout = cupy.empty_like(dist) if with_features else out
     if not with_features:
         feature = out
-    kernel = _get_chamfer_kernels(ndim)["minmax_pass"]
     for axis in range(ndim - 2, -1, -1):
         n = shape[axis]
         inner = math.prod(shape[axis + 1 :])
         lines = math.prod(shape[:axis]) * inner
-        kernel(
-            ((lines + _THREADS - 1) // _THREADS,),
+        # With few lines the forward and the backward sweeps of a line run in
+        # different threads.
+        split = lines < _FEW_LINES
+        sweeps = 2 if split else 1
+        stack = cupy.empty((sweeps,) + shape + (2,), dtype=cupy.int32)
+        if split:
+            out2 = cupy.empty_like(dist)
+            fout2 = cupy.empty_like(dist) if with_features else out2
+        else:
+            out2, fout2 = out, fout
+        final = int(axis == 0)
+        kernels["minmax_pass"](
+            ((lines + _THREADS - 1) // _THREADS, sweeps),
             (_THREADS,),
             (
                 dist,
                 out,
                 feature,
                 fout,
+                out2,
+                fout2,
                 stack,
                 np.int64(n),
                 np.int64(inner),
                 np.int64(lines),
-                np.int32(axis == 0),
+                np.int32(final),
                 np.int32(with_features),
+                np.int32(split),
             ),
         )
+        if split:
+            size = dist.size
+            kernels["minmax_combine"](
+                ((size + _THREADS - 1) // _THREADS,),
+                (_THREADS,),
+                (
+                    out,
+                    out2,
+                    fout,
+                    fout2,
+                    np.int64(size),
+                    np.int32(final),
+                    np.int32(with_features),
+                ),
+            )
         dist, out = out, dist
         if with_features:
             feature, fout = fout, feature

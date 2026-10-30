@@ -324,3 +324,22 @@ def test_distance_transform_cdt_larger_image(metric):
     out = distance_transform_cdt(cp.asarray(img), metric=metric)
     expected = ndi_cpu.distance_transform_cdt(img, metric=metric)
     cp.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("metric", METRICS)
+@pytest.mark.parametrize("return_indices", [False, True])
+def test_distance_transform_cdt_many_lines(metric, return_indices):
+    """Enough lines along the axes for one thread per line (no splitting of
+    the sweeps of the min-max pass)."""
+    shape = (4, 6, 40000)
+    img = random_image(shape, 0.001, seed=11)
+    out = distance_transform_cdt(
+        cp.asarray(img), metric=metric, return_indices=return_indices
+    )
+    expected = ndi_cpu.distance_transform_cdt(img, metric=metric)
+    if return_indices:
+        out, ind = out
+        np.testing.assert_array_equal(
+            distance_from_indices(shape, cp.asnumpy(ind), metric), expected
+        )
+    cp.testing.assert_array_equal(out, expected)
