@@ -62,6 +62,17 @@ def _get_unreached_kernel():
     )
 
 
+@cupy.memoize(for_each_device=True)
+def _get_initial_kernel():
+    """0 at the background pixels and _BIG elsewhere."""
+    return cupy.ElementwiseKernel(
+        in_params="bool background",
+        out_params="int32 dist",
+        operation=f"dist = background ? 0 : {_BIG};",
+        name="cucim_cdt_initial",
+    )
+
+
 def _parse_metric(metric):
     if isinstance(metric, str):
         if metric in _TAXICAB_NAMES:
@@ -306,9 +317,8 @@ def distance_transform_cdt(
         dist = cupy.empty(shape, dtype=cupy.int32)
         idx = cupy.empty((ndim,) + shape, dtype=cupy.int32)
     else:
-        background = image == 0
-        dist = cupy.where(background, np.int32(0), np.int32(_BIG))
-        dist = cupy.ascontiguousarray(dist, dtype=cupy.int32)
+        background = cupy.ascontiguousarray(image == 0)
+        dist = _get_initial_kernel()(background)
 
         if metric == "taxicab":
             dist, feature = _taxicab_passes(dist, return_indices)
