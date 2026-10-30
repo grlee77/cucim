@@ -20,8 +20,10 @@ _MAX_NDIM = 8
 _THREADS = 128
 
 # Below this number of lines a pass over the lines of an axis does not occupy
-# the GPU with one thread per line.
-_FEW_LINES = 1 << 17
+# the GPU with one thread per line: the taxicab lines are split into chunks
+# and the two sweeps of a chessboard line run in different threads.
+_CHUNK_LINES = 1 << 16
+_SPLIT_LINES = 1 << 15
 
 # Shortest piece of a line that a thread handles when the lines are split.
 _MIN_CHUNK = 64
@@ -126,7 +128,7 @@ def _taxicab_passes(dist, with_features, final=False, axes=None):
             else:
                 kernels["l1_pass_warp"](grid, (_THREADS,), (dist,) + args)
             continue
-        chunks = min(-(-_FEW_LINES // lines), n // _MIN_CHUNK)
+        chunks = min(-(-_CHUNK_LINES // lines), n // _MIN_CHUNK)
         if chunks >= 2:
             # few lines: every line is split into chunks (see l1_chunk_pass)
             chunk_len = -(-n // chunks)
@@ -218,7 +220,7 @@ def _chessboard_passes(dist, with_features):
         lines = math.prod(shape[:axis]) * inner
         # With few lines the forward and the backward sweeps of a line run in
         # different threads.
-        split = lines < _FEW_LINES
+        split = lines < _SPLIT_LINES
         sweeps = 2 if split else 1
         stack = cupy.empty((sweeps,) + shape + (2,), dtype=cupy.int32)
         if split:
