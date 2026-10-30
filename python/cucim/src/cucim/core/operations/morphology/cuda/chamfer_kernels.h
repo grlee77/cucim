@@ -261,6 +261,21 @@ __global__ void sum_pass_warp(int *data, long long n, long long lines)
     }
 }
 
+// Convert the flat (C-order) index of the feature of every pixel into
+// coordinates, written to indices[d * size + i].
+__global__ void flat_to_coordinates(const int *feature, int *indices,
+                                    const long long *shape, long long size)
+{
+    long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size)
+        return;
+    long long rest = feature[i];
+    for (int d = NDIM - 1; d >= 0; --d) {
+        indices[d * size + i] = static_cast<int>(rest % shape[d]);
+        rest /= shape[d];
+    }
+}
+
 // Chessboard distance of every pixel. `dist1` is the taxicab distance (BIG or
 // more if the image has no background pixel), `sat` the summed-area table of
 // the background. If `return_indices` is not 0, the coordinates of a nearest

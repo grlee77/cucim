@@ -45,6 +45,7 @@ def _get_chamfer_kernels(ndim):
         "l1_pass_feature_warp",
         "sum_pass",
         "sum_pass_warp",
+        "flat_to_coordinates",
         "chessboard",
     )
     return {name: module.get_function(name) for name in names}
@@ -123,11 +124,16 @@ def _flat_to_coordinates(feature):
     """Convert flat (C-order) indices to an array of coordinates."""
     shape = feature.shape
     indices = cupy.empty((feature.ndim,) + shape, dtype=cupy.int32)
-    for d, stride in enumerate(_c_strides(shape)):
-        coordinate = feature // np.int32(stride)
-        if d > 0:
-            coordinate %= np.int32(shape[d])
-        indices[d] = coordinate
+    _get_chamfer_kernels(feature.ndim)["flat_to_coordinates"](
+        ((feature.size + _THREADS - 1) // _THREADS,),
+        (_THREADS,),
+        (
+            feature,
+            indices,
+            cupy.asarray(shape, dtype=cupy.int64),
+            np.int64(feature.size),
+        ),
+    )
     return indices
 
 
