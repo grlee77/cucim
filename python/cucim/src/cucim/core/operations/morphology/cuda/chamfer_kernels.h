@@ -314,14 +314,22 @@ __global__ void l1_chunk_pass(int *__restrict__ dist, int *__restrict__ feature,
 #define FULL_MASK 0xffffffffu
 
 __global__ void l1_pass_warp(int *dist, long long n, long long lines,
-                             int final)
+                             int final, int staged)
 {
+    extern __shared__ int staged_rows[];
     long long line = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) +
                      threadIdx.x / 32;
     if (line >= lines)
         return;
     int lane = threadIdx.x & 31;
-    int *row = dist + line * n;
+    int *global_row = dist + line * n;
+    int *row = global_row;
+    if (staged) {
+        row = staged_rows + (threadIdx.x / 32) * n;
+        for (long long i = lane; i < n; i += 32)
+            row[i] = global_row[i];
+        __syncwarp();
+    }
 
     int carry = BIG;
     for (long long base = 0; base < n; base += 32) {
@@ -352,6 +360,12 @@ __global__ void l1_pass_warp(int *dist, long long n, long long lines,
         if (i < n)
             row[i] = finished(w - static_cast<int>(i), final);
     }
+
+    if (staged) {
+        __syncwarp();
+        for (long long i = lane; i < n; i += 32)
+            global_row[i] = row[i];
+    }
 }
 
 // The same with the feature: the distance term and the flat index of the
@@ -359,8 +373,10 @@ __global__ void l1_pass_warp(int *dist, long long n, long long lines,
 // half, offset to be non-negative), so that a minimum of the keys is the
 // minimum of the distance.
 __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
-                                     long long lines, int final, int first)
+                                     long long lines, int final, int first,
+                                     int staged)
 {
+    extern __shared__ int staged_rows[];
     typedef unsigned long long key_t_;
     const key_t_ NONE = ~0ULL;
     long long line = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) +
@@ -368,8 +384,22 @@ __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
     if (line >= lines)
         return;
     int lane = threadIdx.x & 31;
-    int *row = dist + line * n;
-    int *frow = feature + line * n;
+    int *global_row = dist + line * n;
+    int *global_frow = feature + line * n;
+    int *row = global_row;
+    int *frow = global_frow;
+    if (staged) {
+        // the line (distances, then features) in shared memory
+        int warps = blockDim.x / 32;
+        row = staged_rows + (threadIdx.x / 32) * n;
+        frow = staged_rows + warps * n + (threadIdx.x / 32) * n;
+        for (long long i = lane; i < n; i += 32) {
+            row[i] = global_row[i];
+            frow[i] = first ? static_cast<int>(line * n + i) : global_frow[i];
+        }
+        first = 0;
+        __syncwarp();
+    }
 
     key_t_ carry = NONE;
     for (long long base = 0; base < n; base += 32) {
@@ -414,6 +444,14 @@ __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
             row[i] = finished(static_cast<int>(w >> 32) - static_cast<int>(i),
                               final);
             frow[i] = static_cast<int>(w & 0xffffffffULL);
+        }
+    }
+
+    if (staged) {
+        __syncwarp();
+        for (long long i = lane; i < n; i += 32) {
+            global_row[i] = row[i];
+            global_frow[i] = frow[i];
         }
     }
 }

@@ -83,6 +83,9 @@ def _get_chamfer_kernels(ndim):
     )
     tile_kernel.max_dynamic_shared_size_bytes = max_tile_bytes
     kernels["max_tile_bytes"] = max_tile_bytes
+    # the warp kernels have no static shared memory
+    for name in ("l1_pass_warp", "l1_pass_feature_warp"):
+        kernels[name].max_dynamic_shared_size_bytes = _max_shared_memory()
     return kernels
 
 
@@ -144,14 +147,24 @@ def _taxicab_passes(dist, with_features, final=False, axes=None):
         if inner == 1 and n >= _WARP_MIN_LENGTH:
             warps = _THREADS // 32
             grid = ((lines + warps - 1) // warps,)
+            # a line is staged in shared memory (so that it is read and
+            # written once in global memory) if the lines of a block fit
+            line_bytes = warps * n * 4 * (2 if with_features else 1)
+            staged = line_bytes <= _max_shared_memory()
             args = (np.int64(n), np.int64(lines), np.int32(is_last))
             if with_features:
                 args = args + (np.int32(axis == axes[0]),)
-                kernels["l1_pass_feature_warp"](
-                    grid, (_THREADS,), (dist, feature) + args
-                )
+                kernel = kernels["l1_pass_feature_warp"]
+                arrays = (dist, feature)
             else:
-                kernels["l1_pass_warp"](grid, (_THREADS,), (dist,) + args)
+                kernel = kernels["l1_pass_warp"]
+                arrays = (dist,)
+            kernel(
+                grid,
+                (_THREADS,),
+                arrays + args + (np.int32(staged),),
+                shared_mem=line_bytes if staged else 0,
+            )
             continue
         tile_bytes = n * (_TILE_W + 1) * 4 * (2 if with_features else 1)
         if (

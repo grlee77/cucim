@@ -387,3 +387,18 @@ def test_distance_transform_cdt_single_site_on_long_lines(metric, site):
     cp.testing.assert_array_equal(
         out, ndi_cpu.distance_transform_cdt(img, metric=metric)
     )
+
+
+@pytest.mark.parametrize("metric", METRICS)
+@pytest.mark.parametrize("shape", [(40000,), (5, 30000)])
+def test_distance_transform_cdt_very_long_lines(metric, shape):
+    """Lines too long to be staged in shared memory (contiguous axis)."""
+    img = random_image(shape, 0.0005, seed=31)
+    out, ind = distance_transform_cdt(
+        cp.asarray(img), metric=metric, return_indices=True
+    )
+    expected = ndi_cpu.distance_transform_cdt(img, metric=metric)
+    cp.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(
+        distance_from_indices(shape, cp.asnumpy(ind), metric), expected
+    )
