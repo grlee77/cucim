@@ -108,6 +108,117 @@ __global__ void l1_pass_feature(int *dist, int *feature, long long n,
     }
 }
 
+// The passes for the contiguous axis (inner == 1): one warp per line, so that
+// the reads and writes are coalesced. The forward sweep g(i) = min(f(i),
+// g(i-1) + 1) is, with u(i) = f(i) - i, g(i) = i + min over j <= i of u(j),
+// a prefix minimum that is computed for 32 elements at a time with shuffles
+// and a carry from the previous tiles. The backward sweep is the same for
+// v(i) = f(i) + i with a suffix minimum: g(i) = min over j >= i of v(j) - i.
+// A block has WARPS_PER_BLOCK warps (lines).
+#define FULL_MASK 0xffffffffu
+
+__global__ void l1_pass_warp(int *dist, long long n, long long lines)
+{
+    long long line = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) +
+                     threadIdx.x / 32;
+    if (line >= lines)
+        return;
+    int lane = threadIdx.x & 31;
+    int *row = dist + line * n;
+
+    int carry = BIG;
+    for (long long base = 0; base < n; base += 32) {
+        long long i = base + lane;
+        int w = (i < n) ? row[i] - static_cast<int>(i) : 0x7fffffff;
+        for (int k = 1; k < 32; k <<= 1) {
+            int other = __shfl_up_sync(FULL_MASK, w, k);
+            if (lane >= k)
+                w = min(w, other);
+        }
+        w = min(w, carry);
+        carry = __shfl_sync(FULL_MASK, w, 31);
+        if (i < n)
+            row[i] = w + static_cast<int>(i);
+    }
+
+    carry = 0x7fffffff;
+    for (long long base = ((n - 1) / 32) * 32; base >= 0; base -= 32) {
+        long long i = base + lane;
+        int w = (i < n) ? row[i] + static_cast<int>(i) : 0x7fffffff;
+        for (int k = 1; k < 32; k <<= 1) {
+            int other = __shfl_down_sync(FULL_MASK, w, k);
+            if (lane + k < 32)
+                w = min(w, other);
+        }
+        w = min(w, carry);
+        carry = __shfl_sync(FULL_MASK, w, 0);
+        if (i < n)
+            row[i] = w - static_cast<int>(i);
+    }
+}
+
+// The same with the feature: the distance term and the flat index of the
+// background pixel are packed in one 64-bit key (distance term in the upper
+// half, offset to be non-negative), so that a minimum of the keys is the
+// minimum of the distance.
+__global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
+                                     long long lines)
+{
+    typedef unsigned long long key_t_;
+    const key_t_ NONE = ~0ULL;
+    long long line = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) +
+                     threadIdx.x / 32;
+    if (line >= lines)
+        return;
+    int lane = threadIdx.x & 31;
+    int *row = dist + line * n;
+    int *frow = feature + line * n;
+
+    key_t_ carry = NONE;
+    for (long long base = 0; base < n; base += 32) {
+        long long i = base + lane;
+        key_t_ w = NONE;
+        if (i < n) {
+            w = (static_cast<key_t_>(row[i] - static_cast<int>(i) +
+                                     static_cast<int>(n)) << 32) |
+                static_cast<unsigned int>(frow[i]);
+        }
+        for (int k = 1; k < 32; k <<= 1) {
+            key_t_ other = __shfl_up_sync(FULL_MASK, w, k);
+            if (lane >= k)
+                w = min(w, other);
+        }
+        w = min(w, carry);
+        carry = __shfl_sync(FULL_MASK, w, 31);
+        if (i < n) {
+            row[i] = static_cast<int>(w >> 32) - static_cast<int>(n) +
+                     static_cast<int>(i);
+            frow[i] = static_cast<int>(w & 0xffffffffULL);
+        }
+    }
+
+    carry = NONE;
+    for (long long base = ((n - 1) / 32) * 32; base >= 0; base -= 32) {
+        long long i = base + lane;
+        key_t_ w = NONE;
+        if (i < n) {
+            w = (static_cast<key_t_>(row[i] + static_cast<int>(i)) << 32) |
+                static_cast<unsigned int>(frow[i]);
+        }
+        for (int k = 1; k < 32; k <<= 1) {
+            key_t_ other = __shfl_down_sync(FULL_MASK, w, k);
+            if (lane + k < 32)
+                w = min(w, other);
+        }
+        w = min(w, carry);
+        carry = __shfl_sync(FULL_MASK, w, 0);
+        if (i < n) {
+            row[i] = static_cast<int>(w >> 32) - static_cast<int>(i);
+            frow[i] = static_cast<int>(w & 0xffffffffULL);
+        }
+    }
+}
+
 // Chessboard distance of every pixel. `dist1` is the taxicab distance (BIG or
 // more if the image has no background pixel), `sat` the summed-area table of
 // the background. If `return_indices` is not 0, the coordinates of a nearest

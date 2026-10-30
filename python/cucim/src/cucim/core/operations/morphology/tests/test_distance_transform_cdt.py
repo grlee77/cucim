@@ -128,7 +128,10 @@ def test_distance_transform_cdt_all_background(metric):
 
 
 @pytest.mark.parametrize("metric", METRICS)
-@pytest.mark.parametrize("shape", [(30,), (17, 23), (6, 7, 8), (3, 4, 3, 4)])
+@pytest.mark.parametrize(
+    "shape",
+    [(30,), (17, 23), (6, 7, 8), (3, 4, 3, 4), (200,), (33, 70), (5, 9, 65)],
+)
 @pytest.mark.parametrize("bg_fraction", [0.02, 0.3])
 def test_distance_transform_cdt_indices(metric, shape, bg_fraction):
     """The indices are a nearest background pixel (not necessarily SciPy's)."""

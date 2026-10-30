@@ -19,6 +19,10 @@ _MAX_NDIM = 8
 
 _THREADS = 128
 
+# The contiguous axis is processed with one warp per line when the lines are at
+# least this long (shorter lines leave most lanes of the warp idle).
+_WARP_MIN_LENGTH = 32
+
 _TAXICAB_NAMES = ("taxicab", "cityblock", "manhattan")
 
 
@@ -34,7 +38,13 @@ def _get_chamfer_src(ndim):
 def _get_chamfer_kernels(ndim):
     """Return the kernels for images with `ndim` dimensions as a dictionary."""
     module = cupy.RawModule(code=_get_chamfer_src(ndim))
-    names = ("l1_pass", "l1_pass_feature", "chessboard")
+    names = (
+        "l1_pass",
+        "l1_pass_feature",
+        "l1_pass_warp",
+        "l1_pass_feature_warp",
+        "chessboard",
+    )
     return {name: module.get_function(name) for name in names}
 
 
@@ -85,6 +95,17 @@ def _taxicab_passes(dist, with_features):
     for axis, n in enumerate(shape):
         inner = math.prod(shape[axis + 1 :])
         lines = math.prod(shape[:axis]) * inner
+        if inner == 1 and n >= _WARP_MIN_LENGTH:
+            warps = _THREADS // 32
+            grid = ((lines + warps - 1) // warps,)
+            args = (np.int64(n), np.int64(lines))
+            if with_features:
+                kernels["l1_pass_feature_warp"](
+                    grid, (_THREADS,), (dist, feature) + args
+                )
+            else:
+                kernels["l1_pass_warp"](grid, (_THREADS,), (dist,) + args)
+            continue
         grid = ((lines + _THREADS - 1) // _THREADS,)
         args = (np.int64(n), np.int64(inner), np.int64(lines))
         if with_features:
