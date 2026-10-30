@@ -5,8 +5,9 @@
 
 // Kernels of the taxicab and chessboard (chamfer) distance transforms.
 //
-// NDIM (the number of dimensions of the image) and BIG (the value that marks
-// "no background found yet") are defined by the Python code before this file.
+// NDIM (the number of dimensions of the image), BIG (the value that marks "no
+// background found yet") and TILE_W and TILE_G (see l1_tile_pass) are defined by
+// the Python code before this file.
 //
 // Taxicab: one pass per axis over every line of the array, computing
 //     g(x) = min over x' of ( |x - x'| + f(x') )
@@ -89,6 +90,106 @@ __global__ void l1_pass_feature(int *__restrict__ dist,
         feature[k] = f;
         g = v;
         gf = f;
+    }
+}
+
+// The passes for the other axes when whole lines fit in shared memory. A block
+// handles TILE_W neighboring lines (columns of a (n, inner) matrix): it loads
+// the tile with coalesced reads, TILE_G threads per column run the sweeps on
+// consecutive pieces of the column in shared memory (with the carries of the
+// pieces, as in l1_chunk_pass) and the result is written back, so that every
+// element is read and written once in global memory instead of twice. The
+// block is (TILE_W, TILE_G) threads and the grid (ceil(inner / TILE_W), outer).
+// The dynamic shared memory is n * (TILE_W + 1) ints for the distances and, with
+// a feature, as much for the features (the +1 avoids bank conflicts).
+__global__ void l1_tile_pass(int *dist, int *feature, long long n,
+                             long long inner, int final, int first,
+                             int with_feature)
+{
+    extern __shared__ int tile[];
+    __shared__ unsigned long long forward[TILE_G][TILE_W];
+    __shared__ unsigned long long backward[TILE_G][TILE_W];
+    const int stride = TILE_W + 1;
+    int *ftile = tile + n * stride;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    long long col = static_cast<long long>(blockIdx.x) * TILE_W + tx;
+    bool inside = col < inner;
+    long long base = static_cast<long long>(blockIdx.y) * n * inner + col;
+
+    for (int r = ty; r < n; r += TILE_G) {
+        long long k = base + static_cast<long long>(r) * inner;
+        tile[r * stride + tx] = inside ? dist[k] : BIG;
+        if (with_feature)
+            ftile[r * stride + tx] =
+                inside ? (first ? static_cast<int>(k) : feature[k]) : 0;
+    }
+    __syncthreads();
+
+    int len = (static_cast<int>(n) + TILE_G - 1) / TILE_G;
+    int begin = min(ty * len, static_cast<int>(n));
+    int end = min(begin + len, static_cast<int>(n));
+    unsigned long long fmin = ~0ULL, bmin = ~0ULL;
+    for (int i = begin; i < end; ++i) {
+        int v = tile[i * stride + tx];
+        unsigned int fe = with_feature ? ftile[i * stride + tx] : 0;
+        fmin = min(fmin, (static_cast<unsigned long long>(
+                              v - i + static_cast<int>(n)) << 32) | fe);
+        bmin = min(bmin,
+                   (static_cast<unsigned long long>(v + i) << 32) | fe);
+    }
+    forward[ty][tx] = fmin;
+    backward[ty][tx] = bmin;
+    __syncthreads();
+
+    unsigned long long best = ~0ULL;
+    for (int c = 0; c < ty; ++c)
+        best = min(best, forward[c][tx]);
+    int g = BIG, gf = -1;
+    if (best != ~0ULL) {
+        g = static_cast<int>(best >> 32) - static_cast<int>(n) + begin - 1;
+        gf = static_cast<int>(best & 0xffffffffULL);
+    }
+    for (int i = begin; i < end; ++i) {
+        int v = tile[i * stride + tx];
+        bool take = v <= g + 1;
+        g = take ? v : g + 1;
+        tile[i * stride + tx] = g;
+        if (with_feature) {
+            gf = take ? ftile[i * stride + tx] : gf;
+            ftile[i * stride + tx] = gf;
+        }
+    }
+
+    best = ~0ULL;
+    for (int c = ty + 1; c < TILE_G; ++c)
+        best = min(best, backward[c][tx]);
+    g = BIG;
+    gf = -1;
+    if (best != ~0ULL) {
+        g = static_cast<int>(best >> 32) - end;
+        gf = static_cast<int>(best & 0xffffffffULL);
+    }
+    for (int i = end - 1; i >= begin; --i) {
+        int v = tile[i * stride + tx];
+        bool take = g + 1 < v;
+        v = take ? g + 1 : v;
+        tile[i * stride + tx] = v;
+        if (with_feature) {
+            int f = take ? gf : ftile[i * stride + tx];
+            ftile[i * stride + tx] = f;
+            gf = f;
+        }
+        g = v;
+    }
+    __syncthreads();
+
+    if (inside) {
+        for (int r = ty; r < n; r += TILE_G) {
+            long long k = base + static_cast<long long>(r) * inner;
+            dist[k] = finished(tile[r * stride + tx], final);
+            if (with_feature)
+                feature[k] = ftile[r * stride + tx];
+        }
     }
 }
 

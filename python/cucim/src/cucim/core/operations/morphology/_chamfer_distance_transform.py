@@ -28,6 +28,12 @@ _SPLIT_LINES = 1 << 15
 # Shortest piece of a line that a thread handles when the lines are split.
 _MIN_CHUNK = 64
 
+# The tiles of the taxicab passes (TILE_W and TILE_G of the kernel). A tile is
+# used for an axis if its lines fit in shared memory and there are enough lines.
+_TILE_W = 16
+_TILE_G = 32
+_TILE_MIN_LINES = 1 << 10
+
 # The contiguous axis is processed with one warp per line when the lines are at
 # least this long (shorter lines leave most lanes of the warp idle).
 _WARP_MIN_LENGTH = 32
@@ -35,11 +41,20 @@ _WARP_MIN_LENGTH = 32
 _TAXICAB_NAMES = ("taxicab", "cityblock", "manhattan")
 
 
+@cupy.memoize(for_each_device=True)
+def _max_shared_memory():
+    """Largest dynamic shared memory of a block (with the opt-in)."""
+    return cupy.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
+
+
 def _get_chamfer_src(ndim):
     kernel_directory = os.path.join(os.path.dirname(__file__), "cuda")
     with open(os.path.join(kernel_directory, "chamfer_kernels.h")) as f:
         kernels = f.read()
-    defines = f"#define NDIM {ndim}\n#define BIG {_BIG}\n"
+    defines = (
+        f"#define NDIM {ndim}\n#define BIG {_BIG}\n"
+        f"#define TILE_W {_TILE_W}\n#define TILE_G {_TILE_G}\n"
+    )
     return defines + kernels
 
 
@@ -53,12 +68,22 @@ def _get_chamfer_kernels(ndim):
         "l1_pass_warp",
         "l1_pass_feature_warp",
         "flat_to_coordinates",
+        "l1_tile_pass",
         "l1_chunk_summary",
         "l1_chunk_pass",
         "minmax_pass",
         "minmax_combine",
     )
-    return {name: module.get_function(name) for name in names}
+    kernels = {name: module.get_function(name) for name in names}
+    # the dynamic shared memory of the tile kernel can use what is left of the
+    # opt-in limit after its static shared memory
+    tile_kernel = kernels["l1_tile_pass"]
+    max_tile_bytes = (
+        _max_shared_memory() - tile_kernel.attributes["shared_size_bytes"]
+    )
+    tile_kernel.max_dynamic_shared_size_bytes = max_tile_bytes
+    kernels["max_tile_bytes"] = max_tile_bytes
+    return kernels
 
 
 @cupy.memoize(for_each_device=True)
@@ -127,6 +152,27 @@ def _taxicab_passes(dist, with_features, final=False, axes=None):
                 )
             else:
                 kernels["l1_pass_warp"](grid, (_THREADS,), (dist,) + args)
+            continue
+        tile_bytes = n * (_TILE_W + 1) * 4 * (2 if with_features else 1)
+        if (
+            inner >= _TILE_W
+            and lines >= _TILE_MIN_LINES
+            and tile_bytes <= kernels["max_tile_bytes"]
+        ):
+            kernels["l1_tile_pass"](
+                ((inner + _TILE_W - 1) // _TILE_W, lines // inner),
+                (_TILE_W, _TILE_G),
+                (
+                    dist,
+                    feature if with_features else dist,
+                    np.int64(n),
+                    np.int64(inner),
+                    np.int32(is_last),
+                    np.int32(axis == axes[0]),
+                    np.int32(with_features),
+                ),
+                shared_mem=tile_bytes,
+            )
             continue
         chunks = min(-(-_CHUNK_LINES // lines), n // _MIN_CHUNK)
         if chunks >= 2:

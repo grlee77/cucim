@@ -347,7 +347,16 @@ def test_distance_transform_cdt_many_lines(metric, return_indices):
 
 @pytest.mark.parametrize("metric", METRICS)
 @pytest.mark.parametrize(
-    "shape", [(1000, 3), (260, 7), (300, 700), (200, 20, 33), (129, 5, 5)]
+    "shape",
+    [
+        (1000, 3),
+        (260, 7),
+        (300, 700),
+        (200, 20, 33),
+        (129, 5, 5),
+        (70, 90, 100),
+        (50, 101, 99),
+    ],
 )
 @pytest.mark.parametrize("bg_fraction", [0.0005, 0.01, 0.3])
 def test_distance_transform_cdt_long_lines_few_lines(
