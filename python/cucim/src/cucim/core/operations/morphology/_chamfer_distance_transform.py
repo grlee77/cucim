@@ -166,10 +166,10 @@ def _chessboard_passes(dist, with_features):
     if ndim == 1:
         return dist, feature
     out = cupy.empty_like(dist)
-    stack = cupy.empty_like(dist)
-    fout = cupy.empty_like(dist) if with_features else stack
+    stack = cupy.empty(shape + (2,), dtype=cupy.int32)
+    fout = cupy.empty_like(dist) if with_features else out
     if not with_features:
-        feature = stack
+        feature = out
     kernel = _get_chamfer_kernels(ndim)["minmax_pass"]
     for axis in range(ndim - 2, -1, -1):
         n = shape[axis]

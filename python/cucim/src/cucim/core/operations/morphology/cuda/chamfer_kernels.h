@@ -234,7 +234,7 @@ __global__ void flat_to_coordinates(const int *feature, int *indices,
 // moves towards the top as x increases, so a pointer to the minimum only moves
 // forward (and is clamped when sites are popped): O(n) per line.
 //
-// `stack` is scratch memory of the size of the array. The sweeps read `f`
+// `stack` is scratch memory with two ints per element of the array. The sweeps read `f`
 // and write the result to `out` (the forward sweep writes the minimum over the
 // sites before x, the backward sweep takes the minimum with it), so `f` must not
 // be the same array as `out`. If `with_feature` is not 0, the feature of the
@@ -242,7 +242,7 @@ __global__ void flat_to_coordinates(const int *feature, int *indices,
 // `fout`; at equal distances the sites before x win.
 __global__ void minmax_pass(const int *__restrict__ f, int *__restrict__ out,
                             const int *__restrict__ fin,
-                            int *__restrict__ fout, int *__restrict__ stack,
+                            int *__restrict__ fout, int2 *__restrict__ stack,
                             long long n, long long inner, long long lines,
                             int final, int with_feature)
 {
@@ -251,59 +251,61 @@ __global__ void minmax_pass(const int *__restrict__ f, int *__restrict__ out,
         return;
     long long base = (t / inner) * n * inner + t % inner;
 
+    // The stack holds (position, f at the position).
     int top = 0, p = 0;
     for (int i = 0; i < n; ++i) {
         int fx = f[base + i * inner];
-        while (top > 0 && f[base + static_cast<long long>(stack[base + (top - 1) * inner]) * inner] >= fx)
+        while (top > 0 && stack[base + (top - 1) * inner].y >= fx)
             --top;
         int limit = top > 0 ? top - 1 : 0;
         if (p > limit)
             p = limit;
-        stack[base + top * inner] = i;
+        stack[base + top * inner] = make_int2(i, fx);
         ++top;
-        int s = stack[base + p * inner];
-        int cur = max(i - s, f[base + static_cast<long long>(s) * inner]);
+        int2 site = stack[base + p * inner];
+        int cur = max(i - site.x, site.y);
         while (p + 1 < top) {
-            int s2 = stack[base + (p + 1) * inner];
-            int v2 = max(i - s2, f[base + static_cast<long long>(s2) * inner]);
+            int2 next = stack[base + (p + 1) * inner];
+            int v2 = max(i - next.x, next.y);
             if (v2 > cur)
                 break;
             cur = v2;
-            s = s2;
+            site = next;
             ++p;
         }
         out[base + i * inner] = cur;
         if (with_feature)
-            fout[base + i * inner] = fin[base + static_cast<long long>(s) * inner];
+            fout[base + i * inner] =
+                fin[base + static_cast<long long>(site.x) * inner];
     }
 
     top = 0;
     p = 0;
     for (int i = n - 1; i >= 0; --i) {
         int fx = f[base + i * inner];
-        while (top > 0 && f[base + static_cast<long long>(stack[base + (top - 1) * inner]) * inner] >= fx)
+        while (top > 0 && stack[base + (top - 1) * inner].y >= fx)
             --top;
         int limit = top > 0 ? top - 1 : 0;
         if (p > limit)
             p = limit;
-        stack[base + top * inner] = i;
+        stack[base + top * inner] = make_int2(i, fx);
         ++top;
-        int s = stack[base + p * inner];
-        int cur = max(s - i, f[base + static_cast<long long>(s) * inner]);
+        int2 site = stack[base + p * inner];
+        int cur = max(site.x - i, site.y);
         while (p + 1 < top) {
-            int s2 = stack[base + (p + 1) * inner];
-            int v2 = max(s2 - i, f[base + static_cast<long long>(s2) * inner]);
+            int2 next = stack[base + (p + 1) * inner];
+            int v2 = max(next.x - i, next.y);
             if (v2 > cur)
                 break;
             cur = v2;
-            s = s2;
+            site = next;
             ++p;
         }
         long long k = base + i * inner;
         int before = out[k];
         if (cur < before) {
             if (with_feature)
-                fout[k] = fin[base + static_cast<long long>(s) * inner];
+                fout[k] = fin[base + static_cast<long long>(site.x) * inner];
         } else {
             cur = before;
         }
