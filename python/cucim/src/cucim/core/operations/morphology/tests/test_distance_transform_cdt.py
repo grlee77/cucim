@@ -1,9 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# NOTE: these tests were written together with the initial implementation and
-# have not been run yet.
-
 import cupy as cp
 import numpy as np
 import pytest
