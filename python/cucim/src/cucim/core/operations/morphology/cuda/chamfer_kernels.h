@@ -73,7 +73,8 @@ __global__ void l1_pass(int *dist, long long n, long long inner,
 
 // The same, and `feature` (the flat index of a nearest background pixel) is
 // propagated with the distance.
-__global__ void l1_pass_feature(int *dist, int *feature, long long n,
+__global__ void l1_pass_feature(int *__restrict__ dist,
+                                int *__restrict__ feature, long long n,
                                 long long inner, long long lines)
 {
     long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -81,30 +82,32 @@ __global__ void l1_pass_feature(int *dist, int *feature, long long n,
         return;
     long long base = (t / inner) * n * inner + t % inner;
 
+    // The loads do not depend on the running values and the choices are
+    // selects (no branch that guards a load), which is much faster than loading
+    // the feature only when it is needed.
     int g = BIG, gf = -1;
     for (long long i = 0; i < n; ++i) {
         long long k = base + i * inner;
         int v = dist[k];
-        if (v <= g + 1) {
-            g = v;
-            gf = feature[k];
-        } else {
-            g = g + 1;
-            feature[k] = gf;
-        }
+        int f = feature[k];
+        bool take = v <= g + 1;
+        g = take ? v : g + 1;
+        gf = take ? f : gf;
         dist[k] = g;
+        feature[k] = gf;
     }
     g = BIG;
     for (long long i = n - 1; i >= 0; --i) {
         long long k = base + i * inner;
         int v = dist[k];
-        if (g + 1 < v) {
-            v = g + 1;
-            dist[k] = v;
-            feature[k] = gf;
-        }
+        int f = feature[k];
+        bool take = g + 1 < v;
+        v = take ? g + 1 : v;
+        f = take ? gf : f;
+        dist[k] = v;
+        feature[k] = f;
         g = v;
-        gf = feature[k];
+        gf = f;
     }
 }
 
