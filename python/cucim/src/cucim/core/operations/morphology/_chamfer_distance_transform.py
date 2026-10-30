@@ -52,17 +52,6 @@ def _get_chamfer_kernels(ndim):
 
 
 @cupy.memoize(for_each_device=True)
-def _get_unreached_kernel():
-    """Replace the distances of pixels that no background pixel reached by -1."""
-    return cupy.ElementwiseKernel(
-        in_params="int32 dist",
-        out_params="int32 out",
-        operation=f"out = (dist >= {_BIG // 2}) ? -1 : dist;",
-        name="cucim_cdt_unreached",
-    )
-
-
-@cupy.memoize(for_each_device=True)
 def _get_initial_kernel():
     """0 at the background pixels and _BIG elsewhere."""
     return cupy.ElementwiseKernel(
@@ -94,12 +83,13 @@ def _c_strides(shape):
     return strides
 
 
-def _taxicab_passes(dist, with_features):
+def _taxicab_passes(dist, with_features, final=False):
     """Taxicab distance transform of `dist`, in place (and the flat index of a
     nearest background pixel if `with_features`).
 
     `dist` must be a C-contiguous int32 array with 0 at the background pixels
-    and `_BIG` elsewhere.
+    and `_BIG` elsewhere. With `final` the last pass stores -1 for the pixels
+    that no background pixel reached.
     """
     shape = dist.shape
     kernels = _get_chamfer_kernels(dist.ndim)
@@ -107,12 +97,13 @@ def _taxicab_passes(dist, with_features):
     if with_features:
         feature = cupy.arange(dist.size, dtype=cupy.int32).reshape(shape)
     for axis, n in enumerate(shape):
+        is_last = final and axis == len(shape) - 1
         inner = math.prod(shape[axis + 1 :])
         lines = math.prod(shape[:axis]) * inner
         if inner == 1 and n >= _WARP_MIN_LENGTH:
             warps = _THREADS // 32
             grid = ((lines + warps - 1) // warps,)
-            args = (np.int64(n), np.int64(lines))
+            args = (np.int64(n), np.int64(lines), np.int32(is_last))
             if with_features:
                 kernels["l1_pass_feature_warp"](
                     grid, (_THREADS,), (dist, feature) + args
@@ -121,7 +112,12 @@ def _taxicab_passes(dist, with_features):
                 kernels["l1_pass_warp"](grid, (_THREADS,), (dist,) + args)
             continue
         grid = ((lines + _THREADS - 1) // _THREADS,)
-        args = (np.int64(n), np.int64(inner), np.int64(lines))
+        args = (
+            np.int64(n),
+            np.int64(inner),
+            np.int64(lines),
+            np.int32(is_last),
+        )
         if with_features:
             kernels["l1_pass_feature"](
                 grid, (_THREADS,), (dist, feature) + args
@@ -321,7 +317,7 @@ def distance_transform_cdt(
         dist = _get_initial_kernel()(background)
 
         if metric == "taxicab":
-            dist, feature = _taxicab_passes(dist, return_indices)
+            dist, feature = _taxicab_passes(dist, return_indices, final=True)
             idx = _flat_to_coordinates(feature) if return_indices else None
         else:
             # The chessboard distance is bounded by the taxicab distance
@@ -329,8 +325,6 @@ def distance_transform_cdt(
             # distance of every pixel is needed anyway, so it is computed first.
             dist1, _ = _taxicab_passes(dist, False)
             dist, idx = _chessboard(background, dist1, return_indices)
-        if metric == "taxicab":
-            dist = _get_unreached_kernel()(dist)
 
     result = []
     if return_distances:

@@ -102,7 +102,9 @@ def test_distance_transform_cdt_single_background_pixel(metric, shape):
 
 
 @pytest.mark.parametrize("metric", METRICS)
-@pytest.mark.parametrize("shape", [(7,), (6, 8), (3, 4, 5)])
+@pytest.mark.parametrize(
+    "shape", [(7,), (6, 8), (3, 4, 5), (50,), (40, 50), (3, 4, 70)]
+)
 def test_distance_transform_cdt_no_background(metric, shape):
     """SciPy returns -1 everywhere, and every pixel is its own feature."""
     img = np.ones(shape, dtype=np.uint8)

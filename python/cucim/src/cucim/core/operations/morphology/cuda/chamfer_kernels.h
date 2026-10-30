@@ -45,12 +45,19 @@ __device__ long long box_count(const int *sat, const long long *sat_strides,
     return total;
 }
 
+// The distance that is stored by the last pass: with `final`, the pixels that no
+// background pixel reached get the value -1 (as in SciPy).
+__device__ __forceinline__ int finished(int v, int final)
+{
+    return (final && v >= BIG / 2) ? -1 : v;
+}
+
 extern "C" {
 
 // One pass of the taxicab transform along one axis. `dist` has the shape
 // (outer, n, inner) and is modified in place. There is one thread per line.
 __global__ void l1_pass(int *dist, long long n, long long inner,
-                        long long lines)
+                        long long lines, int final)
 {
     long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= lines)
@@ -67,7 +74,7 @@ __global__ void l1_pass(int *dist, long long n, long long inner,
     for (long long i = n - 1; i >= 0; --i) {
         long long k = base + i * inner;
         g = min(dist[k], g + 1);
-        dist[k] = g;
+        dist[k] = finished(g, final);
     }
 }
 
@@ -75,7 +82,7 @@ __global__ void l1_pass(int *dist, long long n, long long inner,
 // propagated with the distance.
 __global__ void l1_pass_feature(int *__restrict__ dist,
                                 int *__restrict__ feature, long long n,
-                                long long inner, long long lines)
+                                long long inner, long long lines, int final)
 {
     long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= lines)
@@ -104,7 +111,7 @@ __global__ void l1_pass_feature(int *__restrict__ dist,
         bool take = g + 1 < v;
         v = take ? g + 1 : v;
         f = take ? gf : f;
-        dist[k] = v;
+        dist[k] = finished(v, final);
         feature[k] = f;
         g = v;
         gf = f;
@@ -120,7 +127,8 @@ __global__ void l1_pass_feature(int *__restrict__ dist,
 // A block has WARPS_PER_BLOCK warps (lines).
 #define FULL_MASK 0xffffffffu
 
-__global__ void l1_pass_warp(int *dist, long long n, long long lines)
+__global__ void l1_pass_warp(int *dist, long long n, long long lines,
+                             int final)
 {
     long long line = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) +
                      threadIdx.x / 32;
@@ -156,7 +164,7 @@ __global__ void l1_pass_warp(int *dist, long long n, long long lines)
         w = min(w, carry);
         carry = __shfl_sync(FULL_MASK, w, 0);
         if (i < n)
-            row[i] = w - static_cast<int>(i);
+            row[i] = finished(w - static_cast<int>(i), final);
     }
 }
 
@@ -165,7 +173,7 @@ __global__ void l1_pass_warp(int *dist, long long n, long long lines)
 // half, offset to be non-negative), so that a minimum of the keys is the
 // minimum of the distance.
 __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
-                                     long long lines)
+                                     long long lines, int final)
 {
     typedef unsigned long long key_t_;
     const key_t_ NONE = ~0ULL;
@@ -216,7 +224,8 @@ __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
         w = min(w, carry);
         carry = __shfl_sync(FULL_MASK, w, 0);
         if (i < n) {
-            row[i] = static_cast<int>(w >> 32) - static_cast<int>(i);
+            row[i] = finished(static_cast<int>(w >> 32) - static_cast<int>(i),
+                              final);
             frow[i] = static_cast<int>(w & 0xffffffffULL);
         }
     }
