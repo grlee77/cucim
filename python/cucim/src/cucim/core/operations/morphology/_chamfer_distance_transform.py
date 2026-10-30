@@ -23,6 +23,9 @@ _THREADS = 128
 # the GPU with one thread per line.
 _FEW_LINES = 1 << 17
 
+# Shortest piece of a line that a thread handles when the lines are split.
+_MIN_CHUNK = 64
+
 # The contiguous axis is processed with one warp per line when the lines are at
 # least this long (shorter lines leave most lanes of the warp idle).
 _WARP_MIN_LENGTH = 32
@@ -48,6 +51,8 @@ def _get_chamfer_kernels(ndim):
         "l1_pass_warp",
         "l1_pass_feature_warp",
         "flat_to_coordinates",
+        "l1_chunk_summary",
+        "l1_chunk_pass",
         "minmax_pass",
         "minmax_combine",
     )
@@ -120,6 +125,37 @@ def _taxicab_passes(dist, with_features, final=False, axes=None):
                 )
             else:
                 kernels["l1_pass_warp"](grid, (_THREADS,), (dist,) + args)
+            continue
+        chunks = min(-(-_FEW_LINES // lines), n // _MIN_CHUNK)
+        if chunks >= 2:
+            # few lines: every line is split into chunks (see l1_chunk_pass)
+            chunk_len = -(-n // chunks)
+            chunks = -(-n // chunk_len)
+            forward = cupy.empty(chunks * lines, dtype=cupy.uint64)
+            backward = cupy.empty(chunks * lines, dtype=cupy.uint64)
+            grid = ((lines * chunks + _THREADS - 1) // _THREADS,)
+            args = (
+                np.int64(n),
+                np.int64(inner),
+                np.int64(lines),
+                np.int64(chunks),
+                np.int64(chunk_len),
+            )
+            flags = (np.int32(axis == axes[0]), np.int32(with_features))
+            fe = feature if with_features else dist
+            kernels["l1_chunk_summary"](
+                grid,
+                (_THREADS,),
+                (dist, fe, forward, backward) + args + flags,
+            )
+            kernels["l1_chunk_pass"](
+                grid,
+                (_THREADS,),
+                (dist, fe, forward, backward)
+                + args
+                + (np.int32(is_last),)
+                + flags,
+            )
             continue
         grid = ((lines + _THREADS - 1) // _THREADS,)
         args = (

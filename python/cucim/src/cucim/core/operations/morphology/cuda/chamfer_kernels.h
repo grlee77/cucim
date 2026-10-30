@@ -92,6 +92,117 @@ __global__ void l1_pass_feature(int *__restrict__ dist,
     }
 }
 
+// The passes for few lines: every line is split into `chunks` pieces of
+// `chunk_len` elements that are handled by different threads (thread t handles
+// the line t % lines and the chunk t / lines, so that neighboring threads handle
+// neighboring lines). The forward sweep g(i) = min(f(i), g(i-1) + 1) is
+// g(i) = i + min over j <= i of (f(j) - j), so a chunk needs the minimum of
+// f(j) - j over the earlier chunks (and the minimum of f(j) + j over the later
+// chunks for the backward sweep), which l1_chunk_summary computes for every chunk
+// from the original values. The minima are packed with the feature (the flat
+// index of the background pixel) in 64-bit keys: (value + offset) << 32 | feature.
+__global__ void l1_chunk_summary(const int *__restrict__ dist,
+                                 const int *__restrict__ feature,
+                                 unsigned long long *__restrict__ forward,
+                                 unsigned long long *__restrict__ backward,
+                                 long long n, long long inner, long long lines,
+                                 long long chunks, long long chunk_len,
+                                 int first, int with_feature)
+{
+    long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= lines * chunks)
+        return;
+    long long line = t % lines, chunk = t / lines;
+    long long base = (line / inner) * n * inner + line % inner;
+    long long begin = chunk * chunk_len;
+    long long end = min(begin + chunk_len, n);
+
+    unsigned long long fmin = ~0ULL, bmin = ~0ULL;
+    for (long long i = begin; i < end; ++i) {
+        long long k = base + i * inner;
+        int v = dist[k];
+        unsigned int fe = 0;
+        if (with_feature)
+            fe = first ? static_cast<unsigned int>(k) : feature[k];
+        unsigned long long a =
+            (static_cast<unsigned long long>(v - static_cast<int>(i) +
+                                             static_cast<int>(n)) << 32) | fe;
+        unsigned long long b =
+            (static_cast<unsigned long long>(v + static_cast<int>(i)) << 32) |
+            fe;
+        fmin = min(fmin, a);
+        bmin = min(bmin, b);
+    }
+    forward[chunk * lines + line] = fmin;
+    backward[chunk * lines + line] = bmin;
+}
+
+// The sweeps of a chunk, with the carries from the other chunks. Same results
+// as l1_pass / l1_pass_feature, in place.
+__global__ void l1_chunk_pass(int *__restrict__ dist, int *__restrict__ feature,
+                              const unsigned long long *__restrict__ forward,
+                              const unsigned long long *__restrict__ backward,
+                              long long n, long long inner, long long lines,
+                              long long chunks, long long chunk_len, int final,
+                              int first, int with_feature)
+{
+    long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= lines * chunks)
+        return;
+    long long line = t % lines, chunk = t / lines;
+    long long base = (line / inner) * n * inner + line % inner;
+    long long begin = chunk * chunk_len;
+    long long end = min(begin + chunk_len, n);
+
+    // carry from the earlier chunks
+    unsigned long long best = ~0ULL;
+    for (long long c = 0; c < chunk; ++c)
+        best = min(best, forward[c * lines + line]);
+    int g = BIG, gf = -1;
+    if (best != ~0ULL) {
+        g = static_cast<int>(best >> 32) - static_cast<int>(n) +
+            static_cast<int>(begin) - 1;
+        gf = static_cast<int>(best & 0xffffffffULL);
+    }
+    for (long long i = begin; i < end; ++i) {
+        long long k = base + i * inner;
+        int v = dist[k];
+        int f = 0;
+        if (with_feature)
+            f = first ? static_cast<int>(k) : feature[k];
+        bool take = v <= g + 1;
+        g = take ? v : g + 1;
+        gf = take ? f : gf;
+        dist[k] = g;
+        if (with_feature)
+            feature[k] = gf;
+    }
+
+    // carry from the later chunks
+    best = ~0ULL;
+    for (long long c = chunk + 1; c < chunks; ++c)
+        best = min(best, backward[c * lines + line]);
+    g = BIG;
+    gf = -1;
+    if (best != ~0ULL) {
+        g = static_cast<int>(best >> 32) - static_cast<int>(end);
+        gf = static_cast<int>(best & 0xffffffffULL);
+    }
+    for (long long i = end - 1; i >= begin; --i) {
+        long long k = base + i * inner;
+        int v = dist[k];
+        int f = with_feature ? feature[k] : 0;
+        bool take = g + 1 < v;
+        v = take ? g + 1 : v;
+        f = take ? gf : f;
+        dist[k] = finished(v, final);
+        if (with_feature)
+            feature[k] = f;
+        g = v;
+        gf = f;
+    }
+}
+
 // The passes for the contiguous axis (inner == 1): one warp per line, so that
 // the reads and writes are coalesced. The forward sweep g(i) = min(f(i),
 // g(i-1) + 1) is, with u(i) = f(i) - i, g(i) = i + min over j <= i of u(j),

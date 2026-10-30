@@ -343,3 +343,38 @@ def test_distance_transform_cdt_many_lines(metric, return_indices):
             distance_from_indices(shape, cp.asnumpy(ind), metric), expected
         )
     cp.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("metric", METRICS)
+@pytest.mark.parametrize(
+    "shape", [(1000, 3), (260, 7), (300, 700), (200, 20, 33), (129, 5, 5)]
+)
+@pytest.mark.parametrize("bg_fraction", [0.0005, 0.01, 0.3])
+def test_distance_transform_cdt_long_lines_few_lines(
+    metric, shape, bg_fraction
+):
+    """Long lines along the first axis, which are split into chunks."""
+    img = random_image(shape, bg_fraction, seed=21)
+    out, ind = distance_transform_cdt(
+        cp.asarray(img), metric=metric, return_indices=True
+    )
+    expected = ndi_cpu.distance_transform_cdt(img, metric=metric)
+    cp.testing.assert_array_equal(out, expected)
+    ind = cp.asnumpy(ind)
+    assert (img[tuple(ind)] == 0).all()
+    np.testing.assert_array_equal(
+        distance_from_indices(shape, ind, metric), expected
+    )
+
+
+@pytest.mark.parametrize("metric", METRICS)
+@pytest.mark.parametrize("site", [0, 1, 63, 64, 65, 500, 998, 999])
+def test_distance_transform_cdt_single_site_on_long_lines(metric, site):
+    """The only background pixel is at the start, the end, or on a chunk
+    boundary of the lines."""
+    img = np.ones((1000, 3), dtype=np.uint8)
+    img[site, 1] = 0
+    out = distance_transform_cdt(cp.asarray(img), metric=metric)
+    cp.testing.assert_array_equal(
+        out, ndi_cpu.distance_transform_cdt(img, metric=metric)
+    )
