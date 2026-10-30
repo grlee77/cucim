@@ -95,7 +95,7 @@ def _taxicab_passes(dist, with_features, final=False):
     kernels = _get_chamfer_kernels(dist.ndim)
     feature = None
     if with_features:
-        feature = cupy.arange(dist.size, dtype=cupy.int32).reshape(shape)
+        feature = cupy.empty(shape, dtype=cupy.int32)
     for axis, n in enumerate(shape):
         is_last = final and axis == len(shape) - 1
         inner = math.prod(shape[axis + 1 :])
@@ -105,6 +105,7 @@ def _taxicab_passes(dist, with_features, final=False):
             grid = ((lines + warps - 1) // warps,)
             args = (np.int64(n), np.int64(lines), np.int32(is_last))
             if with_features:
+                args = args + (np.int32(axis == 0),)
                 kernels["l1_pass_feature_warp"](
                     grid, (_THREADS,), (dist, feature) + args
                 )
@@ -119,6 +120,7 @@ def _taxicab_passes(dist, with_features, final=False):
             np.int32(is_last),
         )
         if with_features:
+            args = args + (np.int32(axis == 0),)
             kernels["l1_pass_feature"](
                 grid, (_THREADS,), (dist, feature) + args
             )

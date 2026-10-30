@@ -79,10 +79,11 @@ __global__ void l1_pass(int *dist, long long n, long long inner,
 }
 
 // The same, and `feature` (the flat index of a nearest background pixel) is
-// propagated with the distance.
+// propagated with the distance. With `first` (the first pass) the feature of
+// every pixel is its own flat index and `feature` is not read.
 __global__ void l1_pass_feature(int *__restrict__ dist,
                                 int *__restrict__ feature, long long n,
-                                long long inner, long long lines, int final)
+                                long long inner, long long lines, int final, int first)
 {
     long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= lines)
@@ -96,7 +97,7 @@ __global__ void l1_pass_feature(int *__restrict__ dist,
     for (long long i = 0; i < n; ++i) {
         long long k = base + i * inner;
         int v = dist[k];
-        int f = feature[k];
+        int f = first ? static_cast<int>(k) : feature[k];
         bool take = v <= g + 1;
         g = take ? v : g + 1;
         gf = take ? f : gf;
@@ -173,7 +174,7 @@ __global__ void l1_pass_warp(int *dist, long long n, long long lines,
 // half, offset to be non-negative), so that a minimum of the keys is the
 // minimum of the distance.
 __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
-                                     long long lines, int final)
+                                     long long lines, int final, int first)
 {
     typedef unsigned long long key_t_;
     const key_t_ NONE = ~0ULL;
@@ -192,7 +193,8 @@ __global__ void l1_pass_feature_warp(int *dist, int *feature, long long n,
         if (i < n) {
             w = (static_cast<key_t_>(row[i] - static_cast<int>(i) +
                                      static_cast<int>(n)) << 32) |
-                static_cast<unsigned int>(frow[i]);
+                static_cast<unsigned int>(first ? static_cast<int>(line * n + i)
+                                                : frow[i]);
         }
         for (int k = 1; k < 32; k <<= 1) {
             key_t_ other = __shfl_up_sync(FULL_MASK, w, k);
