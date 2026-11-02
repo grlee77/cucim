@@ -17,7 +17,11 @@ import numpy as np
 from scipy import ndimage as cpu_ndi
 
 from ..measure._label import _label_dtype_for_size
-from ..measure._label_kernels import _label_roots
+from ..measure._label_kernels import (
+    _flood_blocks,
+    _label_roots,
+    _use_blocks,
+)
 
 
 def _numeric_dtype_min_max(dtype):
@@ -217,21 +221,29 @@ def flood(
     # are computed on Python scalars so that they cannot overflow.
     seed_value = image[seed_point].item()
     if tolerance is None:
-        mask = image == seed_value
+        low = high = seed_value
+    elif seed_value != seed_value:
+        # NaN seed: no pixel is within the tolerance of it
+        low = high = seed_value
     else:
         tolerance = abs(tolerance)
         min_value, max_value = _numeric_dtype_min_max(image.dtype)
         low = max(min_value, seed_value - tolerance)
         high = min(max_value, seed_value + tolerance)
-        if seed_value != seed_value:
-            # NaN seed: no pixel is within the tolerance of it
-            mask = cp.zeros(image.shape, dtype=bool)
-        else:
-            # Like scikit-image, compare with the bounds converted to the
-            # dtype of the image (a fractional bound of an integer image is
-            # truncated toward zero).
-            low, high = image.dtype.type(low), image.dtype.type(high)
-            mask = (image >= low) & (image <= high)
+    # Like scikit-image, compare with the bounds converted to the dtype of the
+    # image (a fractional bound of an integer image is truncated toward zero).
+    low, high = image.dtype.type(low), image.dtype.type(high)
+
+    if _use_blocks(image, structure, False):
+        seed = int(np.ravel_multi_index(seed_point, image.shape))
+        return _flood_blocks(
+            image, seed, low, high, _label_dtype_for_size(image.size)
+        )
+
+    if tolerance is None:
+        mask = image == low
+    else:
+        mask = (image >= low) & (image <= high)
     # the seed is always part of the region
     mask[seed_point] = True
 

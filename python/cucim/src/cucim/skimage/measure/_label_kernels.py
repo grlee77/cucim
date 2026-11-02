@@ -508,7 +508,7 @@ def _block_params(ndim):
 
 
 @functools.cache
-def _kernel_block_flatten(ndim):
+def _kernel_block_flatten(ndim, count_roots=True):
     """Find the root of each block and count the roots (one thread per block).
 
     ``block_root[i]`` is the root of the tree of the block (-1 for an empty
@@ -525,7 +525,7 @@ def _kernel_block_flatten(ndim):
         Y root = rep;
         while (root != y[root]) {{ root = y[root]; }}
         block_root[i] = root;
-        if (root == rep) atomicAdd(&count[0], 1);
+        {"if (root == rep) atomicAdd(&count[0], 1);" if count_roots else ""}
         """
     return cupy.ElementwiseKernel(
         _block_params(ndim),
@@ -617,6 +617,110 @@ def _kernel_block_write_roots(ndim):
         code,
         "cucim_skimage_measure_label_block_write_roots",
     )
+
+
+@functools.cache
+def _kernel_block_init_range(ndim):
+    """`_kernel_block_init` for the pixels with ``low <= x <= high``.
+
+    The pixel with the index ``seed`` is foreground whatever its value.
+    """
+    coords, origin = _block_code(ndim)
+    pixels = []
+    for c in range(2**ndim):
+        local = [(c >> (ndim - 1 - d)) & 1 for d in range(ndim)]
+        inside = " && ".join(
+            f"2 * b{d} + {lc} < shape{d}" for d, lc in enumerate(local)
+        )
+        index = " + ".join(
+            [f"{lc} * s{d}" for d, lc in enumerate(local)] + ["origin"]
+        )
+        pixels.append((c, inside, index))
+    load = "\n        ".join(
+        f"Y i{c} = {index}; bool in{c} = {inside}; "
+        f"bool f{c} = in{c} && (i{c} == seed || (x[i{c}] >= low && x[i{c}] <= high));"
+        for c, inside, index in pixels
+    )
+    occ = " | ".join(f"(f{c} << {c})" for c, _, _ in pixels)
+    root = "-1"
+    for c, _, _ in reversed(pixels):
+        root = f"(f{c} ? i{c} : {root})"
+    store = "\n        ".join(
+        f"if (in{c}) y[i{c}] = f{c} ? root : -1;" for c, _, _ in pixels
+    )
+    code = f"""
+        {coords}
+        Y origin = {origin};
+        {load}
+        Y root = {root};
+        {store}
+        occupancy[i] = {occ};
+        """
+    shapes = ", ".join(f"int32 shape{d}" for d in range(ndim))
+    bshapes = ", ".join(f"int32 bshape{d}" for d in range(ndim))
+    return cupy.ElementwiseKernel(
+        f"raw X x, {shapes}, {bshapes}, X low, X high, Y seed",
+        "raw Y y, raw uint8 occupancy",
+        code,
+        "cucim_skimage_measure_label_block_init_range",
+    )
+
+
+@functools.cache
+def _kernel_block_mask(ndim):
+    """Write the mask of the pixels of the blocks whose root is the one of block ``seed_block``."""
+    coords, origin = _block_code(ndim)
+    pixels = _block_pixels(ndim)
+    store = "\n        ".join(
+        f"if (in{c}) mask[i{c}] = match && f{c};" for c in range(2**ndim)
+    )
+    code = f"""
+        unsigned int occ = occupancy[i];
+        {coords}
+        Y origin = {origin};
+        {pixels}
+        bool match = occ != 0 && block_root[i] == block_root[seed_block];
+        {store}
+        """
+    return cupy.ElementwiseKernel(
+        _block_params(ndim) + ", raw Y block_root, Y seed_block",
+        "raw bool mask",
+        code,
+        "cucim_skimage_measure_label_block_mask",
+    )
+
+
+def _flood_blocks(image, seed, low, high, label_dtype):
+    """The pixels connected (with full connectivity) to ``seed`` with values in [low, high].
+
+    ``seed`` is the index of the seed in the raveled image; it is always
+    included. ``label_dtype`` is the integer dtype of the forest. For 2 or 3 dimensions: the blocks are built directly from the
+    image (no mask array), and the mask is written per block.
+    """
+    ndim = image.ndim
+    shape = tuple(image.shape)
+    bshape = tuple(-(-s // 2) for s in shape)
+    nblocks = int(numpy.prod(bshape))
+    y = cupy.empty(shape, dtype=label_dtype)
+    occupancy = cupy.empty(nblocks, dtype=numpy.uint8)
+    _kernel_block_init_range(ndim)(
+        image, *shape, *bshape, low, high, seed, y, occupancy, size=nblocks
+    )
+    _kernel_block_connect(ndim)(*shape, *bshape, occupancy, y, size=nblocks)
+    block_root = cupy.empty(nblocks, dtype=label_dtype)
+    count = cupy.zeros(2, dtype=label_dtype)
+    _kernel_block_flatten(ndim, False)(
+        *shape, *bshape, occupancy, y, block_root, count, size=nblocks
+    )
+    seed_coords = numpy.unravel_index(int(seed), shape)
+    seed_block = 0
+    for coord, size in zip(seed_coords, bshape):
+        seed_block = seed_block * size + coord // 2
+    mask = cupy.empty(shape, dtype=bool)
+    _kernel_block_mask(ndim)(
+        *shape, *bshape, occupancy, block_root, seed_block, mask, size=nblocks
+    )
+    return mask
 
 
 def _kernel_count():
