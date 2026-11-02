@@ -13,29 +13,62 @@ import cupy
 import numpy
 
 
-def _label(x, structure, y, greyscale_mode=False):
-    elems = numpy.where(structure != 0)
-    vecs = [elems[dm] - 1 for dm in range(x.ndim)]
-    offset = vecs[0]
-    for dm in range(1, x.ndim):
-        offset = offset * 3 + vecs[dm]
-    indxs = numpy.where(offset < 0)[0]
-    dirs = [[vecs[dm][dr] for dm in range(x.ndim)] for dr in indxs]
+def _half_structure_dirs(structure):
+    """Offsets of the neighbors that precede each pixel in raster order.
+
+    The structure must be centro-symmetric. The offsets are relative to the
+    center ``shape // 2`` of the structure, so structures larger than 3 along
+    an axis (non-adjacent neighbors) are supported.
+    """
+    structure = numpy.asarray(structure)
+    center = [s // 2 for s in structure.shape]
+    elems = numpy.nonzero(structure)
+    offsets = numpy.stack(
+        [elems[dm] - center[dm] for dm in range(structure.ndim)], axis=1
+    )
+    # An offset precedes the center if its first nonzero entry is negative
+    # (the raveled offset is negative).
+    keep = [o for o in offsets if (o[o != 0][:1] < 0).any()]
+    return numpy.array(keep, dtype=numpy.int32).reshape(-1, structure.ndim)
+
+
+def _connect(x, structure, y, greyscale_mode=False):
+    """Initialize ``y`` and merge the neighboring pixels into trees.
+
+    On return ``y[i]`` is the index of the parent of pixel ``i`` (-1 for
+    background pixels); the trees are not flattened yet.
+    """
+    dirs = _half_structure_dirs(structure)
+    ndirs = dirs.shape[0]
     dirs = cupy.array(dirs, dtype=numpy.int32)
-    ndirs = indxs.shape[0]
     y_shape = cupy.array(y.shape, dtype=numpy.int32)
-    count = cupy.zeros(2, dtype=y.dtype)
     _kernel_init()(x, y)
     if greyscale_mode:
         _kernel_connect(True)(x, y_shape, dirs, ndirs, x.ndim, y, size=y.size)
     else:
         _kernel_connect(False)(y_shape, dirs, ndirs, x.ndim, y, size=y.size)
+
+
+def _label(x, structure, y, greyscale_mode=False):
+    count = cupy.zeros(2, dtype=y.dtype)
+    _connect(x, structure, y, greyscale_mode)
     _kernel_count()(y, count, size=y.size)
     maxlabel = int(count[0])  # synchronize
     labels = cupy.empty(maxlabel, dtype=y.dtype)
     _kernel_labels()(y, count, labels, size=y.size)
     _kernel_finalize()(maxlabel, cupy.sort(labels), y, size=y.size)
     return maxlabel
+
+
+def _label_roots(x, structure, y, greyscale_mode=False):
+    """Like `_label`, but ``y`` holds the index of the root of each pixel.
+
+    The roots are not renumbered (-1 for background pixels), which skips the
+    sort and the host synchronization of `_label`. Two foreground pixels are
+    in the same region if and only if their entries are equal.
+    """
+    _connect(x, structure, y, greyscale_mode)
+    _kernel_flatten()(y, size=y.size)
 
 
 """
@@ -141,6 +174,20 @@ def _kernel_count():
         else atomicAdd(&count[0], 1);
         """,
         "cucim_skimage_measure_label_count",
+    )
+
+
+def _kernel_flatten():
+    return cupy.ElementwiseKernel(
+        "",
+        "raw Y y",
+        """
+        if (y[i] < 0) continue;
+        Y j = i;
+        while (j != y[j]) { j = y[j]; }
+        if (j != i) y[i] = j;
+        """,
+        "cucim_skimage_measure_label_flatten",
     )
 
 
