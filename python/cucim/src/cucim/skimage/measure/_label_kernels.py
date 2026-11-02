@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 """Kernels for scikit-image label.
@@ -137,8 +137,21 @@ def _kernel_connect(greyscale_mode=False, int_t="int"):
             if (y[k] < 0) continue;
             {x_condition}
             while (1) {{
-                while (j != y[j]) {{ j = y[j]; }}
-                while (k != y[k]) {{ k = y[k]; }}
+                // find the roots, halving the paths on the way
+                while (1) {{
+                    Y p = y[j];
+                    if (p == j) break;
+                    Y gp = y[p];
+                    if (gp != p) y[j] = gp;
+                    j = gp;
+                }}
+                while (1) {{
+                    Y p = y[k];
+                    if (p == k) break;
+                    Y gp = y[p];
+                    if (gp != p) y[k] = gp;
+                    k = gp;
+                }}
                 if (j == k) break;
                 if (j < k) {{
                     Y old = atomicCAS((atomic_t*)&y[k], k, j);
