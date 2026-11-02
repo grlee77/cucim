@@ -244,6 +244,7 @@ repos:
             ^python/cucim/src/cucim/skimage/segmentation/__init__[.]pyi$|
             ^python/cucim/src/cucim/skimage/segmentation/_chan_vese[.]py$|
             ^python/cucim/src/cucim/skimage/segmentation/_clear_border[.]py$|
+            ^python/cucim/src/cucim/skimage/segmentation/_flood_fill[.]py$|
             ^python/cucim/src/cucim/skimage/segmentation/_join[.]py$|
             ^python/cucim/src/cucim/skimage/segmentation/boundaries[.]py$|
             ^python/cucim/src/cucim/skimage/segmentation/morphsnakes[.]py$|
@@ -534,6 +535,7 @@ repos:
             python/cucim/src/cucim/skimage/segmentation/__init__[.]pyi$|
             python/cucim/src/cucim/skimage/segmentation/_chan_vese[.]py$|
             python/cucim/src/cucim/skimage/segmentation/_clear_border[.]py$|
+            python/cucim/src/cucim/skimage/segmentation/_flood_fill[.]py$|
             python/cucim/src/cucim/skimage/segmentation/_join[.]py$|
             python/cucim/src/cucim/skimage/segmentation/boundaries[.]py$|
             python/cucim/src/cucim/skimage/segmentation/morphsnakes[.]py$|
