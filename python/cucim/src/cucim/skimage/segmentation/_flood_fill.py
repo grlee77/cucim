@@ -23,6 +23,13 @@ from ..measure._label_kernels import (
     _use_blocks,
 )
 
+_set_where = cp.ElementwiseKernel(
+    "bool mask, T value",
+    "T image",
+    "if (mask) image = value",
+    "cucim_skimage_segmentation_flood_fill_set",
+)
+
 
 def _numeric_dtype_min_max(dtype):
     """Smallest and largest value of a dtype, as Python scalars."""
@@ -368,5 +375,13 @@ def flood_fill(
     )
     if not in_place:
         image = cp.array(image)
-    image[mask] = new_value
+    if cp.ndim(new_value) == 0:
+        # one elementwise pass, much cheaper than the boolean-mask assignment
+        if isinstance(new_value, cp.ndarray):
+            value = new_value.astype(image.dtype, copy=False)
+        else:
+            value = np.asarray(new_value, dtype=image.dtype)[()]
+        _set_where(mask, value, image)
+    else:
+        image[mask] = new_value
     return image
