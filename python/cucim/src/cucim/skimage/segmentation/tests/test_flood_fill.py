@@ -458,3 +458,43 @@ def test_winding_region():
     assert expected.sum() > n * n // 3
     result = flood(cp.asarray(image), (1, 1), connectivity=1)
     cp.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("dtype", [cp.uint8, cp.int32, cp.float32, cp.bool_])
+@pytest.mark.parametrize("new_value", [5.7, 0, 1, cp.asarray(3.2), np.int64(4)])
+def test_flood_fill_new_value_is_converted_like_an_assignment(dtype, new_value):
+    image = cp.zeros((6, 6), dtype=dtype)
+    image[:, 3] = 1
+    result = flood_fill(image, (0, 0), new_value)
+    mask = flood(image, (0, 0))
+    expected = image.copy()
+    expected[mask] = new_value
+    cp.testing.assert_array_equal(result, expected)
+    assert result.dtype == image.dtype
+
+
+def test_flood_fill_new_value_array():
+    # values that are not a scalar use the assignment (one value per pixel)
+    image = cp.zeros((4, 4), dtype=cp.int32)
+    mask = flood(image, (0, 0))
+    values = cp.arange(int(mask.sum()), dtype=cp.int32)
+    result = flood_fill(image, (0, 0), values)
+    expected = image.copy()
+    expected[mask] = values
+    cp.testing.assert_array_equal(result, expected)
+
+
+def test_flood_with_64_bit_labels(monkeypatch):
+    # images with 2**31 or more elements use 64-bit indices; check the paths
+    # (blocks and pixels) with a small image
+    import cucim.skimage.segmentation._flood_fill as module
+
+    rng = np.random.default_rng(0)
+    image = (rng.random((40, 37, 11)) < 0.6).astype(np.uint8)
+    seed = (20, 18, 5)
+    image[seed] = 1
+    monkeypatch.setattr(module, "_label_dtype_for_size", lambda size: cp.int64)
+    for connectivity in (1, 3):
+        expected = flood_cpu(image, seed, connectivity=connectivity)
+        result = flood(cp.asarray(image), seed, connectivity=connectivity)
+        cp.testing.assert_array_equal(result, expected)
