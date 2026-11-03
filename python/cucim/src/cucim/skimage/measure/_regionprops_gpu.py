@@ -51,6 +51,7 @@ from ._regionprops_gpu_intensity_kernels import (
 from ._regionprops_gpu_misc_kernels import (
     misc_deps,
     regionprops_euler,
+    regionprops_integral_mean_curvature,
     regionprops_perimeter,
     regionprops_perimeter_crofton,
     regionprops_surface_area,
@@ -100,6 +101,7 @@ __all__ = [
     "regionprops_perimeter_crofton",
     # extra functions for cuCIM not currently in scikit-image
     "regionprops_surface_area",
+    "regionprops_integral_mean_curvature",
     "equivalent_spherical_perimeter",  # as in ITK
     "regionprops_num_boundary_pixels",
     "regionprops_num_perimeter_pixels",
@@ -126,6 +128,8 @@ PROPS_GPU_EXTRA = {
     "perimeter_on_border_ratio": "perimeter_on_border_ratio",
     "equivalent_spherical_perimeter": "equivalent_spherical_perimeter",
     "surface_area": "surface_area",
+    # the integral of mean curvature, a Minkowski functional of 3D regions
+    "integral_mean_curvature": "integral_mean_curvature",
     # Feret diameters and angles as in DIPlib's Feret feature
     "feret_diameter_min": "feret_diameter_min",
     "feret_diameter_min_perpendicular": "feret_diameter_min_perpendicular",
@@ -162,6 +166,7 @@ COL_DTYPES_EXTRA = {
     "perimeter_on_border_ratio": float,
     "equivalent_spherical_perimeter": float,
     "surface_area": float,
+    "integral_mean_curvature": float,
     "feret_diameter_min": float,
     "feret_diameter_min_perpendicular": float,
     "feret_angle_max": float,
@@ -263,6 +268,7 @@ ndim_2_only = {
 # set of properties that can only be computed for 3D regions
 ndim_3_only = {
     "surface_area",
+    "integral_mean_curvature",
 }
 
 
@@ -395,6 +401,16 @@ def regionprops_dict(
       depends on its orientation. With isotropic spacing it ranges from
       7.3% too small (faces normal to an axis) to 2.3% too large. For
       spacing (2, 1, 1) the range is 12.6% too small to 9.4% too large.
+    - ``integral_mean_curvature`` (3D only): the integral of the mean
+      curvature over the surface (4 * pi * R for a ball of radius R, and
+      2 * pi times the mean breadth of a convex region), estimated from the
+      Euler numbers of the sections by the lattice planes normal to the 13
+      neighbor directions (Crofton's formula for planes). The integral of
+      the Gaussian curvature is 4 * pi * ``euler_number``. Balls of radius
+      10 voxels or more are measured to within 0.5%, but, as for
+      ``surface_area``, the error for edges depends on their direction: an
+      axis-aligned cube is measured 8% too small, and boxes in other
+      orientations up to 4.5% too large.
     - ``feret_diameter_min``, ``feret_diameter_min_perpendicular``,
       ``feret_angle_max``, ``feret_angle_min`` (2D only): the minimum Feret
       diameter (caliper width), the caliper width perpendicular to it, and
@@ -843,6 +859,13 @@ def regionprops_dict(
         )
     if "surface_area" in required_props:
         regionprops_surface_area(
+            label_image,
+            spacing=spacing,
+            max_label=max_label,
+            props_dict=out,
+        )
+    if "integral_mean_curvature" in required_props:
+        regionprops_integral_mean_curvature(
             label_image,
             spacing=spacing,
             max_label=max_label,

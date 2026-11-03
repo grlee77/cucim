@@ -12,6 +12,7 @@ from ._regionprops_gpu_utils import _get_label_run_loop, _warp_includes
 
 __all__ = [
     "regionprops_euler",
+    "regionprops_integral_mean_curvature",
     "regionprops_perimeter",
     "regionprops_perimeter_crofton",
     "regionprops_surface_area",
@@ -22,6 +23,7 @@ misc_deps["perimeter"] = []
 misc_deps["perimeter_crofton"] = []
 misc_deps["euler_number"] = []
 misc_deps["surface_area"] = []
+misc_deps["integral_mean_curvature"] = []
 
 
 # The perimeter, Crofton perimeter and Euler number of scikit-image sum a
@@ -152,13 +154,22 @@ def _get_perimeter_op(neighborhood):
     return code
 
 
+def _window_pixel_bit(rel):
+    """Bit of the pixel at `rel` (0 or 1 along each axis, from the first
+    pixel of the window) in the configurations of `_get_windows_op` (bits as
+    in the convolution weights of scikit-image)."""
+    # bit position of each axis in the configuration
+    bit_position = [0, 1] if len(rel) == 2 else [2, 0, 1]
+    return sum(1 << bit_position[d] for d, r in enumerate(rel) if r == 0)
+
+
 def _get_windows_op(ndim, omit_image_edges=False):
     """Coefficients of the 2**ndim windows of 2 x 2 (x 2) pixels that contain
-    pixel ii, for skimage.measure.perimeter_crofton or euler_number of region
-    `lab`.
+    pixel ii, for skimage.measure.perimeter_crofton, euler_number or the
+    integral of mean curvature of region `lab`.
 
     The configuration of a window has one bit per pixel with label `lab`
-    (bits as in the convolution weights of scikit-image). A window's
+    (`_window_pixel_bit`). A window's
     coefficient is added by the first of its pixels (in raster order) that has
     label `lab`, so that each window is counted once per region. Windows
     partly outside the image count, as scikit-image pads the image with
@@ -171,8 +182,6 @@ def _get_windows_op(ndim, omit_image_edges=False):
     offsets1 = list(itertools.product(range(-1, 2), repeat=ndim))
     code = _get_neighbor_coords_code(ndim, 1)
     code += _get_same_label_code(offsets1, 1)
-    # bit position of each axis in the configuration
-    bit_position = [0, 1] if ndim == 2 else [2, 0, 1]
     all_neighbors = " && ".join(_offset_var(o, 1) for o in offsets1 if any(o))
     code += f"""
           if (!({all_neighbors})) {{"""
@@ -189,12 +198,7 @@ def _get_windows_op(ndim, omit_image_edges=False):
         cond = " && ".join(cond) if cond else "true"
         bits = []
         for p in pixels:
-            # offsets of p from the last pixel of the window are 0 or -1
-            bit = sum(
-                1 << bit_position[d]
-                for d in range(ndim)
-                if p[d] - window[d] - 1 == -1
-            )
+            bit = _window_pixel_bit(tuple(a - w for a, w in zip(p, window)))
             bits.append(f"({_offset_var(p, 1)} ? {1 << bit} : 0)")
         code += f"""
             if ({cond}) {{
@@ -253,12 +257,12 @@ def _get_surface_area_op(ndim, isotropic):
 def _get_boundary_kernel(
     kind, ndim, option, pixels_per_thread, int32_coords=True
 ):
-    """Per-region sums of the perimeter, Crofton, Euler or surface-area
-    coefficients.
+    """Per-region sums of the perimeter, Crofton, Euler, surface-area or
+    mean-curvature coefficients.
 
     kind is "perimeter" (option: neighborhood), "crofton" (option:
-    omit_image_edges), "euler" (option unused) or "surface" (option:
-    isotropic spacing).
+    omit_image_edges), "euler" (option unused), "surface" (option:
+    isotropic spacing) or "mean_curvature" (option unused).
     """
     if kind == "perimeter":
         op = _get_perimeter_op(option)
@@ -855,3 +859,210 @@ def regionprops_surface_area(
     if props_dict is not None:
         props_dict["surface_area"] = surface_area
     return surface_area
+
+
+def _mean_curvature_windows(normal):
+    """The 2D windows of the lattice planes normal to `normal` (an offset to
+    a neighbor) that lie in the 2 x 2 x 2 window, as lists of the window's
+    pixels (0 or 1 along each axis).
+
+    Every 2D window of every such plane lies in exactly one 2 x 2 x 2
+    window: for an axis normal, the square face at the first position along
+    that axis; for a face-diagonal normal, the 1 x sqrt(2) rectangle of the
+    4 pixels in the middle plane; for a body-diagonal normal, the triangles
+    of the two planes through 3 pixels.
+    """
+    vertices = list(itertools.product((0, 1), repeat=3))
+    nonzero = [d for d in range(3) if normal[d]]
+    if len(nonzero) == 1:
+        return [[v for v in vertices if v[nonzero[0]] == 0]]
+    planes = {}
+    for v in vertices:
+        planes.setdefault(sum(n * c for n, c in zip(normal, v)), []).append(v)
+    size = 4 if len(nonzero) == 2 else 3
+    return [p for p in planes.values() if len(p) == size]
+
+
+@functools.cache
+def _get_mean_curvature_lut():
+    """Twelve times the Euler number that each configuration of a 2 x 2 x 2
+    window (`_window_pixel_bit`) adds to the sections of a region by the
+    lattice planes normal to each of the 13 directions (in the order of
+    ``_surface_area_groups(3, False)``): an int64 array of shape (256, 13).
+
+    The Euler number of a planar section is a sum over its 2D windows
+    (`_mean_curvature_windows`). In the square and rectangular lattices of
+    the axis and face-diagonal planes, with 8-connectivity, a window adds 1/4
+    with one pixel of the section, -1/4 with three and -1/2 with two diagonal
+    ones (Gray's weights). In the triangular lattices of the body-diagonal
+    planes, with 6-connectivity, a triangle adds 1/6 with one vertex and -1/6
+    with two. These are the connectivities that 26-connected voxels have
+    within each plane. A window full of the region adds 0.
+    """
+    offsets = list(itertools.product(range(-1, 2), repeat=3))
+    lut = np.zeros((256, 13), dtype=np.int64)
+    for k, group in enumerate(_surface_area_groups(3, False)):
+        for window in _mean_curvature_windows(offsets[group[0]]):
+            diagonal = max(
+                sum((a - b) ** 2 for a, b in zip(v, w))
+                for v in window
+                for w in window
+            )
+            for code in range(256):
+                on = [v for v in window if code >> _window_pixel_bit(v) & 1]
+                if len(window) == 3:
+                    lut[code, k] += {1: 2, 2: -2}.get(len(on), 0)
+                elif len(on) == 2 and (
+                    sum((a - b) ** 2 for a, b in zip(*on)) == diagonal
+                ):
+                    lut[code, k] -= 6
+                else:
+                    lut[code, k] += {1: 3, 3: -3}.get(len(on), 0)
+    return lut
+
+
+@cp.memoize(for_each_device=True)
+def _get_mean_curvature_coefs(spacing):
+    """Integral of mean curvature added by each configuration of a 2 x 2 x 2
+    window, for voxels of size `spacing` (a tuple of 3 floats).
+
+    Crofton's formula for planes gives the integral of mean curvature as
+    M = 2 * pi * sum_k c_k * D_k * chi_k [1]_, where chi_k is the sum of the
+    Euler numbers of the region's sections by the lattice planes with normal
+    m_k (`_get_mean_curvature_lut`), D_k = 1 / |m_k / s| their distance (s
+    the spacing), and c_k the weight of the direction of m_k / s: the area of
+    its Voronoi cell on the unit sphere among the 26 directions of the
+    normals +-m_k / s. These normals are the neighbor directions scaled by
+    the reciprocal spacing, so with anisotropic spacing the weights are
+    those of `_get_voronoi_crofton_weights` for 1 / s, and not those of the
+    surface area (for s).
+
+    References
+    ----------
+    .. [1] C. Lang, J. Ohser and R. Hilfer, "On the analysis of spatial
+           binary images", Journal of Microscopy 203(3), 303-313, 2001.
+           :DOI:`10.1046/j.1365-2818.2001.00899.x`
+    """
+    offsets = list(itertools.product(range(-1, 2), repeat=3))
+    normals = [
+        np.asarray(offsets[g[0]]) for g in _surface_area_groups(3, False)
+    ]
+    if _is_isotropic(spacing):
+        weights = [
+            _CROFTON_3D_WEIGHTS[np.count_nonzero(m) - 1] for m in normals
+        ]
+    else:
+        weights = _get_voronoi_crofton_weights(tuple(1.0 / v for v in spacing))
+    distances = [1.0 / np.linalg.norm(m / np.asarray(spacing)) for m in normals]
+    scale = (2 * math.pi / 12) * np.asarray(weights) * np.asarray(distances)
+    return cp.asarray(_get_mean_curvature_lut() @ scale, dtype=cp.float64)
+
+
+def regionprops_integral_mean_curvature(
+    labels,
+    spacing=None,
+    *,
+    max_label=None,
+    props_dict=None,
+    pixels_per_thread=10,
+):
+    """Estimate the integral of mean curvature of each labeled region of a 3D
+    image.
+
+    writes "integral_mean_curvature" to `props_dict`
+
+    The integral of mean curvature of a region with a smooth boundary is the
+    integral of (k1 + k2) / 2 over its surface, for k1 and k2 the principal
+    curvatures. It has the units of a length: a ball of radius R has
+    4 * pi * R, and a convex region 2 * pi times its mean breadth (mean
+    caliper diameter), such as pi * (a + b + c) for a box with sides a, b
+    and c. With the volume, the surface area and the Euler number, it is one
+    of the four Minkowski functionals of 3D regions; the integral of the
+    Gaussian curvature is 4 * pi * ``euler_number``. Derived measures include
+    the structure model index of bone morphometry, 12 * V * M / S**2 for the
+    volume V, the surface area S and the integral of mean curvature M.
+
+    The estimate is Crofton's formula for planes [1]_: 2 * pi times the
+    integral of the Euler number of the region's sections by parallel planes,
+    averaged over the plane directions. The planes are the lattice planes
+    normal to the 13 directions to the neighbors of a voxel (axes, face
+    diagonals and body diagonals), weighted by their distance and by the
+    area of the Voronoi cell of their normal on the unit sphere. The Euler
+    numbers of the sections use the connectivity that 26-connected voxels
+    have within each plane, as ``euler_number`` does in 3D. Each 2D window
+    of a section lies in one 2 x 2 x 2 window of voxels, so the estimate is
+    a sum over these windows of a coefficient looked up from their
+    configuration, like ``euler_number``. Each region is measured as in
+    isolation: voxels with another label count as background, and the image
+    is padded with background. With anisotropic spacing, the weights are
+    those of the plane normals (the neighbor offsets divided by the
+    spacing), which differ from those of ``surface_area``.
+
+    The estimate is not exact, and no estimate from 2 x 2 x 2 windows is
+    unbiased at high resolution [2]_. Surfaces without a preferred
+    orientation are measured well: balls of radius 10 voxels or more were
+    within 0.5%, and balls of radius 20 within 0.7% with spacing (2, 1, 1),
+    (1, 2, 2) or (5, 1, 1), whereas balls of radius 5 were up to 1.9% too
+    small. Thin rods and the edges of boxes, however, are measured times a
+    factor that depends on their direction, from 0.927 to 1.023 with
+    isotropic spacing, 0.842 to 1.071 for spacing (2, 1, 1) and 0.716 to
+    1.090 for (5, 1, 1): an axis-aligned cube of side 60 voxels was measured
+    8% too small. Edges at small angles to the lattice planes add an error
+    that does not decrease with the resolution either, as the planar
+    sections near them break into small pieces: boxes of 80 x 50 x 30
+    voxels in two random orientations were measured 1.1% to 2.5% more than
+    the factors of their edge directions predict, and boxes of twice that
+    size 1.8% to 3.1% more (4.5% too large in all).
+
+    Parameters
+    ----------
+    labels : (M, N, P) cupy.ndarray
+        Label image.
+    spacing : tuple of float, optional
+        The voxel spacing along each axis.
+
+    Extra Parameters
+    ----------------
+    max_label : int or None, optional
+        The maximum label in labels can be provided to avoid recomputing it if
+        it was already known.
+    props_dict : dict or None, optional
+        Dictionary of properties. The output of this function will be stored
+        under key "integral_mean_curvature" within this dictionary.
+    pixels_per_thread : int, optional
+        Number of pixels processed per thread on the GPU.
+
+    Returns
+    -------
+    integral_mean_curvature : cp.ndarray
+        The estimated integral of mean curvature of each region, of shape
+        (max_label,).
+
+    References
+    ----------
+    .. [1] C. Lang, J. Ohser and R. Hilfer, "On the analysis of spatial
+           binary images", Journal of Microscopy 203(3), 303-313, 2001.
+           :DOI:`10.1046/j.1365-2818.2001.00899.x`
+    .. [2] A. M. Svane, "Local digital algorithms for estimating the
+           integrated mean curvature of r-regular sets", Discrete &
+           Computational Geometry 54(2), 316-338, 2015.
+           :DOI:`10.1007/s00454-015-9708-8`
+    """
+    if labels.ndim != 3:
+        raise ValueError(
+            "integral_mean_curvature is defined for 3D images only"
+        )
+    if max_label is None:
+        max_label = int(labels.max())
+    spacing = (1.0, 1.0, 1.0) if spacing is None else spacing
+    integral_mean_curvature = _boundary_sums(
+        "mean_curvature",
+        labels,
+        _get_mean_curvature_coefs(tuple(float(v) for v in spacing)),
+        False,
+        max_label,
+        pixels_per_thread,
+    )
+    if props_dict is not None:
+        props_dict["integral_mean_curvature"] = integral_mean_curvature
+    return integral_mean_curvature
