@@ -70,6 +70,7 @@ from cucim.skimage.measure._regionprops_gpu_misc_kernels import (
     _CROFTON_3D_WEIGHTS,
     _get_boundary_kernel,
     _get_euler_coefs,
+    _get_mean_curvature_coefs,
     _get_perimeter_coefs,
     _get_perimeter_crofton_coefs,
     _get_voronoi_crofton_weights,
@@ -2042,6 +2043,157 @@ def test_surface_area_2d_raises():
         regionprops_dict(cp.ones((4, 4), cp.uint8), properties=["surface_area"])
 
 
+# one of each pair of opposite neighbor offsets: the 13 lattice-plane normals
+_PLANE_NORMALS = [
+    o for o in itertools.product((-1, 0, 1), repeat=3) if o > (0, 0, 0)
+]
+
+
+def _triangular_euler_number(section):
+    # vertices - edges + triangles of the triangular lattice whose neighbors
+    # are at (1, 0), (0, 1) and (1, -1)
+    b = np.pad(section, 1)
+    edges = (b[:-1] & b[1:]).sum() + (b[:, :-1] & b[:, 1:]).sum()
+    edges += (b[:-1, 1:] & b[1:, :-1]).sum()
+    triangles = (b[:-1, :-1] & b[1:, :-1] & b[:-1, 1:]).sum()
+    triangles += (b[1:, :-1] & b[:-1, 1:] & b[1:, 1:]).sum()
+    return int(b.sum() - edges + triangles)
+
+
+def _section_euler_sum(mask, normal):
+    # The sum of the Euler numbers of the sections of `mask` by the lattice
+    # planes normal to `normal`, plane by plane. The axes with negative
+    # components are flipped and the nonzero ones put first, so that the
+    # normal becomes (1, 0, 0), (1, 1, 0) or (1, 1, 1).
+    for d in range(3):
+        if normal[d] < 0:
+            mask = np.flip(mask, d)
+    nonzero = [d for d in range(3) if normal[d]]
+    mask = np.transpose(mask, nonzero + [d for d in range(3) if not normal[d]])
+    n0, n1, n2 = mask.shape
+    total = 0
+    if len(nonzero) == 1:
+        for plane in mask:
+            total += measure_cpu.euler_number(plane, connectivity=2)
+    elif len(nonzero) == 2:
+        # the plane i + j = c, a rectangular lattice indexed by (i, k)
+        i = np.arange(n0)
+        for c in range(n0 + n1 - 1):
+            ok = (c - i >= 0) & (c - i < n1)
+            plane = np.zeros((n0, n2), dtype=bool)
+            plane[i[ok]] = mask[i[ok], c - i[ok]]
+            total += measure_cpu.euler_number(plane, connectivity=2)
+    else:
+        # the plane i + j + k = c, a triangular lattice indexed by (i, j)
+        i, j = np.meshgrid(np.arange(n0), np.arange(n1), indexing="ij")
+        for c in range(n0 + n1 + n2 - 2):
+            k = c - i - j
+            ok = (k >= 0) & (k < n2)
+            plane = np.zeros((n0, n1), dtype=bool)
+            plane[ok] = mask[i[ok], j[ok], k[ok]]
+            total += _triangular_euler_number(plane)
+    return total
+
+
+def _mean_curvature_reference(labels, spacing):
+    # Crofton's formula for planes: 2 * pi * sum over the 13 normals m of the
+    # Voronoi weight of m / spacing, times the planes' distance
+    # 1 / |m / spacing|, times the sum of the Euler numbers of the sections
+    # (8-connected in square and rectangular lattices, 6-connected in
+    # triangular ones), for each region alone
+    scale = np.ones(3) if spacing is None else np.asarray(spacing, float)
+    weights = _crofton_weights_reference(1 / scale)
+    labels = cp.asnumpy(labels)
+    out = np.zeros(int(labels.max()))
+    for lab, box in enumerate(cpu_find_objects(labels), start=1):
+        if box is None:
+            continue
+        mask = labels[box] == lab
+        for m in _PLANE_NORMALS:
+            distance = 1 / np.linalg.norm(np.asarray(m) / scale)
+            chi = _section_euler_sum(mask, m)
+            out[lab - 1] += 2 * math.pi * weights[m] * distance * chi
+    return out
+
+
+@pytest.mark.parametrize("kind", ["random", "blobs"])
+@pytest.mark.parametrize("spacing", [None, (0.5, 1.5, 0.8)])
+@pytest.mark.parametrize("label_dtype", [cp.uint8, cp.int32])
+def test_integral_mean_curvature(kind, spacing, label_dtype):
+    labels = _convex_test_labels(kind, 3).astype(label_dtype)
+    result = regionprops_dict(
+        labels, properties=["integral_mean_curvature"], spacing=spacing
+    )["integral_mean_curvature"]
+    assert_allclose(
+        result, _mean_curvature_reference(labels, spacing), rtol=1e-12
+    )
+    # an absent label value has none
+    if kind == "random":
+        assert result[2] == 0
+
+
+@pytest.mark.parametrize("spacing", [None, (2.0, 1.0, 1.0), (1.0, 2.0, 2.0)])
+def test_integral_mean_curvature_box(spacing):
+    # Axis-aligned boxes: every section by a lattice plane that meets the box
+    # is connected and has no holes, so the Euler numbers of the sections sum
+    # to the number of planes that meet the box. For a box of n0 x n1 x n2
+    # voxels, that is n_a for the axis a, n_a + n_b - 1 for the face
+    # diagonals of the axes a and b, and n0 + n1 + n2 - 2 for the body
+    # diagonals.
+    scale = np.ones(3) if spacing is None else np.asarray(spacing, float)
+    weights = _crofton_weights_reference(1 / scale)
+    for size in [(60, 60, 60), (8, 120, 120), (120, 12, 12), (24, 40, 64)]:
+        n = np.asarray(size)
+        labels = np.zeros(tuple(n + 4), dtype=np.uint8)
+        labels[tuple(slice(2, 2 + k) for k in n)] = 1
+        result = regionprops_dict(
+            cp.asarray(labels),
+            properties=["integral_mean_curvature"],
+            spacing=spacing,
+        )["integral_mean_curvature"][0]
+        expected = 0.0
+        for m in _PLANE_NORMALS:
+            axes = np.flatnonzero(m)
+            planes = n[axes].sum() - (axes.size - 1)
+            distance = 1 / np.linalg.norm(np.asarray(m) / scale)
+            expected += 2 * math.pi * weights[m] * distance * planes
+        assert_allclose(result, expected, rtol=1e-12)
+        if spacing is None and size == (60, 60, 60):
+            # pi * (a + b + c) for a box, times about 0.927, the factor of
+            # edges along the axes (8% too small)
+            ratio = float(result) / (math.pi * 180)
+            assert 0.91 < ratio < 0.927
+
+
+@pytest.mark.parametrize("spacing", [None, (2.0, 1.0, 1.0)])
+def test_integral_mean_curvature_ball(spacing):
+    # close to 4 * pi * R for a digitized ball of radius R (in physical
+    # units), centered off the voxel grid
+    scale = np.ones(3) if spacing is None else np.asarray(spacing, float)
+    radius = 20
+    shape = [int(2 * radius / s) + 6 for s in scale]
+    center = (np.asarray(shape) // 2 + np.array([0.3, 0.6, 0.45])) * scale
+    grid = np.meshgrid(
+        *(np.arange(n) * s for n, s in zip(shape, scale)),
+        indexing="ij",
+        sparse=True,
+    )
+    inside = sum((g - c) ** 2 for g, c in zip(grid, center)) <= radius**2
+    result = regionprops_dict(
+        cp.asarray(inside.astype(np.uint8)),
+        properties=["integral_mean_curvature"],
+        spacing=spacing,
+    )["integral_mean_curvature"]
+    assert_allclose(result, 4 * math.pi * radius, rtol=0.005)
+
+
+def test_integral_mean_curvature_2d_raises():
+    with pytest.raises(ValueError, match="3D label images only"):
+        regionprops_dict(
+            cp.ones((4, 4), cp.uint8), properties=["integral_mean_curvature"]
+        )
+
+
 @pytest.mark.parametrize("granularity", [1, 2, 3, 5])
 @pytest.mark.parametrize("label_dtype", [cp.uint8, cp.int32])
 def test_boundary_properties_touching_labels(granularity, label_dtype):
@@ -2089,7 +2241,14 @@ def test_boundary_properties_touching_labels(granularity, label_dtype):
 
 @pytest.mark.parametrize("int32_coords", [True, False])
 @pytest.mark.parametrize(
-    "kind, ndim", [("perimeter", 2), ("crofton", 2), ("euler", 2), ("euler", 3)]
+    "kind, ndim",
+    [
+        ("perimeter", 2),
+        ("crofton", 2),
+        ("euler", 2),
+        ("euler", 3),
+        ("mean_curvature", 3),
+    ],
 )
 def test_boundary_kernel_coordinate_types(kind, ndim, int32_coords):
     # images of fewer than 2**31 pixels use 32-bit coordinates, larger ones
@@ -2107,6 +2266,9 @@ def test_boundary_kernel_coordinate_types(kind, ndim, int32_coords):
     elif kind == "crofton":
         coefs, option = _get_perimeter_crofton_coefs(4), False
         expected = [measure_cpu.perimeter_crofton(m, 4) for m in masks]
+    elif kind == "mean_curvature":
+        coefs, option = _get_mean_curvature_coefs((1.0, 1.0, 1.0)), False
+        expected = _mean_curvature_reference(labels, None)
     else:
         coefs, option = _get_euler_coefs(ndim, 1), False
         expected = [measure_cpu.euler_number(m, 1) for m in masks]
