@@ -152,6 +152,12 @@ def flood(
     pass the test and keeping the one that contains the seed, so the time
     depends on the size of `image` and not on the size of the filled region.
 
+    A faster implementation, which works on 2 x 2 (or 2 x 2 x 2) blocks of
+    pixels, is used for 2D and 3D images when the neighbors are the full
+    connectivity (``connectivity=None``, or ``connectivity=image.ndim``, with
+    no `footprint` or one that is all ones with size 3 along each axis). It
+    is typically 2 to 6 times faster than the general implementation.
+
     Differences from scikit-image:
 
     - `footprint` must be symmetric about its center. A footprint that is not
