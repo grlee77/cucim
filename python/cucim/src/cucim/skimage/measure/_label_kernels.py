@@ -21,17 +21,20 @@ _RUN_WIDTH = 128
 def _half_structure_dirs(structure):
     """Offsets of the neighbors that precede each pixel in raster order.
 
-    The structure must be centro-symmetric and have 3 elements along each axis.
+    The structure must be centro-symmetric. The offsets are relative to the
+    center ``shape // 2`` of the structure, so structures larger than 3 along
+    an axis (non-adjacent neighbors) are supported.
     """
     structure = numpy.asarray(structure)
-    elems = numpy.where(structure != 0)
-    vecs = [elems[dm] - 1 for dm in range(structure.ndim)]
-    offset = vecs[0]
-    for dm in range(1, structure.ndim):
-        offset = offset * 3 + vecs[dm]
-    indxs = numpy.where(offset < 0)[0]
-    dirs = [[vecs[dm][dr] for dm in range(structure.ndim)] for dr in indxs]
-    return numpy.array(dirs, dtype=numpy.int32).reshape(-1, structure.ndim)
+    center = [s // 2 for s in structure.shape]
+    elems = numpy.nonzero(structure)
+    offsets = numpy.stack(
+        [elems[dm] - center[dm] for dm in range(structure.ndim)], axis=1
+    )
+    # An offset precedes the center if its first nonzero entry is negative
+    # (the raveled offset is negative).
+    keep = [o for o in offsets if (o[o != 0][:1] < 0).any()]
+    return numpy.array(keep, dtype=numpy.int32).reshape(-1, structure.ndim)
 
 
 def _use_blocks(x, structure, greyscale_mode):
@@ -113,6 +116,20 @@ def _label_blocks(x, y):
     return maxlabel
 
 
+def _label_roots_blocks(x, y):
+    """`_label_roots` for the block kernels."""
+    shape, bshape, nblocks, occupancy = _connect_blocks(x, y)
+    ndim = x.ndim
+    count = cupy.zeros(2, dtype=y.dtype)
+    block_root = cupy.empty(nblocks, dtype=y.dtype)
+    _kernel_block_flatten(ndim)(
+        *shape, *bshape, occupancy, y, block_root, count, size=nblocks
+    )
+    _kernel_block_write_roots(ndim)(
+        *shape, *bshape, occupancy, block_root, y, size=nblocks
+    )
+
+
 def _label(x, structure, y, greyscale_mode=False):
     if _use_blocks(x, structure, greyscale_mode):
         try:
@@ -131,6 +148,20 @@ def _label(x, structure, y, greyscale_mode=False):
     _kernel_labels()(y, count, labels, size=y.size)
     _kernel_finalize()(maxlabel, cupy.sort(labels), y, size=y.size)
     return maxlabel
+
+
+def _label_roots(x, structure, y, greyscale_mode=False):
+    """Like `_label`, but ``y`` holds the index of the root of each pixel.
+
+    The roots are not renumbered (-1 for background pixels), which skips the
+    sort and the host synchronization of `_label`. Two foreground pixels are
+    in the same region if and only if their entries are equal.
+    """
+    if _use_blocks(x, structure, greyscale_mode):
+        _label_roots_blocks(x, y)
+        return
+    _connect(x, structure, y, greyscale_mode)
+    _kernel_flatten()(y, size=y.size)
 
 
 def _use_face_connected_runs(x, structure, y):
@@ -727,11 +758,30 @@ def _kernel_block_finalize(ndim):
     )
 
 
-def _kernel_count():
-    return cupy.ElementwiseKernel(
-        "",
-        "raw Y y, raw Y count",
+@functools.cache
+def _kernel_block_write_roots(ndim):
+    """Write the root of the block of each pixel (-1 for the background)."""
+    coords, origin = _block_code(ndim)
+    store = "\n        ".join(
+        f"if ({inside}) y[{index}] = ((occ >> {bit}) & 1) ? root : -1;"
+        for bit, inside, index in _block_pixel_indices(ndim)
+    )
+    code = f"""
+        unsigned int occ = occupancy[i];
+        {coords}
+        Y origin = {origin};
+        Y root = occ != 0 ? block_root[i] : -1;
+        {store}
         """
+    return cupy.ElementwiseKernel(
+        _block_params(ndim) + ", raw Y block_root",
+        "raw Y y",
+        code,
+        "cucim_skimage_measure_label_block_write_roots",
+    )
+
+
+_FLATTEN_PARENTS = """
         Y j = i;
         Y parent = load_parent(&y[j]);
         if (parent < 0) continue;
@@ -740,9 +790,25 @@ def _kernel_count():
             parent = load_parent(&y[j]);
         }
         if (j != i) store_parent(&y[i], j);
-        else atomicAdd(&count[0], 1);
-        """,
+"""
+
+
+def _kernel_count():
+    return cupy.ElementwiseKernel(
+        "",
+        "raw Y y, raw Y count",
+        _FLATTEN_PARENTS + "else atomicAdd(&count[0], 1);",
         "cucim_skimage_measure_label_count",
+        preamble=_PARENT_ATOMICS,
+    )
+
+
+def _kernel_flatten():
+    return cupy.ElementwiseKernel(
+        "",
+        "raw Y y",
+        _FLATTEN_PARENTS,
+        "cucim_skimage_measure_label_flatten",
         preamble=_PARENT_ATOMICS,
     )
 
