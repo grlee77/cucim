@@ -227,6 +227,12 @@ def flood(
             "try upcasting to float32"
         )
 
+    if image.dtype == cp.bool_:
+        # Like scikit-image, work on the bytes of a boolean image, so that a
+        # fractional bound of the tolerance is truncated to 0 or 1 and not
+        # converted to True.
+        image = image.view(cp.uint8)
+
     seed_point = _resolve_seed_point(seed_point, image.shape)
     structure = _resolve_structure(footprint, connectivity, image.ndim)
 

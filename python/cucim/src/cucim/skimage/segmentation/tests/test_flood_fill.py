@@ -5,7 +5,7 @@
 import cupy as cp
 import numpy as np
 import pytest
-from skimage.morphology import flood as flood_cpu
+from skimage.morphology import flood as flood_cpu, flood_fill as flood_fill_cpu
 
 from cucim.skimage.segmentation import flood, flood_fill
 
@@ -498,3 +498,53 @@ def test_flood_with_64_bit_labels(monkeypatch):
         expected = flood_cpu(image, seed, connectivity=connectivity)
         result = flood(cp.asarray(image), seed, connectivity=connectivity)
         cp.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "shape, footprint",
+    [
+        ((3,), np.array([False, True, False])),
+        ((5, 6), np.array([[False] * 3, [False, True, False], [False] * 3])),
+        ((4, 5), np.ones((1, 1), dtype=bool)),
+    ],
+)
+def test_footprint_with_only_its_center(shape, footprint):
+    # no neighbors: only the pixel of the seed (and equal pixels are not
+    # connected to it)
+    image = cp.ones(shape, dtype=cp.uint8)
+    seed = (1,) * len(shape)
+    expected = flood_cpu(cp.asnumpy(image), seed, footprint=footprint)
+    result = flood(image, seed, footprint=footprint)
+    np.testing.assert_array_equal(cp.asnumpy(result), expected)
+    assert expected.sum() == 1
+    filled = flood_fill(image, seed, 7, footprint=footprint)
+    assert int((filled == 7).sum()) == 1
+
+
+@pytest.mark.parametrize("seed_value", [0, 1])
+@pytest.mark.parametrize("tolerance", [None, 0, 0.5, 1, 1.5])
+@pytest.mark.parametrize("ndim", [1, 2, 3])
+def test_boolean_image_with_fractional_tolerance(ndim, tolerance, seed_value):
+    # scikit-image works on the bytes of a boolean image, so a fractional
+    # bound is truncated to an integer (it is not converted to True)
+    rng = np.random.default_rng({1: 0, 2: 1, 3: 2}[ndim])
+    shape = {1: (40,), 2: (24, 25), 3: (10, 11, 12)}[ndim]
+    image = rng.random(shape) < 0.5
+    seed = tuple(np.argwhere(image == bool(seed_value))[0])
+    expected = flood_cpu(image, seed, tolerance=tolerance)
+    result = flood(cp.asarray(image), seed, tolerance=tolerance)
+    np.testing.assert_array_equal(cp.asnumpy(result), expected)
+    expected_filled = flood_fill_cpu(image, seed, True, tolerance=tolerance)
+    filled = flood_fill(cp.asarray(image), seed, True, tolerance=tolerance)
+    np.testing.assert_array_equal(cp.asnumpy(filled), expected_filled)
+
+
+def test_boolean_image_fractional_tolerance_example():
+    image = cp.asarray([False, True, False, True])
+    assert flood(image, 0, tolerance=0.5).tolist() == [
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert flood(image, 3, tolerance=0.5).tolist() == [True, True, True, True]

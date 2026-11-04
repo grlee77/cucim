@@ -279,7 +279,11 @@ def _neighbor_code(ndim, dirs):
     the image and the expression of its index offset.
     """
     table = ", ".join(str(d) for dirvec in dirs for d in dirvec)
-    declaration = f"static const int dirs[{len(dirs) * ndim}] = {{{table}}};"
+    # (a footprint that contains only its center has no neighbors, and an
+    # array of size 0 is not legal in CUDA C++; the loops over the neighbors
+    # are then empty)
+    size = max(len(dirs) * ndim, 1)
+    declaration = f"static const int dirs[{size}] = {{{table or '0'}}};"
     coords = "\n        ".join(
         ["Y rest = i;", "Y stride = 1;"]
         + [
