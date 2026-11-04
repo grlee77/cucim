@@ -396,10 +396,13 @@ def regionprops_dict(
       Euler numbers of the sections by the lattice planes normal to the 13
       neighbor directions (Crofton's formula for planes). The integral of
       the Gaussian curvature is 4 * pi * ``euler_number``. Balls of radius
-      10 voxels or more are measured to within 0.5%, but, as for
-      ``surface_area``, the error for edges depends on their direction: an
-      axis-aligned cube is measured 8% too small, and boxes in other
-      orientations up to 4.5% too large.
+      10 voxels or more digitized at random sub-voxel centers are measured
+      to within 0.5%, but a ball centered on a voxel is measured less well
+      (``skimage.morphology.ball`` of radius 10 is 2.8% too large and of
+      radius 20 0.9% too large), because lattice points on the sphere add
+      single-voxel bumps. As for ``surface_area``, the error for edges
+      depends on their direction: an axis-aligned cube is measured 8% too
+      small, and boxes in other orientations up to 4.5% too large.
     - ``feret_diameter_min``, ``feret_diameter_min_perpendicular``,
       ``feret_angle_max``, ``feret_angle_min`` (2D only): the minimum Feret
       diameter (caliper width), the caliper width perpendicular to it, and
