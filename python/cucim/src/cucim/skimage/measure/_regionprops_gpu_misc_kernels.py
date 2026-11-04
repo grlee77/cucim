@@ -1000,10 +1000,13 @@ def regionprops_integral_mean_curvature(
 
     The estimate is not exact, and no estimate from 2 x 2 x 2 windows is
     unbiased at high resolution [2]_. Surfaces without a preferred
-    orientation are measured well: balls of radius 10 voxels or more were
-    within 0.5%, and balls of radius 20 within 0.7% with spacing (2, 1, 1),
-    (1, 2, 2) or (5, 1, 1), whereas balls of radius 5 were up to 1.9% too
-    small. Thin rods and the edges of boxes, however, are measured times a
+    orientation are measured well: balls of radius 10 voxels or more at
+    random sub-voxel centers were within 0.5%, and balls of radius 20 within
+    0.7% with spacing (2, 1, 1), (1, 2, 2) or (5, 1, 1), whereas balls of
+    radius 5 were up to 1.9% too small. Balls centered on a voxel are
+    measured less well, as lattice points on the sphere add single-voxel
+    bumps (``skimage.morphology.ball`` of radius 10 is 2.8% too large and of
+    radius 20 0.9% too large). Thin rods and the edges of boxes, however, are measured times a
     factor that depends on their direction, from 0.927 to 1.023 with
     isotropic spacing, 0.842 to 1.071 for spacing (2, 1, 1) and 0.716 to
     1.090 for (5, 1, 1): an axis-aligned cube of side 60 voxels was measured
