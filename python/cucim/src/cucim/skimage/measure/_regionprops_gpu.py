@@ -382,7 +382,8 @@ def regionprops_dict(
       ``perimeter_on_border_ratio``, ``equivalent_spherical_perimeter``: as
       in ITK.
     - ``surface_area`` (3D only): the Crofton estimate of the surface area
-      with 13 directions, as ITK's ``Perimeter`` of 3D objects. Unlike ITK,
+      with 13 directions [1]_, [2]_, [3]_, as ITK's ``Perimeter`` of 3D
+      objects. Unlike ITK,
       cuCIM recomputes the direction weights for anisotropic spacing. The
       estimate is not exact, and its error does not decrease as the
       resolution increases. Balls of radius 20 voxels or more are measured
@@ -394,9 +395,10 @@ def regionprops_dict(
       curvature over the surface (4 * pi * R for a ball of radius R, and
       2 * pi times the mean breadth of a convex region), estimated from the
       Euler numbers of the sections by the lattice planes normal to the 13
-      neighbor directions (Crofton's formula for planes). The integral of
-      the Gaussian curvature is 4 * pi * ``euler_number``. Balls of radius
-      10 voxels or more digitized at random sub-voxel centers are measured
+      neighbor directions (Crofton's formula for planes) [2]_, [4]_. The
+      integral of the Gaussian curvature is 4 * pi * ``euler_number``.
+      Balls of radius 10 voxels or more digitized at random sub-voxel
+      centers are measured
       to within 0.5%, but a ball centered on a voxel is measured less well
       (``skimage.morphology.ball`` of radius 10 is 2.8% too large and of
       radius 20 0.9% too large), because lattice points on the sphere add
@@ -431,6 +433,23 @@ def regionprops_dict(
       and cubes, the axes (and so the box) are not unique, and the box can
       be much larger: a square rotated by 45 degrees can get an
       axis-aligned box of twice its area.
+
+    References
+    ----------
+    .. [1] G. Lehmann and D. Legland, "Efficient N-dimensional surface
+           estimation using Crofton formula and run-length encoding", The
+           Insight Journal, 2012. :DOI:`10.54294/wdu86d`
+    .. [2] C. Lang, J. Ohser and R. Hilfer, "On the analysis of spatial
+           binary images", Journal of Microscopy 203(3), 303-313, 2001.
+           :DOI:`10.1046/j.1365-2818.2001.00899.x`
+    .. [3] J. Ziegel and M. Kiderlen, "Estimation of surface area and
+           surface area measure of three-dimensional sets from
+           digitizations", Image and Vision Computing 28(1), 64-77, 2010.
+           :DOI:`10.1016/j.imavis.2009.04.013`
+    .. [4] A. M. Svane, "Local digital algorithms for estimating the
+           integrated mean curvature of r-regular sets", Discrete &
+           Computational Geometry 54(2), 316-338, 2015.
+           :DOI:`10.1007/s00454-015-9708-8`
     """
     if convex_hull_3d not in ("gpu", "qhull"):
         raise ValueError(
