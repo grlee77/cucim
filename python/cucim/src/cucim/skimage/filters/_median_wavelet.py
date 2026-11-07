@@ -1,8 +1,8 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Wavelet matrix-based median filter implementation for cuCIM.
+Wavelet matrix-based rank (median) filter implementation for cuCIM.
 
 This module provides a fast GPU-based median filter using the wavelet matrix
 algorithm described in:
@@ -11,7 +11,9 @@ algorithm described in:
   December 2022. https://doi.org/10.1145/3550454.3555512
 
 The wavelet matrix approach is faster than histogram-based methods, especially
-for larger kernel sizes and higher bit-depth images.
+for larger kernel sizes and higher bit-depth images. The same data structure
+answers any rank query, so `_median_wavelet_filter` accepts a ``rank`` (the
+median is the default).
 
 The implementation here was adapted from the MIT-licensed one provided by the
 authors at:
@@ -19,6 +21,20 @@ https://github.com/TumoiYorozu/WMatrixMedian?tab=readme-ov-file
 
 That same implementation was also contributed to Open-CV in the following PR:
 https://github.com/opencv/opencv_contrib/pull/3627
+
+Data flow
+---------
+1. Pad the image (``mode``/``cval``) by the filter radii.
+2. Convert the values to unsigned integer keys that sort like the values
+   (`_to_keys`).
+3. Build the value wavelet matrix: one bit vector per key bit, with the
+   elements stably partitioned by that bit (most significant bit first).
+4. For every value level also build a *column* wavelet matrix over the column
+   indices of the elements in that level's order (one bit vector per bit of
+   the column index). Counting how many elements of a pixel window have a 0 at
+   the current value bit is then a rank query on these.
+5. One thread per output pixel selects the element of the requested rank by
+   walking the value levels from the most significant bit down.
 """
 
 import os
@@ -33,18 +49,102 @@ from cucim.skimage._shared.utils import _to_np_mode
 # Constants
 # =============================================================================
 
-# Default kernel configuration
 WM_WARP_SIZE = 32
-WM_WORD_SIZE = 32  # 32-bit bitvector words
+WM_WORD_SIZE = 32  # bits per bit vector word (BlockT::nbit)
+WM_BLOCK_T_SIZE = 8  # sizeof(BlockT): 4 bytes prefix count + 4 bytes word
 WM_THREAD_PER_GRID = 512  # Threads per block for construction
 WM_MAX_BLOCK_X = 1024  # Maximum grid X dimension
+WM_SRC_CACHE_DIV = 2  # Shared memory caching factor of the up-sweep
 
 # Median query kernel thread configuration
 WM_THREADS_W = 8  # Threads per block in X for median query
 WM_THREADS_H = 64  # Threads per block in Y for median query
 
+# Column indices are stored as uint16
+WM_MAX_PADDED_WIDTH = 65534
+
 # CuPy compilation options for CUB
 CUB_COMPILE_OPTIONS = ("--std=c++17", "-DCUB_DISABLE_BF16_SUPPORT")
+
+_KERNEL_DIR = os.path.join(os.path.dirname(__file__), "cuda")
+
+_CUDA_TYPES = {
+    np.dtype(np.uint8): "unsigned char",
+    np.dtype(np.uint16): "unsigned short",
+    np.dtype(np.uint32): "unsigned int",
+}
+
+_SUPPORTED_MODES = ("constant", "nearest", "reflect", "mirror", "wrap")
+
+# =============================================================================
+# Value handling
+# =============================================================================
+
+
+def _uses_rank_mode(dtype):
+    """True if values must be replaced by their ranks in the sorted image.
+
+    Types of up to 16 bits are mapped to order-preserving unsigned keys
+    (`_to_keys`), which have at most 16 matrix levels. For wider types the
+    ranks need fewer levels (about log2 of the number of pixels, e.g. 22 for
+    a 2048 x 2048 image instead of 32 or 64), and ranking the image by sorting
+    it is cheaper than the extra levels: measured on an RTX A6000, a 2048 x
+    2048 uint32 or float32 image takes 22 ms with ranks and 30 ms with 32-bit
+    keys.
+    """
+    return np.dtype(dtype).itemsize > 2
+
+
+def _key_dtype(dtype):
+    """Unsigned dtype of the keys stored in the matrix for ``dtype``."""
+    dtype = np.dtype(dtype)
+    if _uses_rank_mode(dtype):
+        return np.dtype(np.uint32)
+    return np.dtype(f"u{dtype.itemsize}")
+
+
+def _to_keys(image):
+    """Map an image of up to 16 bits per value to unsigned integer keys.
+
+    The mapping is monotonic (``a < b`` implies ``key(a) < key(b)``), so
+    ranks of keys equal ranks of values. Signed integers get their sign bit
+    flipped. Floats are mapped with the usual IEEE trick (flip the sign bit of
+    non-negative values, all bits of negative ones); NaNs sort last like
+    ``numpy.sort``. ``-0.0`` sorts just before ``0.0`` (it compares equal).
+    """
+    dtype = image.dtype
+    if dtype.kind == "u":
+        return image
+    udt = np.dtype(f"u{dtype.itemsize}")
+    sign = udt.type(1 << (dtype.itemsize * 8 - 1))
+    u = image.view(udt)
+    if dtype.kind == "i":
+        return u ^ sign
+    keys = cp.where((u & sign) != 0, ~u, u | sign)
+    return cp.where(cp.isnan(image), udt.type(np.iinfo(udt).max), keys)
+
+
+def _from_keys(keys, dtype):
+    """Inverse of `_to_keys` (NaNs come back as NaNs)."""
+    dtype = np.dtype(dtype)
+    if dtype.kind == "u":
+        return keys
+    sign = keys.dtype.type(1 << (dtype.itemsize * 8 - 1))
+    if dtype.kind == "i":
+        return (keys ^ sign).view(dtype)
+    return cp.where((keys & sign) != 0, keys ^ sign, ~keys).view(dtype)
+
+
+def _to_ranks(image):
+    """Replace each value by its (unique) rank in the sorted image.
+
+    Returns the uint32 ranks and the sorted values for the final lookup.
+    """
+    flat = image.ravel()
+    order = cp.argsort(flat)
+    ranks = cp.empty(flat.size, dtype=cp.uint32)
+    ranks[order] = cp.arange(flat.size, dtype=cp.uint32)
+    return ranks.reshape(image.shape), flat[order]
 
 
 # =============================================================================
@@ -58,96 +158,13 @@ def _div_ceil(a, b):
 
 
 def _get_bit_len(val):
-    """
-    Compute the number of bits needed to represent a value.
-
-    Returns ceil(log2(val + 1)).
-    For val=0 returns 1, val=1 returns 1, val=255 returns 8, val=256 returns 9.
-    """
-    if val <= 0:
-        return 1
-    return val.bit_length()
+    """Number of bits needed to represent ``val`` (at least 1)."""
+    return max(int(val).bit_length(), 1)
 
 
 def _next_power_of_2(v):
     """Round up to the next power of 2."""
-    v -= 1
-    v |= v >> 1
-    v |= v >> 2
-    v |= v >> 4
-    v |= v >> 8
-    v |= v >> 16
-    v += 1
-    return v
-
-
-def _dtype_to_cuda_type(dtype):
-    """Convert numpy/cupy dtype to CUDA type string."""
-    dtype = np.dtype(dtype)
-    type_map = {
-        np.uint8: "unsigned char",
-        np.uint16: "unsigned short",
-        np.uint32: "unsigned int",
-        np.uint64: "unsigned long long",
-        np.int8: "signed char",
-        np.int16: "short",
-        np.int32: "int",
-        np.int64: "long long",
-        np.float16: "half",
-        np.float32: "float",
-        np.float64: "double",
-    }
-    if dtype.type not in type_map:
-        raise ValueError(f"Unsupported dtype: {dtype}")
-    return type_map[dtype.type]
-
-
-def _get_val_bit_len(dtype, total_pixels=None):
-    """
-    Get the number of bits for a value type.
-
-    For small unsigned integer types (uint8, uint16, uint32), this is the bit width.
-    For types using rank mode (floats, signed ints, uint64), we use ranks
-    (0 to total_pixels-1), so we need ceil(log2(total_pixels)) bits.
-
-    Parameters
-    ----------
-    dtype : numpy dtype
-        The data type
-    total_pixels : int, optional
-        Total number of pixels (required for rank-mode types)
-
-    Returns
-    -------
-    bit_len : int
-        Number of bits needed
-    """
-    dtype = np.dtype(dtype)
-    # For rank-based types, use ceil(log2(total_pixels))
-    if _uses_rank_mode(dtype):
-        if total_pixels is None:
-            raise ValueError(f"total_pixels required for {dtype}")
-        return _get_bit_len(total_pixels)
-    return dtype.itemsize * 8
-
-
-def _uses_rank_mode(dtype):
-    """Check if dtype requires rank mode (sorting + rank lookup).
-
-    This is used for dtypes where direct bit representation is impractical:
-    - float16/32/64: Can't use bitwise operations for median
-    - int8/16/32/64: Sign bit would cause incorrect ordering
-    - uint64: 64 bit levels would be too slow, use ranks instead
-    """
-    dtype = np.dtype(dtype)
-    # All floats need rank mode (bit patterns don't match value ordering)
-    # All signed ints need rank mode (sign bit causes incorrect ordering)
-    # uint64 needs rank mode (64 bit levels would be too slow)
-    return dtype.kind in ("f", "i") or dtype == np.uint64
-
-
-# Keep old name for backward compatibility
-_is_float_mode = _uses_rank_mode
+    return 1 << (v - 1).bit_length() if v > 1 else 1
 
 
 # =============================================================================
@@ -162,280 +179,103 @@ def _get_block_pair_num(
     warp_size=WM_WARP_SIZE,
 ):
     """
-    Compute the number of block pairs for wavelet matrix construction.
-
-    This determines how many elements each thread block processes during
-    the wavelet matrix construction phase.
-
-    Parameters
-    ----------
-    size : int
-        Total number of elements (H * W, rounded up to word size multiple)
-    thread_per_grid : int
-        Threads per block
-    max_block_x : int
-        Maximum grid X dimension
-    warp_size : int
-        Warp size (32)
-
-    Returns
-    -------
-    block_pair_num : int
-        Number of block pairs
+    Number of warp-rows (of ``warp_size`` elements) each construction block
+    processes, chosen so that a block handles a multiple of 65536 elements
+    once the image is large (or a power of two number of rows otherwise).
     """
-    # Make pixels assigned per grid a multiple of 65536
-    x_chunk = 65536 // thread_per_grid // warp_size
-    if x_chunk <= 0:
-        x_chunk = 1
+    x_chunk = max(65536 // thread_per_grid // warp_size, 1)
 
     total_gridx = _div_ceil(size, thread_per_grid * warp_size)
     block_pair_num = _div_ceil(total_gridx, max_block_x)
 
     if block_pair_num <= x_chunk:
-        # Round up to next power of 2
         block_pair_num = _next_power_of_2(block_pair_num)
     else:
-        # Round up to multiple of x_chunk
         block_pair_num = _div_ceil(block_pair_num, x_chunk) * x_chunk
 
-    block_pair_num *= warp_size
-    return block_pair_num
+    return block_pair_num * warp_size
 
 
-def _compute_buffer_sizes(
-    height,
-    width,
-    dtype,
-    word_size=WM_WORD_SIZE,
-    thread_per_grid=WM_THREAD_PER_GRID,
-):
-    """
-    Compute buffer sizes needed for wavelet matrix construction and query.
+BufferSizes = namedtuple(
+    "WaveletMatrixBufferSizes",
+    [
+        "size",  # Padded total pixels (multiple of the word size)
+        "val_bit_len",  # Bits per value
+        "w_bit_len",  # Bits for column index
+        "bv_block_len",  # BlockT entries per bit level
+        "bv_block_bytes_div32",  # Bytes of the value bit vectors / 32
+        "wm_bv_block_bytes_div32",  # Bytes of the column bit vectors / 32
+        "block_pair_num",  # Warp-rows per construction block
+        "nsum_scan_buf_len",  # Scan buffer length
+        "buf_bytes_div32",  # Working buffer bytes / 32
+        "nsum_pos",  # Index of the BlockT holding the total count
+        "grid_x",  # Grid X for construction
+    ],
+)
 
-    Parameters
-    ----------
-    height : int
-        Image height
-    width : int
-        Image width
-    dtype : numpy dtype
-        Image data type (uint8, uint16, float32)
-    word_size : int
-        Bitvector word size (32 or 64)
-    thread_per_grid : int
-        Threads per block for construction kernels
 
-    Returns
-    -------
-    BufferSizes : namedtuple
-        Named tuple with all computed buffer sizes
-    """
-    dtype = np.dtype(dtype)
-    total_pixels = height * width
-    val_bit_len = _get_val_bit_len(dtype, total_pixels)
+def _compute_buffer_sizes(height, width, val_bit_len, val_bytes):
+    """Compute buffer sizes for a (padded) ``height`` x ``width`` image."""
+    thread_per_grid = WM_THREAD_PER_GRID
     w_bit_len = _get_bit_len(width)
 
-    # Total size rounded up to word_size multiple
-    total_pixels = height * width
-    size = _div_ceil(total_pixels, word_size) * word_size
+    size = _div_ceil(height * width, WM_WORD_SIZE) * WM_WORD_SIZE
 
-    # BlockT size: nsum (4 bytes) + nbit (4 or 8 bytes)
-    block_t_size = 4 + (word_size // 8)
-
-    # Bitvector block length
-    # Formula: ceil(size / thread_per_grid) * thread_per_grid / word_size + 1
-    # Then round up to multiple of 16
+    # BlockT entries per bit level: one per word, plus one for the total,
+    # rounded up to a multiple of 16
     bv_block_len = (
-        _div_ceil(size, thread_per_grid) * thread_per_grid // word_size + 1
+        _div_ceil(size, thread_per_grid) * thread_per_grid // WM_WORD_SIZE + 1
     )
     bv_block_len = _div_ceil(bv_block_len, 16) * 16
 
-    # Total bitvector storage for value wavelet matrix
-    # One bitvector array per bit level
-    bv_block_bytes = block_t_size * val_bit_len * bv_block_len
-    bv_block_bytes_div32 = _div_ceil(bv_block_bytes, 32)
+    bv_block_bytes = WM_BLOCK_T_SIZE * val_bit_len * bv_block_len
+    wm_bv_block_bytes = WM_BLOCK_T_SIZE * w_bit_len * bv_block_len * val_bit_len
 
-    # Block pair number for construction
-    block_pair_num = _get_block_pair_num(size, thread_per_grid)
-
-    # Scan buffer length
+    block_pair_num = _get_block_pair_num(size)
     nsum_scan_buf_len = _div_ceil(size, thread_per_grid * block_pair_num)
     nsum_scan_buf_len = _div_ceil(nsum_scan_buf_len, 4) * 4
 
-    # Working buffer for construction
-    # - 2 * nsum_scan_buf_len uint32 for scan buffers
-    # - 2 * size uint16 for index buffers
-    # - 1 * size * val_bytes for value buffer (single channel)
-    val_bytes = dtype.itemsize
-    buf_bytes = (
-        4 * 2 * nsum_scan_buf_len  # XYIdxT scan buffers
-        + 2 * 2 * size  # XIdxT index buffers
-        + val_bytes * size  # Value buffer
-    )
-    buf_bytes_div32 = _div_ceil(buf_bytes, 32)
-
-    # Column wavelet matrix buffers (for X dimension)
-    # Similar structure but with w_bit_len levels
-    wm_bv_block_bytes = block_t_size * w_bit_len * bv_block_len * val_bit_len
-    wm_bv_block_bytes_div32 = _div_ceil(wm_bv_block_bytes, 32)
-
-    # Position of total count in wavelet matrix
-    nsum_pos = size // word_size
-
-    # Grid dimensions for construction
-    grid_x = _div_ceil(size, thread_per_grid * block_pair_num)
-
-    BufferSizes = namedtuple(
-        "WaveletMatrixBufferSizes",
-        [
-            "size",  # Padded total pixels
-            "val_bit_len",  # Bits per value
-            "w_bit_len",  # Bits for column index
-            "bv_block_len",  # Blocks per bit level
-            "bv_block_bytes",  # Total bytes for value bitvectors
-            "bv_block_bytes_div32",
-            "wm_bv_block_bytes",  # Total bytes for column bitvectors
-            "wm_bv_block_bytes_div32",
-            "block_pair_num",  # Block pairs for construction
-            "nsum_scan_buf_len",  # Scan buffer length
-            "buf_bytes",  # Working buffer bytes
-            "buf_bytes_div32",
-            "nsum_pos",  # Position of total count
-            "grid_x",  # Grid X for construction
-            "block_t_size",  # Size of BlockT struct
-        ],
-    )
+    # Working buffer: 2 scan buffers, 2 index buffers and a value buffer
+    buf_bytes = 4 * 2 * nsum_scan_buf_len + 2 * 2 * size + val_bytes * size
 
     return BufferSizes(
         size=size,
         val_bit_len=val_bit_len,
         w_bit_len=w_bit_len,
         bv_block_len=bv_block_len,
-        bv_block_bytes=bv_block_bytes,
-        bv_block_bytes_div32=bv_block_bytes_div32,
-        wm_bv_block_bytes=wm_bv_block_bytes,
-        wm_bv_block_bytes_div32=wm_bv_block_bytes_div32,
+        bv_block_bytes_div32=_div_ceil(bv_block_bytes, 32),
+        wm_bv_block_bytes_div32=_div_ceil(wm_bv_block_bytes, 32),
         block_pair_num=block_pair_num,
         nsum_scan_buf_len=nsum_scan_buf_len,
-        buf_bytes=buf_bytes,
-        buf_bytes_div32=buf_bytes_div32,
-        nsum_pos=nsum_pos,
-        grid_x=grid_x,
-        block_t_size=block_t_size,
+        buf_bytes_div32=_div_ceil(buf_bytes, 32),
+        nsum_pos=size // WM_WORD_SIZE,
+        grid_x=_div_ceil(size, thread_per_grid * block_pair_num),
     )
 
 
-def _estimate_memory_usage(height, width, dtype, radius):
-    """
-    Estimate total GPU memory usage for wavelet matrix median filter.
-
-    Parameters
-    ----------
-    height : int
-        Image height
-    width : int
-        Image width
-    dtype : numpy dtype
-        Image data type
-    radius : int
-        Filter radius
-
-    Returns
-    -------
-    memory_bytes : int
-        Estimated total GPU memory usage in bytes
-    """
-    # Account for padding
-    padded_h = height + 2 * radius
-    padded_w = width + 2 * radius
-
-    buf_sizes = _compute_buffer_sizes(padded_h, padded_w, dtype)
-
-    # Bitvector storage (value + column wavelet matrices)
-    bv_memory = buf_sizes.bv_block_bytes_div32 * 32
-    wm_memory = buf_sizes.wm_bv_block_bytes_div32 * 32
-
-    # Working buffers
-    work_memory = buf_sizes.buf_bytes_div32 * 32
-
-    # Input and output images
+def _estimate_memory_usage(height, width, dtype, ry, rx):
+    """Estimated peak device memory (bytes) of `_median_wavelet_filter`."""
     dtype = np.dtype(dtype)
-    input_memory = padded_h * padded_w * dtype.itemsize
-    output_memory = height * width * dtype.itemsize
+    ph, pw = height + 2 * ry, width + 2 * rx
+    val_bit_len = _get_val_bit_len(dtype, ph * pw)
+    buf = _compute_buffer_sizes(ph, pw, val_bit_len, _key_dtype(dtype).itemsize)
+    # the two matrices, the construction buffers and the two
+    # (val_bit_len, size) uint16 column index arrays
+    total = (buf.bv_block_bytes_div32 + buf.wm_bv_block_bytes_div32) * 32
+    total += buf.buf_bytes_div32 * 32
+    total += 2 * val_bit_len * buf.size * 2
+    # padded input, keys and (rank mode) sorted values and ranks
+    total += ph * pw * (dtype.itemsize + _key_dtype(dtype).itemsize)
+    if _uses_rank_mode(dtype):
+        total += ph * pw * (8 + dtype.itemsize + 4)
+    return total + height * width * dtype.itemsize
 
-    total = bv_memory + wm_memory + work_memory + input_memory + output_memory
-    return total
 
-
-# =============================================================================
-# Kernel Preamble Generation
-# =============================================================================
-
-
-def _gen_wavelet_preamble(
-    val_type,
-    val_bit_len,
-    w_bit_len,
-    word_size=WM_WORD_SIZE,
-    threads_w=WM_THREADS_W,
-    threads_h=WM_THREADS_H,
-):
-    """
-    Generate the CUDA preamble with #define statements for wavelet kernels.
-
-    Parameters
-    ----------
-    val_type : str
-        CUDA type string for values (e.g., "unsigned char")
-    val_bit_len : int
-        Number of bits per value
-    w_bit_len : int
-        Number of bits for column indices
-    word_size : int
-        Bitvector word size
-    threads_w : int
-        Threads per block in X for median query
-    threads_h : int
-        Threads per block in Y for median query
-
-    Returns
-    -------
-    preamble : str
-        CUDA code with all necessary definitions
-    """
-    preamble = f"""
-// CUB includes
-#include <cub/warp/warp_scan.cuh>
-#include <cub/warp/warp_reduce.cuh>
-#include <cub/block/block_scan.cuh>
-
-// Wavelet matrix configuration
-#define WM_WORD_SIZE {word_size}
-#define WM_WARP_SIZE 32
-#define WM_THREAD_PER_GRID {WM_THREAD_PER_GRID}
-#define WM_THREADS_DIM_Y (WM_THREAD_PER_GRID / WM_WARP_SIZE)
-
-// Value type configuration
-#define WM_VAL_T {val_type}
-#define WM_VAL_BIT_LEN {val_bit_len}
-#define WM_W_BIT_LEN {w_bit_len}
-
-// Median query thread configuration
-#define WM_THREADS_W {threads_w}
-#define WM_THREADS_H {threads_h}
-
-// Index type definitions
-typedef unsigned short XIdxT;
-typedef unsigned short YIdxT;
-typedef unsigned int XYIdxT;
-
-// BlockT definition for {word_size}-bit words
-struct __align__(8) BlockT {{
-    unsigned int nsum;  // Prefix sum of set bits
-    unsigned int nbit;  // Bitvector word
-}};
-"""
-    return preamble
+def _get_val_bit_len(dtype, total_pixels):
+    """Number of matrix levels (bits per key) for ``dtype``."""
+    if _uses_rank_mode(dtype):
+        return _get_bit_len(total_pixels)
+    return np.dtype(dtype).itemsize * 8
 
 
 # =============================================================================
@@ -443,44 +283,56 @@ struct __align__(8) BlockT {{
 # =============================================================================
 
 
+def _gen_preamble(val_type, w_bit_len):
+    """CUDA macro definitions shared by the construction and query kernels."""
+    return f"""
+#define WM_VAL_T {val_type}
+#define WM_W_BIT_LEN {w_bit_len}
+#define WM_THREAD_PER_GRID {WM_THREAD_PER_GRID}
+#define WM_MAX_BLOCK_X {WM_MAX_BLOCK_X}
+#define WM_SRC_CACHE_DIV {WM_SRC_CACHE_DIV}
+#define WM_THREADS_W {WM_THREADS_W}
+#define WM_THREADS_H {WM_THREADS_H}
+"""
+
+
+def _read_kernel_source(*names):
+    sources = []
+    for name in names:
+        with open(os.path.join(_KERNEL_DIR, name)) as f:
+            sources.append(f.read())
+    return "".join(sources)
+
+
 @cp.memoize(for_each_device=True)
-def _get_median_query_kernel(val_type, val_bit_len, w_bit_len, padded=False):
-    """
-    Get the compiled median query kernel.
-
-    Parameters
-    ----------
-    val_type : str
-        CUDA type string for values
-    val_bit_len : int
-        Number of bits per value
-    w_bit_len : int
-        Number of bits for column indices
-    padded : bool
-        If True, return the padded variant
-
-    Returns
-    -------
-    kernel : cp.RawKernel
-        Compiled CUDA kernel
-    """
-    preamble = _gen_wavelet_preamble(val_type, val_bit_len, w_bit_len)
-
-    # Read the kernel file
-    kernel_dir = os.path.join(os.path.dirname(__file__), "cuda")
-    kernel_path = os.path.join(kernel_dir, "wavelet_matrix_median.cu")
-
-    with open(kernel_path) as f:
-        kernel_code = f.read()
-
-    full_code = preamble + kernel_code
-    kernel_name = "wavelet_median2d_padded" if padded else "wavelet_median2d"
-
-    return cp.RawKernel(
-        code=full_code,
-        name=kernel_name,
-        options=CUB_COMPILE_OPTIONS,
+def _get_median_query_kernel(val_type, w_bit_len):
+    """Compile the query kernel for a matrix value type."""
+    code = _gen_preamble(val_type, w_bit_len) + _read_kernel_source(
+        "wavelet_matrix_common.cuh", "wavelet_matrix_median.cu"
     )
+    return cp.RawKernel(code, "wavelet_median2d", options=CUB_COMPILE_OPTIONS)
+
+
+_CONSTRUCTION_KERNELS = (
+    "wavelet_first_pass",
+    "wavelet_exclusive_sum",
+    # Value up-sweep fused with the initialization of the column matrices
+    "wavelet_upsweep_with_col_init",
+    # Batched over the value levels (grid.y)
+    "wavelet_wm_first_pass_batched",
+    "wavelet_exclusive_sum_batched",
+    "wavelet_wm_upsweep_batched",
+)
+
+
+@cp.memoize(for_each_device=True)
+def _get_construction_kernels(val_type, w_bit_len):
+    """Compile the construction kernels (a dict of name -> RawKernel)."""
+    code = _gen_preamble(val_type, w_bit_len) + _read_kernel_source(
+        "wavelet_matrix_common.cuh", "wavelet_matrix_construct.cu"
+    )
+    module = cp.RawModule(code=code, options=CUB_COMPILE_OPTIONS)
+    return {name: module.get_function(name) for name in _CONSTRUCTION_KERNELS}
 
 
 # =============================================================================
@@ -488,217 +340,95 @@ def _get_median_query_kernel(val_type, val_bit_len, w_bit_len, padded=False):
 # =============================================================================
 
 
-def _can_use_wavelet_matrix(
-    image,
-    footprint_shape=None,
-    radius=None,
-    radius_y=None,
-    radius_x=None,
-    use_padding=True,
-):
+def _can_use_wavelet_matrix(image, footprint_shape=None, mode=None):
     """
-    Check if the wavelet matrix median filter can be used.
+    Check if the wavelet matrix filter can be used.
 
     Parameters
     ----------
     image : cupy.ndarray
-        The input image (2D, C-contiguous assumed)
+        The input image.
     footprint_shape : tuple of int, optional
-        The filter footprint shape (size_axis0, size_axis1). Both must be odd.
-    radius : int, optional
-        The filter radius for square footprints (alternative to footprint_shape)
-    radius_y : int, optional
-        The filter radius along axis 0 (rows). Alternative to footprint_shape.
-    radius_x : int, optional
-        The filter radius along axis 1 (columns). Alternative to footprint_shape.
-    use_padding : bool, optional
-        If True (default), check padded dimensions. If False, check original
-        dimensions (for non-padded kernel mode).
+        Footprint shape (size_axis0, size_axis1). Both must be odd. The
+        footprint itself must be a full rectangle (checked by the caller).
+    mode : str, optional
+        Boundary mode of the filter.
 
     Returns
     -------
     compatible : bool
-        Whether wavelet matrix can be used
+        Whether the wavelet matrix filter can be used
     reason : str or None
         Reason for incompatibility, or None if compatible
     """
-    # Check image dimensions
     if image.ndim != 2:
         return False, "Only 2D images are supported"
 
-    # Check dtype - support unsigned ints, signed ints, and floats
-    supported_dtypes = [
-        cp.uint8,
-        cp.uint16,
-        cp.uint32,
-        cp.uint64,
-        cp.int8,
-        cp.int16,
-        cp.int32,
-        cp.int64,
-        cp.float16,
-        cp.float32,
-        cp.float64,
-    ]
-    if image.dtype not in supported_dtypes:
-        return (
-            False,
-            "Unsupported dtype. Supported: uint8/16/32/64, int8/16/32/64, float16/32/64",
-        )
+    if image.dtype.kind not in "uif" or image.dtype.itemsize > 8:
+        return False, f"Unsupported dtype: {image.dtype}"
 
-    # Check image width (must fit in uint16 for column indices)
-    if image.shape[1] >= 65535:
-        return False, "Image width must be less than 65535"
+    if mode is not None and mode not in _SUPPORTED_MODES:
+        return False, f"Unsupported mode: {mode!r}"
 
-    # Normalize radius parameters
-    if radius is not None:
-        ry, rx = radius, radius
-    elif radius_y is not None and radius_x is not None:
-        ry, rx = radius_y, radius_x
-    elif footprint_shape is not None:
+    ry = rx = 0
+    if footprint_shape is not None:
         if len(footprint_shape) != 2:
             return False, "Footprint must be 2D"
         if footprint_shape[0] % 2 == 0 or footprint_shape[1] % 2 == 0:
             return False, "Footprint dimensions must be odd"
         ry = footprint_shape[0] // 2
         rx = footprint_shape[1] // 2
-    else:
-        ry, rx = None, None
-
-    # For rank-based dtypes, check total pixels (ranks stored as uint32)
-    if _uses_rank_mode(image.dtype):
-        # Account for padding (radius added on each side) if padding is used
-        if use_padding and ry is not None and rx is not None:
-            check_h = image.shape[0] + 2 * ry
-            check_w = image.shape[1] + 2 * rx
-        else:
-            check_h = image.shape[0]
-            check_w = image.shape[1]
-
-        total_pixels = check_h * check_w
-        if total_pixels > 2**32 - 1:
-            return (
-                False,
-                f"Image too large for rank-based dtype ({image.dtype}). "
-                f"Total pixels ({total_pixels:,}) exceeds uint32 max ({2**32 - 1:,})",
-            )
-
-    # Validate radius values
-    if ry is not None and rx is not None:
         if ry < 1 or rx < 1:
-            return False, "Radius must be at least 1"
-        # Check dimensions for wavelet matrix
-        if use_padding:
-            check_w = image.shape[1] + 2 * rx
-            if check_w >= 65535:
-                return False, "Padded width exceeds maximum (65535)"
-        else:
-            # For non-padded mode, check original width
-            if image.shape[1] >= 65535:
-                return False, "Image width exceeds maximum (65535)"
+            return False, "Footprint must be at least 3 along each axis"
+
+    padded_h = image.shape[0] + 2 * ry
+    padded_w = image.shape[1] + 2 * rx
+    if padded_w > WM_MAX_PADDED_WIDTH:
+        return False, f"Padded width exceeds maximum ({WM_MAX_PADDED_WIDTH})"
+    if padded_h * padded_w > 2**32 - 1:
+        return False, "Padded image has more than 2**32 - 1 pixels"
 
     return True, None
 
 
 # =============================================================================
-# Main Entry Point (placeholder - full implementation in Phase 5)
+# Parameters and buffers
 # =============================================================================
 
 
 class WaveletMatrixMedianParams:
-    """
-    Container for wavelet matrix median filter parameters.
+    """Sizes and strides for filtering a ``height`` x ``width`` image."""
 
-    This class computes and stores all the parameters needed for
-    wavelet matrix construction and median queries.
-    """
-
-    def __init__(
-        self,
-        height,
-        width,
-        dtype,
-        radius=None,
-        radius_y=None,
-        radius_x=None,
-        use_padding=True,
-    ):
-        """
-        Initialize parameters for wavelet matrix median filter.
-
-        Parameters
-        ----------
-        height : int
-            Original image height (before padding), i.e., image.shape[0]
-        width : int
-            Original image width (before padding), i.e., image.shape[1]
-        dtype : numpy dtype
-            Image data type
-        radius : int, optional
-            Filter radius for square footprints
-        radius_y : int, optional
-            Filter radius along axis 0 (rows/height)
-        radius_x : int, optional
-            Filter radius along axis 1 (columns/width)
-        use_padding : bool, optional
-            If True (default), pad the input image and build wavelet matrix on
-            padded dimensions. If False, build wavelet matrix on original
-            dimensions and use boundary-aware query kernel.
-        """
+    def __init__(self, height, width, dtype, radius_y, radius_x):
         self.height = height
         self.width = width
         self.dtype = np.dtype(dtype)
-        self.use_padding = use_padding
+        self.radius_y = radius_y
+        self.radius_x = radius_x
 
-        # Handle radius parameters
-        if radius is not None:
-            self.radius_y = radius
-            self.radius_x = radius
-        elif radius_y is not None and radius_x is not None:
-            self.radius_y = radius_y
-            self.radius_x = radius_x
-        else:
-            raise ValueError(
-                "Must provide either radius or both radius_y and radius_x"
-            )
+        # dimensions of the padded image the matrices are built on
+        self.padded_h = height + 2 * radius_y
+        self.padded_w = width + 2 * radius_x
 
-        # Keep single radius for backward compatibility (square case)
-        self.radius = self.radius_y if self.radius_y == self.radius_x else None
+        # dtype of the matrix values (keys or ranks, see `_key_dtype`)
+        self.matrix_dtype = _key_dtype(self.dtype)
+        self.val_type = _CUDA_TYPES[self.matrix_dtype]
+        self.is_rank_mode = _uses_rank_mode(self.dtype)
 
-        # Dimensions for wavelet matrix construction
-        if use_padding:
-            self.padded_h = height + 2 * self.radius_y
-            self.padded_w = width + 2 * self.radius_x
-        else:
-            # Non-padded mode: build WM on original dimensions
-            self.padded_h = height
-            self.padded_w = width
-
-        # Float mode: use sorted ranks instead of direct values
-        self.is_float_mode = _is_float_mode(self.dtype)
-
-        # Compute buffer sizes
-        self.buf_sizes = _compute_buffer_sizes(
-            self.padded_h, self.padded_w, self.dtype
+        self.val_bit_len = _get_val_bit_len(
+            self.dtype, self.padded_h * self.padded_w
         )
-
-        # Store commonly used values
-        # For float mode, we use uint32 ranks as the "value type"
-        if self.is_float_mode:
-            self.val_type = "unsigned int"  # ranks are uint32
-            self.rank_dtype = cp.uint32
-        else:
-            self.val_type = _dtype_to_cuda_type(self.dtype)
-            self.rank_dtype = None
-
-        self.val_bit_len = self.buf_sizes.val_bit_len
+        self.buf_sizes = _compute_buffer_sizes(
+            self.padded_h,
+            self.padded_w,
+            self.val_bit_len,
+            self.matrix_dtype.itemsize,
+        )
         self.w_bit_len = self.buf_sizes.w_bit_len
         self.nsum_pos = self.buf_sizes.nsum_pos
         self.bv_block_len = self.buf_sizes.bv_block_len
-
-        # Compute bv_block_h_byte_div32 (bytes per bit level / 32)
-        block_t_size = self.buf_sizes.block_t_size
-        self.bv_block_h_byte_div32 = (self.bv_block_len * block_t_size) // 32
+        # bytes per bit vector level / 32
+        self.bv_block_h_byte_div32 = (self.bv_block_len * WM_BLOCK_T_SIZE) // 32
 
     def get_median_grid_block(self):
         """Get grid and block dimensions for median query kernel."""
@@ -707,14 +437,7 @@ class WaveletMatrixMedianParams:
             _div_ceil(self.height, WM_THREADS_H),
             1,
         )
-        block = (WM_THREADS_W, WM_THREADS_H, 1)
-        return grid, block
-
-    def estimate_memory(self):
-        """Estimate total GPU memory usage."""
-        return _estimate_memory_usage(
-            self.height, self.width, self.dtype, self.radius
-        )
+        return grid, (WM_THREADS_W, WM_THREADS_H, 1)
 
     def get_construct_grid_block(self):
         """Get grid and block dimensions for construction kernels."""
@@ -723,198 +446,44 @@ class WaveletMatrixMedianParams:
         return grid, block
 
 
-# =============================================================================
-# Construction Kernel Compilation
-# =============================================================================
-
-
-def _gen_construct_preamble(
-    val_type, val_bit_len, w_bit_len, word_size=WM_WORD_SIZE
-):
-    """
-    Generate the CUDA preamble for construction kernels.
-
-    Parameters
-    ----------
-    val_type : str
-        CUDA type string for values
-    val_bit_len : int
-        Number of bits per value
-    w_bit_len : int
-        Number of bits for column indices
-    word_size : int
-        Bitvector word size
-
-    Returns
-    -------
-    preamble : str
-        CUDA code with definitions for construction kernels
-    """
-    return f"""
-#define WM_VAL_T {val_type}
-#define WM_VAL_BIT_LEN {val_bit_len}
-#define WM_W_BIT_LEN {w_bit_len}
-#define WM_WORD_SIZE {word_size}
-#define WM_THREAD_PER_GRID {WM_THREAD_PER_GRID}
-#define WM_MAX_BLOCK_X {WM_MAX_BLOCK_X}
-#define WM_SRC_CACHE_DIV 2
-"""
-
-
-@cp.memoize(for_each_device=True)
-def _get_construction_kernels(val_type, val_bit_len, w_bit_len):
-    """
-    Get all compiled construction kernels.
-
-    Parameters
-    ----------
-    val_type : str
-        CUDA type string for values
-    val_bit_len : int
-        Number of bits per value
-    w_bit_len : int
-        Number of bits for column indices
-
-    Returns
-    -------
-    kernels : dict
-        Dictionary of kernel name -> cp.RawKernel
-    """
-    preamble = _gen_construct_preamble(val_type, val_bit_len, w_bit_len)
-
-    # Read the common header and construction kernel file
-    kernel_dir = os.path.join(os.path.dirname(__file__), "cuda")
-    common_path = os.path.join(kernel_dir, "wavelet_matrix_common.cuh")
-    construct_path = os.path.join(kernel_dir, "wavelet_matrix_construct.cu")
-
-    with open(common_path) as f:
-        common_code = f.read()
-
-    with open(construct_path) as f:
-        construct_code = f.read()
-
-    full_code = preamble + common_code + construct_code
-
-    kernel_names = [
-        "wavelet_first_pass",
-        "wavelet_exclusive_sum",
-        # Fused kernel: value upsweep + column WM initialization
-        "wavelet_upsweep_with_col_init",
-        # Batched kernels for processing all value levels in parallel
-        "wavelet_wm_first_pass_batched",
-        "wavelet_exclusive_sum_batched",
-        "wavelet_wm_upsweep_batched",
-    ]
-
-    kernels = {}
-    for name in kernel_names:
-        kernels[name] = cp.RawKernel(
-            code=full_code,
-            name=name,
-            options=CUB_COMPILE_OPTIONS,
-        )
-
-    return kernels
-
-
-# =============================================================================
-# Buffer Allocation
-# =============================================================================
-
-
 class WaveletMatrixBuffers:
     """
-    Container for all GPU buffers used in wavelet matrix construction.
+    GPU buffers used in wavelet matrix construction.
 
-    This class allocates and manages the GPU memory needed for:
-    - Value bitvector storage (bv_blocks)
-    - Column wavelet matrix storage (wm_blocks)
-    - Working buffers for construction
+    - Value bit vectors (``bv_blocks``) and column bit vectors (``wm_blocks``)
+      that make up the matrices (BlockT entries, stored as bytes)
+    - Working buffers for the construction
     """
 
     def __init__(self, params):
-        """
-        Allocate GPU buffers for wavelet matrix construction.
-
-        Parameters
-        ----------
-        params : WaveletMatrixMedianParams
-            Parameters object with computed buffer sizes
-        """
         self.params = params
         buf = params.buf_sizes
+        val_bit_len = params.val_bit_len
 
-        # Value bitvector storage
-        # Shape: (val_bit_len, bv_block_len) of BlockT structs
-        bv_bytes = buf.bv_block_bytes_div32 * 32
-        self.bv_blocks = cp.zeros(bv_bytes, dtype=cp.uint8)
+        self.bv_blocks = cp.zeros(buf.bv_block_bytes_div32 * 32, cp.uint8)
+        self.wm_blocks = cp.zeros(buf.wm_bv_block_bytes_div32 * 32, cp.uint8)
 
-        # Column wavelet matrix bitvector storage
-        wm_bytes = buf.wm_bv_block_bytes_div32 * 32
-        self.wm_blocks = cp.zeros(wm_bytes, dtype=cp.uint8)
-
-        # Working buffer for construction
-        work_bytes = buf.buf_bytes_div32 * 32
-        self.work_buffer = cp.zeros(work_bytes, dtype=cp.uint8)
-
-        # Scan buffers (need two for alternating)
+        # Scan buffers (two, alternating)
         self.nsum_scan_buf = cp.zeros(buf.nsum_scan_buf_len, dtype=cp.uint32)
         self.nsum_scan_buf2 = cp.zeros(buf.nsum_scan_buf_len, dtype=cp.uint32)
 
-        # Index buffers (XIdxT = uint16)
+        # Alternating value and column index buffers
         self.idx_buf1 = cp.zeros(buf.size, dtype=cp.uint16)
         self.idx_buf2 = cp.zeros(buf.size, dtype=cp.uint16)
+        self.val_buf1 = cp.zeros(buf.size, dtype=params.matrix_dtype)
+        self.val_buf2 = cp.zeros(buf.size, dtype=params.matrix_dtype)
 
-        # Value buffers
-        # For rank mode (float32, uint64), we use uint32 ranks instead of values
-        if params.is_float_mode:
-            self.val_buf1 = cp.zeros(buf.size, dtype=cp.uint32)
-            self.val_buf2 = cp.zeros(buf.size, dtype=cp.uint32)
-            # Store sorted values for final lookup (use original dtype)
-            self.sorted_values = cp.zeros(buf.size, dtype=params.dtype)
-        else:
-            self.val_buf1 = cp.zeros(buf.size, dtype=params.dtype)
-            self.val_buf2 = cp.zeros(buf.size, dtype=params.dtype)
-            self.sorted_values = None
+        # Column indices of the elements in the order of every value level
+        # (populated at the input positions of each level during the value
+        # up-sweep) and a scratch array of the same shape: the batched column
+        # matrix construction processes all levels at once (grid.y)
+        self.wm_idx_levels = cp.zeros((val_bit_len, buf.size), cp.uint16)
+        self.wm_idx_work = cp.zeros((val_bit_len, buf.size), cp.uint16)
 
-        # Working buffers for column WM construction
-        # OpenCV-style batched approach: Store column indices for ALL value levels,
-        # then build all column WMs in parallel using grid.y = val_bit_len.
-        # This requires more memory but significantly reduces kernel launches.
-        #
-        # wm_idx_levels[h, :] stores column indices sorted by value bits >= h
-        # (populated at input positions during value upsweep for level h)
-        # Shape: (val_bit_len, buf.size) - contiguous 2D array for efficient batched access
-        val_bit_len = params.val_bit_len
-        self.wm_idx_levels = cp.zeros((val_bit_len, buf.size), dtype=cp.uint16)
-
-        # Working buffer for column WM construction (alternating with wm_idx_levels)
-        # Same shape as wm_idx_levels for batched processing
-        self.wm_idx_work = cp.zeros((val_bit_len, buf.size), dtype=cp.uint16)
-
-        # Scan buffers for column WM (need val_bit_len sets for batch processing)
-        # Layout: [level_0_data, level_1_data, ..., level_{n-1}_data]
-        self.wm_scan_buf = cp.zeros(
-            buf.nsum_scan_buf_len * val_bit_len, dtype=cp.uint32
-        )
-        self.wm_scan_buf2 = cp.zeros(
-            buf.nsum_scan_buf_len * val_bit_len, dtype=cp.uint32
-        )
-
-    def get_bv_level_ptr(self, level):
-        """Get pointer to bitvector storage for a specific bit level."""
-        block_t_size = self.params.buf_sizes.block_t_size
-        offset = level * self.params.bv_block_len * block_t_size
-        return self.bv_blocks[offset:]
-
-    def get_wm_level_ptr(self, val_level, wm_level):
-        """Get pointer to column WM storage for specific levels."""
-        block_t_size = self.params.buf_sizes.block_t_size
-        w_bit_len = self.params.w_bit_len
-        bv_block_len = self.params.bv_block_len
-        level_idx = val_level * w_bit_len + wm_level
-        offset = level_idx * bv_block_len * block_t_size
-        return self.wm_blocks[offset:]
+        # Scan buffers for the column matrices (val_bit_len sets, alternating)
+        scan_len = buf.nsum_scan_buf_len * val_bit_len
+        self.wm_scan_buf = cp.zeros(scan_len, dtype=cp.uint32)
+        self.wm_scan_buf2 = cp.zeros(scan_len, dtype=cp.uint32)
 
 
 # =============================================================================
@@ -969,12 +538,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     # Fill buffer with max value as sentinel (so padding has all bits = 1)
     # This ensures padding elements don't affect the wavelet matrix construction
     # For float mode, we use ranks which only need val_bit_len bits
-    if params.is_float_mode:
-        # For float mode, max_val should be >= max_rank but within val_bit_len bits
-        # The max rank is total_pixels - 1, so we use 2^val_bit_len - 1
-        max_val = (1 << params.val_bit_len) - 1
-    else:
-        max_val = np.iinfo(params.dtype).max
+    max_val = (1 << params.val_bit_len) - 1
     buffers.val_buf1.fill(max_val)
 
     # Copy source to value buffer 1
@@ -997,9 +561,13 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     msb_mask = max_val >> 1  # e.g., 0x7F for uint8
 
     # For float mode, use uint32 for masks; otherwise use the dtype
-    first_pass_mask_dtype = (
-        np.dtype(np.uint32) if params.is_float_mode else params.dtype
+    first_pass_mask_dtype = params.matrix_dtype
+
+    nsum_scan_buf, nsum_scan_buf2 = (
+        buffers.nsum_scan_buf,
+        buffers.nsum_scan_buf2,
     )
+    wm_scan_buf, wm_scan_buf2 = buffers.wm_scan_buf, buffers.wm_scan_buf2
 
     kernels["wavelet_first_pass"](
         grid,
@@ -1009,7 +577,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             np.uint16(buf.block_pair_num),  # block_pair_num
             np.uint32(size_div_warp),  # size_div_warp
             buffers.val_buf1,  # src
-            buffers.nsum_scan_buf,  # nsum_scan_buf
+            nsum_scan_buf,  # nsum_scan_buf
             np.uint32(buf.buf_bytes_div32),  # buf_byte_div32
             buffers.idx_buf1,  # buf_idx
             np.int32(params.padded_w),  # W
@@ -1021,7 +589,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     # Step 2: Exclusive sum for first level (MSB = level val_bit_len - 1)
     # -------------------------------------------------------------------------
     # Get pointer to MSB level (highest offset in OpenCV convention)
-    bv_block_h_bytes = params.bv_block_len * buf.block_t_size
+    bv_block_h_bytes = params.bv_block_len * WM_BLOCK_T_SIZE
     msb_bv_offset = (val_bit_len - 1) * bv_block_h_bytes
     bv_ptr = buffers.bv_blocks[msb_bv_offset:]
 
@@ -1029,8 +597,8 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         exsum_grid,
         exsum_block,
         (
-            buffers.nsum_scan_buf,  # nsum_scan_buf
-            buffers.nsum_scan_buf2,  # nsum_buf_test2
+            nsum_scan_buf,  # nsum_scan_buf
+            nsum_scan_buf2,  # nsum_buf_test2
             bv_ptr,  # nsum_p (stores total at nsum_pos)
             np.uint32(buf.buf_bytes_div32),  # buf_byte_div32
             np.uint32(buf.bv_block_bytes_div32),  # bv_block_byte_div32
@@ -1055,7 +623,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     #   - wavelet_wm_first_pass_batched kernel
 
     size_div_w = buf.size // WM_WORD_SIZE
-    block_t_size = buf.block_t_size
+    block_t_size = WM_BLOCK_T_SIZE
     bv_block_h_bytes = params.bv_block_len * block_t_size
     w_bit_len = params.w_bit_len
 
@@ -1073,8 +641,8 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
     wm_msb_mask = (1 << (w_bit_len - 1)) - 1
 
     # Clear column WM scan buffers (fused kernel writes per-block counts)
-    buffers.wm_scan_buf.fill(0)
-    buffers.wm_scan_buf2.fill(0)
+    wm_scan_buf.fill(0)
+    wm_scan_buf2.fill(0)
 
     for h in range(val_bit_len - 1, -1, -1):
         is_last = 1 if h == 0 else 0
@@ -1090,9 +658,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         bv_prev_offset = min(val_bit_len - 1, h + 1) * bv_block_h_bytes
 
         # For float mode, use uint32 for masks; otherwise use the dtype
-        mask_dtype = (
-            np.dtype(np.uint32) if params.is_float_mode else params.dtype
-        )
+        mask_dtype = params.matrix_dtype
 
         # OpenCV-style: Write column WM for level h+1 during value level h
         # First level (h = val_bit_len - 1): no column WM write
@@ -1101,13 +667,13 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             # First value level: no column WM write
             wm_write_enabled = 0
             wm_idx_out = buffers.wm_idx_levels[0]  # Dummy, won't be used
-            wm_scan_out = buffers.wm_scan_buf  # Dummy, won't be used
+            wm_scan_out = wm_scan_buf  # Dummy, won't be used
         else:
             # Write column indices for level h+1 at SOURCE positions
             wm_write_enabled = 1
             col_wm_level = h + 1  # Column WM level we're populating
             wm_idx_out = buffers.wm_idx_levels[col_wm_level]
-            wm_scan_out = buffers.wm_scan_buf[col_wm_level * nsum_scan_stride :]
+            wm_scan_out = wm_scan_buf[col_wm_level * nsum_scan_stride :]
 
         # FUSED kernel: value upsweep + OpenCV-style column WM init + zero counting
         kernels["wavelet_upsweep_with_col_init"](
@@ -1120,8 +686,8 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 src_val,  # src
                 dst_val,  # dst
                 buffers.bv_blocks[bv_curr_offset:],  # nbit_bp
-                buffers.nsum_scan_buf,  # nsum_buf_test
-                buffers.nsum_scan_buf2,  # nsum_buf_test2
+                nsum_scan_buf,  # nsum_buf_test
+                nsum_scan_buf2,  # nsum_buf_test2
                 np.uint32(buf.bv_block_bytes_div32),  # bv_block_byte_div32
                 np.uint32(buf.buf_bytes_div32),  # buf_byte_div32
                 src_idx,  # idx_p
@@ -1143,18 +709,15 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         # Exclusive sum for next value level (skip for last)
         if not is_last:
             # Swap scan buffers
-            buffers.nsum_scan_buf, buffers.nsum_scan_buf2 = (
-                buffers.nsum_scan_buf2,
-                buffers.nsum_scan_buf,
-            )
+            nsum_scan_buf, nsum_scan_buf2 = nsum_scan_buf2, nsum_scan_buf
 
             next_bv_offset = (h - 1) * bv_block_h_bytes
             kernels["wavelet_exclusive_sum"](
                 exsum_grid,
                 exsum_block,
                 (
-                    buffers.nsum_scan_buf,
-                    buffers.nsum_scan_buf2,
+                    nsum_scan_buf,
+                    nsum_scan_buf2,
                     buffers.bv_blocks[next_bv_offset:],
                     np.uint32(buf.buf_bytes_div32),
                     np.uint32(buf.bv_block_bytes_div32),
@@ -1181,7 +744,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
             np.uint16(buf.block_pair_num),  # block_pair_num
             np.uint32(size_div_w),  # size_div_warp
             buffers.wm_idx_levels[0],  # src_base (level 0 only)
-            buffers.wm_scan_buf,  # nsum_scan_buf (level 0 is at offset 0)
+            wm_scan_buf,  # nsum_scan_buf (level 0 is at offset 0)
             np.uint32(nsum_scan_stride),  # nsum_scan_stride
             np.uint32(buf.size),  # size
             np.uint32(buf.size),  # idx_buf_stride
@@ -1213,8 +776,8 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         batched_exsum_grid,
         exsum_block,
         (
-            buffers.wm_scan_buf,
-            buffers.wm_scan_buf2,
+            wm_scan_buf,
+            wm_scan_buf2,
             buffers.wm_blocks,  # nsum_p_base
             np.uint32(buf.nsum_pos),  # nsum_pos
             np.uint32(nsum_scan_stride),  # nsum_scan_stride
@@ -1224,11 +787,9 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
         ),
     )
 
-    # Use wm_idx_levels as source and wm_idx_work as destination
-    # Copy initial data to work buffer, then alternate
-    buffers.wm_idx_work[:] = buffers.wm_idx_levels[:]
-    wm_src_base = buffers.wm_idx_work.ravel()
-    wm_dst_base = buffers.wm_idx_levels.ravel()  # Reuse as scratch
+    # The two index buffers alternate as source and destination
+    wm_src_base = buffers.wm_idx_levels.ravel()
+    wm_dst_base = buffers.wm_idx_work.ravel()
 
     # Up-sweep for each column bit level (processing all value levels in parallel)
     for wm_h in range(w_bit_len - 1, -1, -1):
@@ -1253,8 +814,8 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 wm_src_base,  # src_base
                 wm_dst_base,  # dst_base
                 buffers.wm_blocks,  # nbit_bp_base
-                buffers.wm_scan_buf,  # nsum_buf_test
-                buffers.wm_scan_buf2,  # nsum_buf_test2
+                wm_scan_buf,  # nsum_buf_test
+                wm_scan_buf2,  # nsum_buf_test2
                 np.uint32(buf.wm_bv_block_bytes_div32),  # bv_block_div32
                 buffers.wm_blocks,  # nbit_bp_pre_base
                 np.int32(is_last_wm),  # is_last_bit
@@ -1272,10 +833,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
 
         # Exclusive sum for next level (skip for last)
         if not is_last_wm:
-            buffers.wm_scan_buf, buffers.wm_scan_buf2 = (
-                buffers.wm_scan_buf2,
-                buffers.wm_scan_buf,
-            )
+            wm_scan_buf, wm_scan_buf2 = wm_scan_buf2, wm_scan_buf
 
             next_level = wm_h - 1
             next_wm_offset = next_level * wm_block_h_bytes
@@ -1283,8 +841,8 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 batched_exsum_grid,
                 exsum_block,
                 (
-                    buffers.wm_scan_buf,
-                    buffers.wm_scan_buf2,
+                    wm_scan_buf,
+                    wm_scan_buf2,
                     buffers.wm_blocks,  # nsum_p_base
                     np.uint32(buf.nsum_pos),  # nsum_pos
                     np.uint32(nsum_scan_stride),  # nsum_scan_stride
@@ -1294,336 +852,122 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 ),
             )
 
-    # After w_bit_len swaps, final data may be in wm_idx_work instead of wm_idx_levels
-    # For odd w_bit_len, data ends up in wm_idx_work; for even, in wm_idx_levels
-    # Copy back to wm_idx_levels if needed
-    if w_bit_len % 2 == 1:
-        buffers.wm_idx_levels[:] = buffers.wm_idx_work[:]
-
     return buffers
 
 
 # =============================================================================
-# Median Query Execution
+# Query and full pipeline
 # =============================================================================
 
 
-def _run_median_query(params, buffers, output, use_padded_kernel=True):
-    """
-    Run the wavelet matrix median query kernel.
-
-    This function executes the median query kernel using the pre-constructed
-    wavelet matrices stored in buffers.
-
-    Parameters
-    ----------
-    params : WaveletMatrixMedianParams
-        Parameters object with image dimensions and configuration
-    buffers : WaveletMatrixBuffers
-        Buffers containing constructed wavelet matrices
-    output : cupy.ndarray
-        Output array for median values (shape: original image size)
-    use_padded_kernel : bool
-        If True, use the padded variant (assumes input was padded)
-
-    Returns
-    -------
-    output : cupy.ndarray
-        The median-filtered result
-    """
-    # Get the compiled kernel
-    kernel = _get_median_query_kernel(
-        params.val_type,
-        params.val_bit_len,
-        params.w_bit_len,
-        padded=use_padded_kernel,
-    )
-
-    # Compute grid and block dimensions
+def _run_median_query(params, buffers, output, rank):
+    """Run the query kernel; ``output`` receives the keys/ranks selected."""
+    kernel = _get_median_query_kernel(params.val_type, params.w_bit_len)
     grid, block = params.get_median_grid_block()
 
-    # Get buffer sizes
-    buf = params.buf_sizes
-    block_t_size = buf.block_t_size
-    bv_block_h_bytes = params.bv_block_len * block_t_size
-
-    # Compute bv_block_h_byte_div32
-    bv_block_h_byte_div32 = bv_block_h_bytes // 32
-
-    # Get pointers to the MSB level of each wavelet matrix
-    # Value WM: Start at level (val_bit_len - 1)
-    bv_start_offset = (params.val_bit_len - 1) * bv_block_h_bytes
-
-    # Column WM: Start at level (w_bit_len - 1) of value level (val_bit_len - 1)
+    level_bytes = params.bv_block_len * WM_BLOCK_T_SIZE
+    # The matrices are walked from the most significant level (highest offset)
+    bv_start_offset = (params.val_bit_len - 1) * level_bytes
     wm_start_offset = (
         (params.val_bit_len - 1) * params.w_bit_len + (params.w_bit_len - 1)
-    ) * bv_block_h_bytes
+    ) * level_bytes
 
-    if use_padded_kernel:
-        # Padded kernel: input is padded, output is original size
-        kernel(
-            grid,
-            block,
-            (
-                np.int32(params.height),  # H (output height)
-                np.int32(params.width),  # W (output width)
-                np.int32(params.padded_w),  # padded_W
-                np.int32(params.width),  # res_step_num
-                np.int32(params.radius_y),  # ry
-                np.int32(params.radius_x),  # rx
-                output,  # res_cu
-                buffers.wm_blocks[wm_start_offset:],  # wm_nbit_bp
-                np.uint32(buf.nsum_pos),  # nsum_pos
-                np.uint32(bv_block_h_byte_div32),  # bv_block_h_byte_div32
-                np.uint32(params.bv_block_len),  # bv_block_len
-                buffers.bv_blocks[bv_start_offset:],  # bv_nbit_bp
-                np.uint8(params.w_bit_len),  # w_bit_len
-                np.uint8(params.val_bit_len),  # val_bit_len
-            ),
-        )
-    else:
-        # Non-padded kernel: handles boundaries internally
-        kernel(
-            grid,
-            block,
-            (
-                np.int32(params.height),  # H
-                np.int32(params.width),  # W
-                np.int32(params.width),  # res_step_num
-                np.int32(params.radius_y),  # ry
-                np.int32(params.radius_x),  # rx
-                output,  # res_cu
-                buffers.wm_blocks[wm_start_offset:],  # wm_nbit_bp
-                np.uint32(buf.nsum_pos),  # nsum_pos
-                np.uint32(bv_block_h_byte_div32),  # bv_block_h_byte_div32
-                np.uint32(params.bv_block_len),  # bv_block_len
-                buffers.bv_blocks[bv_start_offset:],  # bv_nbit_bp
-                np.uint8(params.w_bit_len),  # w_bit_len
-                np.uint8(params.val_bit_len),  # val_bit_len
-            ),
-        )
-
+    kernel(
+        grid,
+        block,
+        (
+            np.int32(params.height),
+            np.int32(params.width),
+            np.int32(params.padded_w),
+            np.int32(params.radius_y),
+            np.int32(params.radius_x),
+            np.uint32(rank),
+            output,
+            buffers.wm_blocks[wm_start_offset:],
+            np.uint32(params.nsum_pos),
+            np.uint32(level_bytes // 32),
+            buffers.bv_blocks[bv_start_offset:],
+            np.uint8(params.w_bit_len),
+            np.uint8(params.val_bit_len),
+        ),
+    )
     return output
-
-
-# =============================================================================
-# Full Median Filter Pipeline
-# =============================================================================
-
-
-def _prepare_float_ranks(padded, params, buffers):
-    """
-    Prepare rank values for float32 images.
-
-    For float32, we sort the values and use their ranks (0 to n-1) as the
-    "values" for the wavelet matrix. The wavelet matrix then operates on
-    integers, and the median rank is looked up in the sorted values array
-    to get the actual float result.
-
-    Parameters
-    ----------
-    padded : cupy.ndarray
-        Padded float32 image
-    params : WaveletMatrixMedianParams
-        Filter parameters
-    buffers : WaveletMatrixBuffers
-        Pre-allocated buffers
-
-    Returns
-    -------
-    ranks : cupy.ndarray
-        uint32 array of ranks with same shape as padded
-    """
-    # Flatten and sort
-    flat = padded.ravel()
-    sorted_indices = cp.argsort(flat)
-
-    # Store sorted values for later lookup
-    buffers.sorted_values[: len(flat)] = flat[sorted_indices]
-
-    # Create rank array: rank[original_idx] = sorted_position
-    ranks = cp.empty_like(flat, dtype=cp.uint32)
-    ranks[sorted_indices] = cp.arange(len(flat), dtype=cp.uint32)
-
-    return ranks.reshape(padded.shape)
-
-
-def _lookup_float_results(rank_output, buffers):
-    """
-    Convert rank output back to float values.
-
-    Parameters
-    ----------
-    rank_output : cupy.ndarray
-        Output array containing median ranks (uint32)
-    buffers : WaveletMatrixBuffers
-        Buffers containing sorted values
-
-    Returns
-    -------
-    float_output : cupy.ndarray
-        Float32 array with actual median values
-    """
-    flat_ranks = rank_output.ravel()
-    float_output = buffers.sorted_values[flat_ranks]
-    return float_output.reshape(rank_output.shape)
 
 
 def _median_wavelet_filter(
     image,
-    radius=None,
-    radius_y=None,
-    radius_x=None,
+    radius_y,
+    radius_x,
     mode="reflect",
-    use_padding=True,
+    cval=0.0,
+    rank=None,
 ):
     """
-    Apply wavelet matrix median filter to a 2D image.
-
-    This function performs the complete wavelet matrix median filtering:
-    1. (If use_padding=True) Pad the input image
-    2. For float32: sort values and prepare ranks
-    3. Construct wavelet matrices (value WM + column WMs)
-    4. Run median query kernel
-    5. For float32: look up actual values from sorted array
-    6. Return the filtered result
+    Apply the wavelet matrix rank filter with a full rectangular footprint.
 
     Parameters
     ----------
     image : cupy.ndarray
-        Input 2D image (uint8, uint16, or float32). Must be C-contiguous or
-        will be copied to a contiguous array.
-    radius : int, optional
-        Filter radius for square footprints (kernel size = 2*radius + 1)
-    radius_y : int, optional
-        Filter radius along axis 0 (rows/height). Kernel height = 2*radius_y + 1.
-    radius_x : int, optional
-        Filter radius along axis 1 (columns/width). Kernel width = 2*radius_x + 1.
-    mode : str
-        Padding mode for boundary handling. Options:
-        - 'reflect': Symmetric reflection (d c b a | a b c d | d c b a)
-        - 'constant': Pad with constant value (zeros)
-        - 'nearest': Pad with nearest edge value
-        - 'mirror': Reflection without edge duplication (d c b | a b c d | c b a)
-        - 'wrap': Circular wrap around
-        Note: Only used when ``use_padding=True``. When ``use_padding=False``,
-        the `mode` parameter is ignored and clamp-to-border boundary handling
-        is used (see use_padding description).
-    use_padding : bool, optional
-        If ``True`` (default), pad the input image and build the wavelet matrix
-        on padded dimensions. The query kernel uses a full ``(2*radius + 1)``
-        window for all pixels, with boundary values determined by the `mode`
-        parameter. If ``False``, build the wavelet matrix on original
-        dimensions and use a boundary-aware query kernel with clamp-to-border
-        semantics. This is ~20-30% faster and uses less memory, but **uses a
-        smaller effective window at image edges** because query bounds are
-        clamped to valid image coordinates rather than using padded/replicated
-        values. For example, at corner ``(0, 0)`` with ``radius=3``, non-padded
-        mode uses a ``(radius + 1)*(radius + 1)`` window instead of the full
-        ``(2*radius + 1)*(2*radius + 1)`` window.
+        Input 2D image (see `_can_use_wavelet_matrix` for the supported
+        dtypes).
+    radius_y, radius_x : int
+        Filter radii along axis 0 and 1 (footprint ``(2*radius_y + 1,
+        2*radius_x + 1)``).
+    mode : {'reflect', 'constant', 'nearest', 'mirror', 'wrap'}
+        Boundary mode (scipy.ndimage names). The image is padded explicitly.
+    cval : scalar
+        Value used for ``mode='constant'``.
+    rank : int, optional
+        Index of the selected element when the window values are sorted in
+        ascending order, in ``[0, (2*radius_y + 1) * (2*radius_x + 1))``.
+        The default is the median, ``window_size // 2``.
 
     Returns
     -------
     result : cupy.ndarray
-        Median-filtered image with same shape and dtype as input
-
-    Notes
-    -----
-    The CUDA kernels assume C-contiguous (row-major) memory layout where
-    axis 0 corresponds to rows (Y direction) and axis 1 corresponds to
-    columns (X direction).
-
-    **Boundary handling comparison:**
-
-    - ``use_padding=True``: All pixels use a full-sized (2*radius+1)x(2*radius+1)
-      window. Edge pixels see replicated/reflected values based on `mode`.
-      This matches scipy.ndimage.median_filter behavior.
-
-    - ``use_padding=False``: Edge pixels use a smaller window (clamped to image
-      bounds). This is faster but produces different results at boundaries.
-      Interior pixels (distance > radius from any edge) are identical.
+        Filtered image with the same shape and dtype as the input.
     """
-    # Normalize radius parameters
-    if radius is not None:
-        ry, rx = radius, radius
-    elif radius_y is not None and radius_x is not None:
-        ry, rx = radius_y, radius_x
-    else:
-        raise ValueError(
-            "Must provide either radius or both radius_y and radius_x"
-        )
-
-    # Validate input
     ok, reason = _can_use_wavelet_matrix(
-        image, radius_y=ry, radius_x=rx, use_padding=use_padding
+        image,
+        footprint_shape=(2 * radius_y + 1, 2 * radius_x + 1),
+        mode=mode,
     )
     if not ok:
         raise ValueError(f"Cannot use wavelet matrix filter: {reason}")
 
-    # Ensure C-contiguous layout (kernels assume row-major order)
-    image = cp.ascontiguousarray(image)
+    window_size = (2 * radius_y + 1) * (2 * radius_x + 1)
+    if rank is None:
+        rank = window_size // 2
+    elif not 0 <= rank < window_size:
+        raise ValueError(f"rank must be in [0, {window_size}), got {rank}")
 
     height, width = image.shape
-    dtype = image.dtype
-
-    # Create parameters
     params = WaveletMatrixMedianParams(
-        height,
-        width,
-        dtype,
-        radius_y=ry,
-        radius_x=rx,
-        use_padding=use_padding,
+        height, width, image.dtype, radius_y, radius_x
     )
 
-    # Allocate buffers
+    # Pad (this also makes the array C-contiguous, as the kernels need)
+    pad_kwargs = {"constant_values": cval} if mode == "constant" else {}
+    padded = cp.pad(
+        image,
+        ((radius_y, radius_y), (radius_x, radius_x)),
+        mode=_to_np_mode(mode),
+        **pad_kwargs,
+    )
+
+    sorted_values = None
+    if params.is_rank_mode:
+        values, sorted_values = _to_ranks(padded)
+    else:
+        values = _to_keys(padded)
+
     buffers = WaveletMatrixBuffers(params)
+    kernels = _get_construction_kernels(params.val_type, params.w_bit_len)
+    _run_wavelet_construction(values, params, buffers, kernels)
 
-    # Get construction kernels
-    construction_kernels = _get_construction_kernels(
-        params.val_type, params.val_bit_len, params.w_bit_len
-    )
+    selected = cp.empty((height, width), dtype=params.matrix_dtype)
+    _run_median_query(params, buffers, selected, rank)
 
-    if use_padding:
-        # Pad the input image with asymmetric padding for rectangular footprints
-        # Convert scipy.ndimage mode to cupy.pad mode
-        pad_mode = _to_np_mode(mode)
-        pad_width = ((ry, ry), (rx, rx))
-        padded = cp.pad(image, pad_width, mode=pad_mode)
-
-        # For float mode, convert to ranks
-        if params.is_float_mode:
-            input_values = _prepare_float_ranks(padded, params, buffers)
-        else:
-            input_values = padded
-    else:
-        # Non-padded mode: use original image directly
-        # For float mode, still need to convert to ranks
-        if params.is_float_mode:
-            input_values = _prepare_float_ranks(image, params, buffers)
-        else:
-            input_values = image
-
-    # Run construction
-    _run_wavelet_construction(
-        input_values, params, buffers, construction_kernels
-    )
-
-    # Allocate output
-    # For float mode, query returns ranks (uint32), then we look up values
-    if params.is_float_mode:
-        rank_output = cp.empty((height, width), dtype=cp.uint32)
-        _run_median_query(
-            params,
-            buffers,
-            rank_output,
-            use_padded_kernel=use_padding,
-        )
-        output = _lookup_float_results(rank_output, buffers)
-    else:
-        output = cp.empty((height, width), dtype=dtype)
-        _run_median_query(
-            params, buffers, output, use_padded_kernel=use_padding
-        )
-
-    return output
+    if params.is_rank_mode:
+        return sorted_values[selected]
+    return _from_keys(selected, image.dtype)

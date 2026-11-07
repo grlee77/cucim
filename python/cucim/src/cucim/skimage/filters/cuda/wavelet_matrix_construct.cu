@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
  * Copyright (C) 2009, Willow Garage Inc., all rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
  *
  * Wavelet matrix construction kernels for 2D median filter.
@@ -20,6 +20,9 @@
 
 // Note: wavelet_matrix_common.cuh is prepended by Python
 // Do not include it here to avoid NVRTC include path issues
+#include <cub/block/block_scan.cuh>
+#include <cub/warp/warp_reduce.cuh>
+#include <cub/warp/warp_scan.cuh>
 
 // ============================================================================
 // Value type definition (set by Python preamble)

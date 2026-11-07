@@ -159,7 +159,6 @@ repos:
             ^python/cucim/src/cucim/skimage/filters/rank/tests/test_rank[.]py$|
             ^python/cucim/src/cucim/skimage/filters/ridges[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_correlate[.]py$|
-            ^python/cucim/src/cucim/skimage/filters/tests/test_cub_validation[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_edges[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_fft_based[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_gabor[.]py$|
@@ -449,7 +448,6 @@ repos:
             python/cucim/src/cucim/skimage/filters/rank/_rank_filter[.]py$|
             python/cucim/src/cucim/skimage/filters/rank/tests/test_rank[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_correlate[.]py$|
-            python/cucim/src/cucim/skimage/filters/tests/test_cub_validation[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_edges[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_fft_based[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_gabor[.]py$|

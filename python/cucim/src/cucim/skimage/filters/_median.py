@@ -180,7 +180,7 @@ def median(
         if image.ndim != 2:
             can_use_wavelet = False
             wm_reason = "Only 2D images are supported"
-        elif footprint is not None and not cp.all(footprint):
+        elif footprint is not None and not bool(cp.all(cp.asarray(footprint))):
             # Footprint has zeros - wavelet matrix only supports full rectangles
             can_use_wavelet = False
             wm_reason = (
@@ -189,7 +189,7 @@ def median(
             )
         else:
             can_use_wavelet, wm_reason = _can_use_wavelet_matrix(
-                image, footprint_shape=footprint_shape
+                image, footprint_shape=footprint_shape, mode=mode
             )
 
     if algorithm in ["auto", "histogram"]:
@@ -258,7 +258,7 @@ def median(
                 radius_y=radius_y,
                 radius_x=radius_x,
                 mode=mode,
-                use_padding=True,
+                cval=cval,
             )
 
             if output_array_provided:
@@ -268,12 +268,13 @@ def median(
                     temp = temp.astype(out_dtype, copy=False)
                 out = temp
             return out
-        except Exception as e:
-            # Fall back to histogram or sorting if wavelet matrix fails
+        except cp.cuda.memory.OutOfMemoryError as e:
+            # The matrices need many bytes per pixel: fall back to the other
+            # algorithms if there is not enough memory
             if algorithm == "wavelet_matrix":
                 raise  # Re-raise if explicitly requested
             warn(
-                f"Wavelet matrix median failed: {e}\n"
+                f"Wavelet matrix median ran out of memory: {e}\n"
                 "Falling back to histogram or sorting-based median."
             )
             # Try histogram as fallback
