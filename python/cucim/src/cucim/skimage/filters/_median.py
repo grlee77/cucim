@@ -139,8 +139,9 @@ def median(
     pixel. If that would take more than half of the available device memory,
     the image is filtered in slabs of rows, which takes a little longer but
     needs much less memory (about 350 MB for a 8192 x 8192 uint8 image instead
-    of 4.6 GB, with a 31 x 31 footprint). 'auto' does not choose the wavelet
-    matrix algorithm if not even a slab of a few dozen rows fits. Smaller
+    of 4.6 GB, with a 31 x 31 footprint). Volumes of types wider than
+    8 bits are also filtered in slabs because that is faster (up to 7.6x). 'auto' does not choose the
+    wavelet matrix algorithm if not even a slab of a few dozen rows fits. Smaller
     footprints, other dimensionalities and footprints that are not full
     rectangles use the sorting-based algorithm.
 

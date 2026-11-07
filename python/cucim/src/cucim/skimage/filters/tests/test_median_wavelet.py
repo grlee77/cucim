@@ -527,3 +527,35 @@ def test_auto_algorithm_threshold_3d(
     )
     cp.testing.assert_array_equal(median(img, footprint), expected)
     assert bool(calls) == expect_wavelet
+
+
+def test_speed_slabs_planners():
+    plan_3d = mw._plan_speed_slab_planes
+    # uint8 and small volumes keep the memory plan
+    assert plan_3d(256, 256, 256, np.uint8, 2, 2, 2, 256) == 256
+    assert plan_3d(32, 64, 64, np.float32, 2, 2, 2, 32) == 32
+    # large wide types use slabs of the target size
+    planes = plan_3d(256, 256, 256, np.float32, 2, 2, 2, 256)
+    assert planes == mw.WM_SPEED_SLAB_VOXELS // 256**2
+    # never larger than the plan, and not below the minimum slab
+    assert plan_3d(256, 256, 256, np.float32, 20, 2, 2, 256) == 80
+    assert plan_3d(256, 256, 256, np.float32, 2, 2, 2, None) is None
+    assert plan_3d(256, 256, 256, np.float32, 2, 2, 2, 3) == 3
+
+
+@pytest.mark.parametrize("dtype", [np.uint16, np.float32])
+def test_speed_slabs_match_single_slab(dtype, monkeypatch):
+    rng = np.random.default_rng(5)
+    monkeypatch.setattr(mw, "WM_SPEED_SLAB_VOXELS", 2**9)
+    shape = (24, 16, 16)
+    if np.dtype(dtype).kind == "f":
+        image = cp.asarray(rng.random(shape, dtype=dtype))
+    else:
+        image = cp.asarray(rng.integers(0, 60000, shape, dtype=dtype))
+    # the default now uses slabs (6 of them) ...
+    assert mw._plan_speed_slab_planes(*shape, dtype, 1, 1, 1, 24) == 4
+    # ... and gives the same result as one slab
+    cp.testing.assert_array_equal(
+        mw._median_wavelet_filter_3d(image, 1, 1, 1),
+        mw._median_wavelet_filter_3d(image, 1, 1, 1, slab_planes=24),
+    )

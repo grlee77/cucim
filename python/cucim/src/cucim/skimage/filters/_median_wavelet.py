@@ -42,7 +42,10 @@ LICENSE-3rdparty.md for the attribution). Beyond that, this module adds:
   about 70 to 210 bytes per pixel, so a whole 8192 x 8192 `uint8` image would
   need 4.6 GB. The slab height is chosen from an estimate of the memory use
   (`_estimate_memory_usage`) and the available memory (`_plan_slab_rows`);
-  small images are filtered in a single slab.
+  small images are filtered in a single slab. Volumes of types wider than
+  8 bits (more than 0.8M voxels) are also filtered in slabs of about 0.5M
+  voxels, because the query is up to 7.6 times faster when the matrices of a
+  slab fit in cache (`_plan_speed_slab_planes`).
 - Query thread blocks ordered down the image (concurrently running blocks
   cover a tall strip), which matters for large images, a 16 x 64 thread block
   shape, and construction buffers that are not zero-filled when they are
@@ -128,6 +131,15 @@ WM_MEMORY_FRACTION = 0.5
 WM_MIN_SLAB_ROWS = 64
 # The same for the planes of a volume
 WM_MIN_SLAB_PLANES = 4
+
+# Volumes of types wider than 8 bits are also filtered in slabs of about this
+# many voxels when they have at least ``WM_SPEED_SLAB_MIN_COUNT`` times as
+# many, because the query is much faster (1.1x to 7.6x on an RTX A6000) when
+# the matrices of a slab stay in cache. uint8 volumes do not benefit, and for
+# images the gain is small and not consistent, so they are not slabbed for
+# speed.
+WM_SPEED_SLAB_VOXELS = 2**19
+WM_SPEED_SLAB_MIN_COUNT = 1.5
 
 # CuPy compilation options for CUB
 CUB_COMPILE_OPTIONS = ("--std=c++17", "-DCUB_DISABLE_BF16_SUPPORT")
@@ -427,6 +439,28 @@ def _plan_slab_planes(nz, height, width, dtype, rz, ry, rx, budget=None):
         return nz
     lo = min(max_planes, max(WM_MIN_SLAB_PLANES, 4 * rz))
     return _largest_fitting(lo, max_planes, estimate, budget)
+
+
+def _plan_speed_slab_planes(nz, height, width, dtype, rz, ry, rx, planned):
+    """``planned`` (from `_plan_slab_planes`) reduced for speed, if worthwhile.
+
+    The slabs are smaller than planned only if that needs no more memory.
+    """
+    voxels = height * width
+    if (
+        planned is None
+        or np.dtype(dtype).itemsize == 1
+        or nz * voxels < WM_SPEED_SLAB_MIN_COUNT * WM_SPEED_SLAB_VOXELS
+    ):
+        return planned
+    planes = max(WM_MIN_SLAB_PLANES, 4 * rz, WM_SPEED_SLAB_VOXELS // voxels)
+    if planes >= planned:
+        return planned
+
+    def estimate(n):
+        return _slab_memory_estimate_3d(n, nz, height, width, dtype, rz, ry, rx)
+
+    return planes if estimate(planes) <= estimate(planned) else planned
 
 
 def _has_enough_memory(image, footprint_shape):
@@ -1298,6 +1332,17 @@ def _median_wavelet_filter_3d(
         if slab_planes is None:
             # nothing fits the budget: try the smallest slab anyway
             slab_planes = min(nz, max(WM_MIN_SLAB_PLANES, 4 * radius_z))
+        else:
+            slab_planes = _plan_speed_slab_planes(
+                nz,
+                height,
+                width,
+                image.dtype,
+                radius_z,
+                radius_y,
+                radius_x,
+                slab_planes,
+            )
     n_slabs = _div_ceil(nz, min(slab_planes, nz))
     slab_planes = _div_ceil(nz, n_slabs)
 
