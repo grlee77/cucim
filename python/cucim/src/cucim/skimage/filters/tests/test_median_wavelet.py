@@ -218,3 +218,35 @@ def test_memory_estimate_is_close_to_actual():
     estimate = mw._estimate_memory_usage(512, 512, img.dtype, 3, 3)
     assert 0.8 * actual <= estimate <= 1.2 * actual
     del out
+
+
+@pytest.mark.parametrize(
+    "dtype,footprint_edge,expect_wavelet",
+    [
+        (np.uint8, 9, False),  # 81 elements
+        (np.uint8, 11, True),  # 121 elements
+        (np.uint16, 11, True),
+        (np.float32, 11, False),  # types wider than 16 bits need > 150
+        (np.float32, 13, True),  # 169 elements
+    ],
+)
+def test_auto_algorithm_threshold(
+    monkeypatch, dtype, footprint_edge, expect_wavelet
+):
+    calls = []
+    original = mw._median_wavelet_filter
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "cucim.skimage.filters._median._median_wavelet_filter", spy
+    )
+    img = _random_image((40, 40), dtype)
+    footprint = np.ones((footprint_edge,) * 2, dtype=bool)
+    out = median(img, footprint)
+    assert bool(calls) == expect_wavelet
+    cp.testing.assert_array_equal(
+        out, median(img, footprint, algorithm="sorting")
+    )

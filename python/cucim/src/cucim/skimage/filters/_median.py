@@ -223,16 +223,20 @@ def median(
     # Priority: wavelet_matrix > histogram > sorting
     # Sorting is faster for small footprints. On an RTX A6000 with 2048 x 2048
     # images, wavelet matrix overtakes sorting at 11 x 11 (121 elements) for
-    # uint16 (13.5 vs 30 ms) and uint8 (6.3 vs 7.1 ms), while sorting is
-    # still faster at 9 x 9 (81 elements).
+    # uint16 (12.9 vs 30 ms) and uint8 (6.1 vs 7.1 ms), while sorting is
+    # still faster at 9 x 9 (81 elements). Types wider than 16 bits are
+    # slower with the wavelet matrix (they use ranks, see
+    # `_median_wavelet._uses_rank_mode`): float32 takes 22 ms and sorting
+    # still wins at 11 x 11 (10.8 ms), but not at 13 x 13 (96 ms).
     footprint_size = math.prod(footprint_shape)
+    wavelet_min_size = 100 if image.dtype.itemsize <= 2 else 150
     use_wavelet = False
     use_histogram = False
 
     if algorithm == "auto":
         if (
             can_use_wavelet
-            and footprint_size > 100
+            and footprint_size > wavelet_min_size
             and _has_enough_memory(image, footprint_shape)
         ):
             use_wavelet = True
