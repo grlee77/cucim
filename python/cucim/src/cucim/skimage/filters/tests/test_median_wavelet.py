@@ -84,6 +84,18 @@ def test_wavelet_image_shapes(shape):
     cp.testing.assert_array_equal(out, expected)
 
 
+@pytest.mark.parametrize(
+    "dtype,shape", [(np.uint8, (4096, 4096)), (np.uint16, (300, 20000))]
+)
+def test_wavelet_large_images(dtype, shape):
+    # exercises construction grids of hundreds of blocks
+    img = _random_image(shape, dtype)
+    footprint = np.ones((5, 3), dtype=bool)
+    expected = median(img, footprint, algorithm="sorting")
+    out = median(img, footprint, algorithm="wavelet_matrix")
+    cp.testing.assert_array_equal(out, expected)
+
+
 def test_wavelet_constant_and_extreme_values():
     for value in (0, 255):
         img = cp.full((20, 30), value, dtype=np.uint8)
@@ -176,3 +188,33 @@ def test_wavelet_width_limit():
     img = cp.zeros((3, mw.WM_MAX_PADDED_WIDTH - 1), dtype=np.uint8)
     ok, reason = mw._can_use_wavelet_matrix(img, (3, 3))
     assert not ok and "width" in reason
+
+
+def test_auto_skips_wavelet_when_memory_is_short(monkeypatch):
+    img = _random_image((60, 60), np.uint8)
+    footprint = np.ones((15, 15), dtype=bool)
+    expected = median(img, footprint, algorithm="sorting")
+
+    def fail(*args, **kwargs):
+        raise AssertionError("wavelet matrix should not be used")
+
+    monkeypatch.setattr(
+        "cucim.skimage.filters._median._has_enough_memory",
+        lambda image, footprint_shape: False,
+    )
+    monkeypatch.setattr(
+        "cucim.skimage.filters._median._median_wavelet_filter", fail
+    )
+    cp.testing.assert_array_equal(median(img, footprint), expected)
+
+
+def test_memory_estimate_is_close_to_actual():
+    pool = cp.get_default_memory_pool()
+    img = _random_image((512, 512), np.uint16)
+    mw._median_wavelet_filter(img, 3, 3)  # compile kernels
+    pool.free_all_blocks()
+    out = mw._median_wavelet_filter(img, 3, 3)
+    actual = pool.total_bytes()
+    estimate = mw._estimate_memory_usage(512, 512, img.dtype, 3, 3)
+    assert 0.8 * actual <= estimate <= 1.2 * actual
+    del out

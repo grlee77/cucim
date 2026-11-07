@@ -11,7 +11,11 @@ import numpy as np
 import cucim.skimage._vendored.ndimage as ndi
 
 from ._median_hist import KernelResourceError, _can_use_histogram, _median_hist
-from ._median_wavelet import _can_use_wavelet_matrix, _median_wavelet_filter
+from ._median_wavelet import (
+    _can_use_wavelet_matrix,
+    _has_enough_memory,
+    _median_wavelet_filter,
+)
 
 
 def median(
@@ -98,10 +102,15 @@ def median(
 
     Notes
     -----
-    For 2D images with uint8 or uint16 dtypes, a wavelet matrix-based median
-    filter [2]_ provides the fastest performance for larger kernel sizes. This
-    algorithm builds a succinct data structure enabling efficient range median
-    queries with O(log(max_value)) complexity.
+    For 2D images and full rectangular footprints, a wavelet matrix-based
+    median filter [2]_ provides the fastest performance for larger kernel
+    sizes (the run time is independent of the footprint size). All integer and
+    floating point dtypes are supported. It builds a succinct data structure
+    that answers range median queries in time proportional to the number of
+    bits of the values (for dtypes wider than 16 bits, of the ranks of the
+    values in the sorted image) times the number of bits of the image width.
+    It uses roughly 70 (uint8) to 210 (float32) bytes of device memory per
+    pixel, so 'auto' does not choose it if that much memory is not available.
 
     For cases where the wavelet matrix approach is not applicable, a histogram-
     based median filter [1]_ may be used. It is faster than sorting for larger
@@ -212,21 +221,22 @@ def median(
 
     # Algorithm selection for 'auto' mode
     # Priority: wavelet_matrix > histogram > sorting
-    # Use sorting for small footprints (< ~150 elements)
+    # Sorting is faster for small footprints. On an RTX A6000 with 2048 x 2048
+    # images, wavelet matrix overtakes sorting at 11 x 11 (121 elements) for
+    # uint16 (13.5 vs 30 ms) and uint8 (6.3 vs 7.1 ms), while sorting is
+    # still faster at 9 x 9 (81 elements).
     footprint_size = math.prod(footprint_shape)
     use_wavelet = False
     use_histogram = False
 
     if algorithm == "auto":
-        # For small footprints, sorting is often fastest
         if (
-            footprint_size <= 150
-        ):  # TODO: check appropriate value for this threshold
-            use_wavelet = False
-            use_histogram = False
-        elif can_use_wavelet:
+            can_use_wavelet
+            and footprint_size > 100
+            and _has_enough_memory(image, footprint_shape)
+        ):
             use_wavelet = True
-        elif can_use_histogram:
+        elif can_use_histogram and footprint_size > 150:
             use_histogram = True
     elif algorithm == "wavelet_matrix":
         use_wavelet = True

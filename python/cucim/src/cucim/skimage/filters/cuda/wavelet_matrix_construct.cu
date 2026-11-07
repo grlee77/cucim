@@ -243,7 +243,13 @@ extern "C" __global__ void wavelet_upsweep_with_col_init(
                 vidx_val_cache[threadIdx.y][kb - 1][threadIdx.x] = idx_v;
             }
 
-            // Create bitvector based on value comparison with mask
+            // Create bitvector based on value comparison with mask. Inside
+            // each branch __activemask() is the set of lanes that took it, so
+            // `bits` is the ballot of (v <= mask), the idiom used by the
+            // original implementation. __ballot_sync(FULL_WARP_MASK, v <= mask)
+            // is the documented equivalent (CUDA does not guarantee that the
+            // lanes of a branch stay together) but was 8-15% slower overall on
+            // an RTX A6000.
             if (v <= mask) {
                 bits = __activemask();
             } else {
@@ -656,6 +662,7 @@ extern "C" __global__ void wavelet_exclusive_sum_batched(
  *   wm_prev_offset: Offset for previous column bit level (in bytes)
  *   size: Total buffer size
  *   idx_buf_stride: Stride between value level index buffers (in elements)
+ *   inf: Padding value for column indices beyond the image
  */
 extern "C" __global__ void wavelet_wm_upsweep_batched(
     const XIdxT mask,
@@ -674,7 +681,8 @@ extern "C" __global__ void wavelet_wm_upsweep_batched(
     const unsigned int wm_curr_offset,
     const unsigned int wm_prev_offset,
     const XYIdxT size,
-    const XYIdxT idx_buf_stride
+    const XYIdxT idx_buf_stride,
+    const XIdxT inf  // padding value, larger than any column index
 ) {
     constexpr int THREAD_PER_GRID = WM_THREAD_PER_GRID;
     constexpr int THREADS_DIM_Y = WM_THREADS_DIM_Y;
@@ -710,8 +718,6 @@ extern "C" __global__ void wavelet_wm_upsweep_batched(
     const BlockT* __restrict__ nbit_bp_pre = (const BlockT*)((const char*)nbit_bp_pre_base +
                                                               blockIdx.y * wm_block_stride +
                                                               wm_prev_offset);
-
-    const XIdxT inf = (XIdxT)((1u << WM_W_BIT_LEN) - 1);
 
     const XYIdxT size_div_warp = size_div_w * WM_WORD_DIV_WARP;
     const XYIdxT nsum = nbit_bp[size_div_w].nsum;
@@ -752,6 +758,7 @@ extern "C" __global__ void wavelet_wm_upsweep_batched(
                 src_val_cache[threadIdx.y][kb - 1][threadIdx.x] = v;
             }
 
+            // same ballot idiom as in wavelet_upsweep_with_col_init
             if (v <= mask) {
                 bits = __activemask();
             } else {

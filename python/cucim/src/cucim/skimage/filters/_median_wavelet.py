@@ -57,7 +57,7 @@ WM_MAX_BLOCK_X = 1024  # Maximum grid X dimension
 WM_SRC_CACHE_DIV = 2  # Shared memory caching factor of the up-sweep
 
 # Median query kernel thread configuration
-WM_THREADS_W = 8  # Threads per block in X for median query
+WM_THREADS_W = 16  # Threads per block in X for median query
 WM_THREADS_H = 64  # Threads per block in Y for median query
 
 # Column indices are stored as uint16
@@ -271,6 +271,15 @@ def _estimate_memory_usage(height, width, dtype, ry, rx):
     return total + height * width * dtype.itemsize
 
 
+def _has_enough_memory(image, footprint_shape):
+    """True if the free device memory covers `_estimate_memory_usage`."""
+    ry, rx = footprint_shape[0] // 2, footprint_shape[1] // 2
+    needed = _estimate_memory_usage(*image.shape, image.dtype, ry, rx)
+    free = cp.cuda.runtime.memGetInfo()[0]
+    free += cp.get_default_memory_pool().free_bytes()
+    return needed <= free
+
+
 def _get_val_bit_len(dtype, total_pixels):
     """Number of matrix levels (bits per key) for ``dtype``."""
     if _uses_rank_mode(dtype):
@@ -283,11 +292,10 @@ def _get_val_bit_len(dtype, total_pixels):
 # =============================================================================
 
 
-def _gen_preamble(val_type, w_bit_len):
+def _gen_preamble(val_type):
     """CUDA macro definitions shared by the construction and query kernels."""
     return f"""
 #define WM_VAL_T {val_type}
-#define WM_W_BIT_LEN {w_bit_len}
 #define WM_THREAD_PER_GRID {WM_THREAD_PER_GRID}
 #define WM_MAX_BLOCK_X {WM_MAX_BLOCK_X}
 #define WM_SRC_CACHE_DIV {WM_SRC_CACHE_DIV}
@@ -305,9 +313,9 @@ def _read_kernel_source(*names):
 
 
 @cp.memoize(for_each_device=True)
-def _get_median_query_kernel(val_type, w_bit_len):
+def _get_median_query_kernel(val_type):
     """Compile the query kernel for a matrix value type."""
-    code = _gen_preamble(val_type, w_bit_len) + _read_kernel_source(
+    code = _gen_preamble(val_type) + _read_kernel_source(
         "wavelet_matrix_common.cuh", "wavelet_matrix_median.cu"
     )
     return cp.RawKernel(code, "wavelet_median2d", options=CUB_COMPILE_OPTIONS)
@@ -326,9 +334,9 @@ _CONSTRUCTION_KERNELS = (
 
 
 @cp.memoize(for_each_device=True)
-def _get_construction_kernels(val_type, w_bit_len):
+def _get_construction_kernels(val_type):
     """Compile the construction kernels (a dict of name -> RawKernel)."""
-    code = _gen_preamble(val_type, w_bit_len) + _read_kernel_source(
+    code = _gen_preamble(val_type) + _read_kernel_source(
         "wavelet_matrix_common.cuh", "wavelet_matrix_construct.cu"
     )
     module = cp.RawModule(code=code, options=CUB_COMPILE_OPTIONS)
@@ -431,10 +439,18 @@ class WaveletMatrixMedianParams:
         self.bv_block_h_byte_div32 = (self.bv_block_len * WM_BLOCK_T_SIZE) // 32
 
     def get_median_grid_block(self):
-        """Get grid and block dimensions for median query kernel."""
+        """Get grid and block dimensions for median query kernel.
+
+        ``blockIdx.x`` indexes tiles along the rows (axis 0) and
+        ``blockIdx.y`` tiles along the columns, so that the blocks running at
+        the same time cover a tall strip of the image. The query walks
+        matrices whose layout follows the row-major order of the pixels; with
+        the opposite order, float32 4096 x 4096 images took 300 ms instead of
+        61 ms in the query kernel.
+        """
         grid = (
-            _div_ceil(self.width, WM_THREADS_W),
             _div_ceil(self.height, WM_THREADS_H),
+            _div_ceil(self.width, WM_THREADS_W),
             1,
         )
         return grid, (WM_THREADS_W, WM_THREADS_H, 1)
@@ -456,29 +472,31 @@ class WaveletMatrixBuffers:
     """
 
     def __init__(self, params):
+        # Only the scan buffers need to start at zero: everything else is
+        # fully written by the construction kernels before it is read.
         self.params = params
         buf = params.buf_sizes
         val_bit_len = params.val_bit_len
 
-        self.bv_blocks = cp.zeros(buf.bv_block_bytes_div32 * 32, cp.uint8)
-        self.wm_blocks = cp.zeros(buf.wm_bv_block_bytes_div32 * 32, cp.uint8)
+        self.bv_blocks = cp.empty(buf.bv_block_bytes_div32 * 32, cp.uint8)
+        self.wm_blocks = cp.empty(buf.wm_bv_block_bytes_div32 * 32, cp.uint8)
 
         # Scan buffers (two, alternating)
         self.nsum_scan_buf = cp.zeros(buf.nsum_scan_buf_len, dtype=cp.uint32)
         self.nsum_scan_buf2 = cp.zeros(buf.nsum_scan_buf_len, dtype=cp.uint32)
 
         # Alternating value and column index buffers
-        self.idx_buf1 = cp.zeros(buf.size, dtype=cp.uint16)
-        self.idx_buf2 = cp.zeros(buf.size, dtype=cp.uint16)
+        self.idx_buf1 = cp.empty(buf.size, dtype=cp.uint16)
+        self.idx_buf2 = cp.empty(buf.size, dtype=cp.uint16)
         self.val_buf1 = cp.zeros(buf.size, dtype=params.matrix_dtype)
-        self.val_buf2 = cp.zeros(buf.size, dtype=params.matrix_dtype)
+        self.val_buf2 = cp.empty(buf.size, dtype=params.matrix_dtype)
 
         # Column indices of the elements in the order of every value level
         # (populated at the input positions of each level during the value
         # up-sweep) and a scratch array of the same shape: the batched column
         # matrix construction processes all levels at once (grid.y)
-        self.wm_idx_levels = cp.zeros((val_bit_len, buf.size), cp.uint16)
-        self.wm_idx_work = cp.zeros((val_bit_len, buf.size), cp.uint16)
+        self.wm_idx_levels = cp.empty((val_bit_len, buf.size), cp.uint16)
+        self.wm_idx_work = cp.empty((val_bit_len, buf.size), cp.uint16)
 
         # Scan buffers for the column matrices (val_bit_len sets, alternating)
         scan_len = buf.nsum_scan_buf_len * val_bit_len
@@ -825,6 +843,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
                 np.uint32(wm_prev_offset),  # wm_prev_offset
                 np.uint32(buf.size),  # size
                 np.uint32(idx_buf_stride),  # idx_buf_stride
+                np.uint16((1 << w_bit_len) - 1),  # inf
             ),
         )
 
@@ -862,7 +881,7 @@ def _run_wavelet_construction(src_padded, params, buffers, kernels):
 
 def _run_median_query(params, buffers, output, rank):
     """Run the query kernel; ``output`` receives the keys/ranks selected."""
-    kernel = _get_median_query_kernel(params.val_type, params.w_bit_len)
+    kernel = _get_median_query_kernel(params.val_type)
     grid, block = params.get_median_grid_block()
 
     level_bytes = params.bv_block_len * WM_BLOCK_T_SIZE
@@ -962,7 +981,7 @@ def _median_wavelet_filter(
         values = _to_keys(padded)
 
     buffers = WaveletMatrixBuffers(params)
-    kernels = _get_construction_kernels(params.val_type, params.w_bit_len)
+    kernels = _get_construction_kernels(params.val_type)
     _run_wavelet_construction(values, params, buffers, kernels)
 
     selected = cp.empty((height, width), dtype=params.matrix_dtype)

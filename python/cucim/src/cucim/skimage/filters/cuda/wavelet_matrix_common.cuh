@@ -9,7 +9,6 @@
  * The Python code in ../_median_wavelet.py defines these macros before this
  * file is included:
  *   WM_VAL_T            value type stored in the matrix (unsigned integer)
- *   WM_W_BIT_LEN        number of bits needed for a column index
  *   WM_THREAD_PER_GRID  threads per block of the construction kernels
  *   WM_MAX_BLOCK_X      maximum number of blocks in the construction grid
  *   WM_SRC_CACHE_DIV    shared-memory caching factor of the up-sweep

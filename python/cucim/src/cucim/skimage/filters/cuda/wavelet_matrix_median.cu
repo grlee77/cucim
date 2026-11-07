@@ -74,9 +74,11 @@ extern "C" __global__ void wavelet_median2d(
     const unsigned char w_bit_len,
     const unsigned char val_bit_len
 ) {
-    const int y = blockIdx.y * WM_THREADS_H + threadIdx.y;
+    // blockIdx.x walks down the image, blockIdx.y across (see
+    // get_median_grid_block in _median_wavelet.py for why)
+    const int y = blockIdx.x * WM_THREADS_H + threadIdx.y;
     if (y >= H) return;
-    const int x = blockIdx.x * WM_THREADS_W + threadIdx.x;
+    const int x = blockIdx.y * WM_THREADS_W + threadIdx.x;
     if (x >= W) return;
 
     // Window bounds in the padded image (rows are converted to bit positions)
