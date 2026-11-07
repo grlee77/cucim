@@ -20,8 +20,9 @@
  * Their original MIT-licensed source code is at:
  * https://github.com/TumoiYorozu/WMatrixMedian
  *
- * The code here is NOT a direct copy of the OpenCV code, but was implemented
- * using it as a reference.
+ * The kernels here are adapted from the OpenCV code (rewritten for CuPy
+ * RawKernels and NVRTC, with a different data layout, a rank argument and a
+ * different thread block shape). See LICENSE-3rdparty.md.
  *
  * Layout: images are C-contiguous; axis 0 (rows) is Y and axis 1 (columns) is
  * X; ry and rx are the filter radii along axes 0 and 1.

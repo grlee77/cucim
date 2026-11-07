@@ -206,6 +206,29 @@ OpenCV (extra modules, opencv-contrib-python)
   - Xperience AI
   - Shenzhen Institute of Artificial Intelligence and Robotics for Society
 
+OpenCV cudafilters wavelet matrix median filter, and WMatrixMedian
+- 2D wavelet matrix median filter of Y. Moroto and N. Umetani, "Constant Time Median Filter Using 2D Wavelet
+  Matrix", ACM Trans. Graph. 41(6), 2022, https://doi.org/10.1145/3550454.3555512. The CUDA kernels in cuCIM
+  were adapted from the implementation that the authors contributed to OpenCV
+  (https://github.com/opencv/opencv_contrib/pull/3627, modules/cudafilters/src/cuda/wavelet_matrix_*.cuh). The
+  same authors' original implementation is the WMatrixMedian repository.
+- License:
+  - OpenCV contrib: Apache-2.0 License (the files carry the OpenCV BSD-style notice; see the OpenCV entry above)
+    - https://github.com/opencv/opencv_contrib/blob/master/LICENSE
+  - WMatrixMedian: MIT License
+    - https://github.com/TumoiYorozu/WMatrixMedian/blob/main/LICENSE
+- Copyright:
+  - Intel Corporation
+  - Willow Garage Inc.
+  - TumoiYorozu (2023, WMatrixMedian)
+- Files:
+  - python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_construct.cu : Adapted construction kernels.
+  - python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_median.cu : Query kernel, based on the same algorithm
+    and kernel structure.
+  - python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_common.cuh : Shared definitions.
+  - python/cucim/src/cucim/skimage/filters/_median_wavelet.py : Launch sequence and buffer layout follow the same
+    design.
+
 SCIFIO
 - License: BSD-2-Clause License
   - https://github.com/scifio/scifio/blob/master/LICENSE.txt
