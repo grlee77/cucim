@@ -1,7 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
  * SPDX-FileCopyrightText: Copyright (C) 2009, Willow Garage Inc., all rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
  */
 
@@ -13,6 +13,12 @@
  * on the actual histogram sizes. See the Python function
  * `_get_median_rawkernel` defined in `_median_hist.py`. This function will
  * generate the full kernel code given a set of parameters.
+ *
+ * Based on the publication:
+ *
+ * O. Green, "Efficient Scalable Median Filtering Using Histogram-Based "
+ * Operations," in IEEE Transactions on Image Processing, vol. 27, no. 5,
+ * pp. 2217-2228, May 2018, https://doi.org/10.1109/TIP.2017.2781375.
  */
 
 __device__ void histogramAddAndSubCoarse(HIST_INT_T* H,

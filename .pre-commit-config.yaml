@@ -148,6 +148,9 @@ repos:
             ^python/cucim/src/cucim/skimage/filters/_unsharp_mask[.]py$|
             ^python/cucim/src/cucim/skimage/filters/_window[.]py$|
             ^python/cucim/src/cucim/skimage/filters/cuda/histogram_median[.]cu$|
+            ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_common[.]cuh$|
+            ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_construct[.]cu$|
+            ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_median[.]cu$|
             ^python/cucim/src/cucim/skimage/filters/lpi_filter[.]py$|
             ^python/cucim/src/cucim/skimage/filters/rank/__init__[.]py$|
             ^python/cucim/src/cucim/skimage/filters/rank/_generic[.]py$|
@@ -156,6 +159,7 @@ repos:
             ^python/cucim/src/cucim/skimage/filters/rank/tests/test_rank[.]py$|
             ^python/cucim/src/cucim/skimage/filters/ridges[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_correlate[.]py$|
+            ^python/cucim/src/cucim/skimage/filters/tests/test_cub_validation[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_edges[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_fft_based[.]py$|
             ^python/cucim/src/cucim/skimage/filters/tests/test_gabor[.]py$|
@@ -445,6 +449,7 @@ repos:
             python/cucim/src/cucim/skimage/filters/rank/_rank_filter[.]py$|
             python/cucim/src/cucim/skimage/filters/rank/tests/test_rank[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_correlate[.]py$|
+            python/cucim/src/cucim/skimage/filters/tests/test_cub_validation[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_edges[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_fft_based[.]py$|
             python/cucim/src/cucim/skimage/filters/tests/test_gabor[.]py$|
@@ -577,7 +582,10 @@ repos:
         args: [--fix, --spdx, "--spdx-license-identifier=Apache-2.0 AND BSD-3-Clause"]
         files: |
           (?x)^(
-            python/cucim/src/cucim/skimage/filters/cuda/histogram_median[.]cu$
+            python/cucim/src/cucim/skimage/filters/cuda/histogram_median[.]cu$|
+            python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_common[.]cuh$|
+            python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_construct[.]cu$|
+            python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_median[.]cu$
           )
       - id: verify-copyright
         name: verify-copyright-openjpeg
