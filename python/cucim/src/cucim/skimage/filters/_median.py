@@ -19,6 +19,27 @@ from ._median_wavelet import (
 _histogram_warned = False
 
 
+def _get_wavelet_planes(image, footprint_shape):
+    """Find the 2D planes of ``image`` that the wavelet matrix filters.
+
+    Returns ``(channel_axis, plane, plane_footprint_shape)``. For a 2D image
+    ``channel_axis`` is None and the plane is the image. For a 3D image with
+    a footprint of size 1 along exactly one axis, ``channel_axis`` is that
+    axis, ``plane`` is the first plane (a view) and the footprint shape is
+    that of the other two axes. Otherwise ``plane`` is None.
+    """
+    if image.ndim == 2:
+        return None, image, footprint_shape
+    if image.ndim == 3:
+        ones = [i for i, s in enumerate(footprint_shape) if s == 1]
+        if len(ones) == 1 and image.shape[ones[0]] > 0:
+            axis = ones[0]
+            plane = image[(slice(None),) * axis + (0,)]
+            shape = tuple(s for i, s in enumerate(footprint_shape) if i != axis)
+            return axis, plane, shape
+    return None, None, footprint_shape
+
+
 def median(
     image,
     footprint=None,
@@ -119,6 +140,11 @@ def median(
     footprints, other dimensionalities and footprints that are not full
     rectangles use the sorting-based algorithm.
 
+    A 3D image with a footprint of size 1 along one axis (for example an RGB
+    image and a footprint of shape ``(h, w, 1)``) is filtered one plane at a
+    time with the wavelet matrix algorithm, which gives the same result as
+    filtering each channel separately.
+
     When algorithm='auto', the best available algorithm is selected based on
     image dtype, dimensionality, and footprint size.
 
@@ -198,13 +224,22 @@ def median(
     # Check algorithm compatibility
     can_use_wavelet = False
     wm_reason = None
+    # The wavelet matrix filters 2D images. A 3D image with a footprint of
+    # size 1 along one axis (e.g. an RGB image with a footprint of shape
+    # (h, w, 1)) is filtered plane by plane along that axis.
+    channel_axis, plane, plane_footprint_shape = _get_wavelet_planes(
+        image, footprint_shape
+    )
 
     if algorithm in ["auto", "wavelet_matrix"]:
         # Wavelet matrix supports rectangular footprints with odd dimensions
         # and requires ALL elements in the footprint to be non-zero (full rectangle)
-        if image.ndim != 2:
+        if plane is None:
             can_use_wavelet = False
-            wm_reason = "Only 2D images are supported"
+            wm_reason = (
+                "Only 2D images, or 3D images with a footprint of size 1 "
+                "along one axis (e.g. RGB), are supported"
+            )
         elif footprint is not None and not bool(cp.all(cp.asarray(footprint))):
             # Footprint has zeros - wavelet matrix only supports full rectangles
             can_use_wavelet = False
@@ -214,7 +249,7 @@ def median(
             )
         else:
             can_use_wavelet, wm_reason = _can_use_wavelet_matrix(
-                image, footprint_shape=footprint_shape, mode=mode
+                plane, footprint_shape=plane_footprint_shape, mode=mode
             )
 
     # Explicit algorithm requests with validation
@@ -241,7 +276,7 @@ def median(
         if (
             can_use_wavelet
             and footprint_size > wavelet_min_size
-            and _has_enough_memory(image, footprint_shape)
+            and _has_enough_memory(plane, plane_footprint_shape)
         ):
             use_wavelet = True
     elif algorithm == "wavelet_matrix":
@@ -265,15 +300,27 @@ def median(
                         )
 
             # Support rectangular footprints
-            radius_y = footprint_shape[0] // 2
-            radius_x = footprint_shape[1] // 2
-            temp = _median_wavelet_filter(
-                image,
-                radius_y=radius_y,
-                radius_x=radius_x,
-                mode=mode,
-                cval=cval,
-            )
+            radius_y = plane_footprint_shape[0] // 2
+            radius_x = plane_footprint_shape[1] // 2
+            if channel_axis is None:
+                temp = _median_wavelet_filter(
+                    image,
+                    radius_y=radius_y,
+                    radius_x=radius_x,
+                    mode=mode,
+                    cval=cval,
+                )
+            else:
+                temp = cp.empty_like(image)
+                for c in range(image.shape[channel_axis]):
+                    idx = (slice(None),) * channel_axis + (c,)
+                    temp[idx] = _median_wavelet_filter(
+                        image[idx],
+                        radius_y=radius_y,
+                        radius_x=radius_x,
+                        mode=mode,
+                        cval=cval,
+                    )
 
             if output_array_provided:
                 out[:] = temp

@@ -53,6 +53,15 @@ LICENSE-3rdparty.md for the attribution). Beyond that, this module adds:
 Not included: the polygonal windows and the multi-channel launch of the
 original, and the 64-bit bit-vector words.
 
+Multi-channel images (`median` with a footprint of size 1 along the channel
+axis) are filtered one channel at a time. Batching the channels in the kernels
+(as the original does with ``blockIdx.z``) is not expected to give a large
+benefit: the matrices of a channel depend only on that channel's values, so
+the memory traffic does not shrink, and for images of about 1024 x 1024 and
+larger the GPU is already full (three channels on concurrent streams took as
+long as three sequential calls). Only the launch overhead, which dominates
+below about 512 x 512, would be saved; CUDA graphs could address that.
+
 Data flow
 ---------
 1. Pad the image (``mode``/``cval``) by the filter radii.

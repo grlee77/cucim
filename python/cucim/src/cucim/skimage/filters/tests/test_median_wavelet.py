@@ -322,3 +322,86 @@ def test_slab_memory_matches_estimate():
         # the estimate counts the output, as `actual` does
         assert 0.8 * actual <= estimate <= 1.2 * actual
         del out
+
+
+@pytest.mark.parametrize("n_channels", [3, 4], ids=["RGB", "RGBA"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32])
+@pytest.mark.parametrize("mode", ["reflect", "constant", "nearest"])
+def test_wavelet_multichannel_matches_sorting(n_channels, dtype, mode):
+    img = _random_image((90, 70, n_channels), dtype)
+    footprint = np.ones((7, 9, 1), dtype=bool)
+    expected = median(img, footprint, mode=mode, cval=2, algorithm="sorting")
+    out = median(img, footprint, mode=mode, cval=2, algorithm="wavelet_matrix")
+    assert out.shape == img.shape and out.dtype == img.dtype
+    cp.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("n_channels", [3, 4], ids=["RGB", "RGBA"])
+def test_wavelet_multichannel_is_per_channel_filtering(n_channels):
+    """Equal to filtering every channel as a separate 2D image."""
+    img = _random_image((80, 64, n_channels), np.uint8)
+    footprint = np.ones((11, 11, 1), dtype=bool)
+    out = median(img, footprint, algorithm="wavelet_matrix")
+    for c in range(n_channels):
+        expected = median(img[..., c], footprint[..., 0], algorithm="sorting")
+        cp.testing.assert_array_equal(out[..., c], expected)
+
+
+@pytest.mark.parametrize(
+    "shape,footprint_shape,axis",
+    [
+        ((3, 80, 64), (1, 7, 9), 0),  # channels first
+        ((80, 3, 64), (7, 1, 9), 1),  # channels in the middle
+        ((80, 64, 3), (7, 9, 1), 2),
+    ],
+)
+def test_wavelet_multichannel_channel_axis(shape, footprint_shape, axis):
+    img = _random_image(shape, np.uint16)
+    footprint = np.ones(footprint_shape, dtype=bool)
+    expected = median(img, footprint, algorithm="sorting")
+    out = median(img, footprint, algorithm="wavelet_matrix")
+    cp.testing.assert_array_equal(out, expected)
+
+
+def test_wavelet_multichannel_noncontiguous_and_out():
+    base = _random_image((60, 50, 4), np.uint8)
+    img = base[::-1, ::2, :]  # negative and non-unit strides
+    footprint = np.ones((5, 5, 1), dtype=bool)
+    expected = median(img, footprint, algorithm="sorting")
+    out = cp.empty(img.shape, img.dtype)
+    ret = median(img, footprint, out=out, algorithm="wavelet_matrix")
+    assert ret is out
+    cp.testing.assert_array_equal(out, expected)
+
+
+def test_auto_uses_wavelet_per_channel_for_rgb(monkeypatch):
+    img = _random_image((64, 64, 3), np.uint8)
+    footprint = np.ones((13, 13, 1), dtype=bool)  # 169 elements
+    expected = median(img, footprint, algorithm="sorting")
+    calls = []
+    original = mw._median_wavelet_filter
+
+    def counting(image, *args, **kwargs):
+        calls.append(image.shape)
+        return original(image, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "cucim.skimage.filters._median._median_wavelet_filter", counting
+    )
+    cp.testing.assert_array_equal(median(img, footprint), expected)
+    assert calls == [(64, 64)] * 3
+
+
+def test_wavelet_multichannel_unsupported_footprints():
+    img = _random_image((40, 40, 3), np.uint8)
+    # no axis of size 1, or a footprint with zeros: not supported
+    for footprint in (
+        np.ones((5, 5, 3), dtype=bool),
+        np.ones((5, 5, 1), dtype=bool) & (np.arange(25).reshape(5, 5, 1) != 7),
+    ):
+        with pytest.raises(ValueError):
+            median(img, footprint, algorithm="wavelet_matrix")
+        cp.testing.assert_array_equal(
+            median(img, footprint),
+            median(img, footprint, algorithm="sorting"),
+        )
