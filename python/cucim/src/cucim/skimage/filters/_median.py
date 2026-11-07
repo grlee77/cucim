@@ -110,12 +110,19 @@ def median(
     bits of the values (for dtypes wider than 16 bits, of the ranks of the
     values in the sorted image) times the number of bits of the image width.
     It uses roughly 70 (uint8) to 210 (float32) bytes of device memory per
-    pixel, so 'auto' does not choose it if that much memory is not available.
+    pixel. If that would take more than half of the available device memory,
+    the image is filtered in slabs of rows, which takes a little longer but
+    needs much less memory (about 350 MB for a 8192 x 8192 uint8 image instead
+    of 4.6 GB, with a 31 x 31 footprint). 'auto' does not choose the wavelet
+    matrix algorithm if not even a slab of a few dozen rows fits.
 
     For cases where the wavelet matrix approach is not applicable, a histogram-
     based median filter [1]_ may be used. It is faster than sorting for larger
     kernels (e.g., greater than 13x13) and has near-constant run time regardless
-    of kernel size.
+    of kernel size. For 8 and 16-bit integer images, 'auto' uses it at larger
+    footprints (more than 150 elements) only when the wavelet matrix algorithm
+    cannot be used. Whenever the wavelet matrix algorithm can be used, it is
+    faster.
 
     When algorithm='auto', the best available algorithm is selected based on
     image dtype, dimensionality, and footprint size.

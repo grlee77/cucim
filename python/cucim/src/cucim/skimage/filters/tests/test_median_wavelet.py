@@ -250,3 +250,75 @@ def test_auto_algorithm_threshold(
     cp.testing.assert_array_equal(
         out, median(img, footprint, algorithm="sorting")
     )
+
+
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("mode", ["reflect", "constant", "wrap"])
+def test_slabs_match_single_slab(dtype, mode):
+    img = _random_image((300, 70), dtype)
+    full = mw._median_wavelet_filter(
+        img, 4, 3, mode=mode, cval=1, slab_rows=300
+    )
+    # slab heights that do and do not divide the height (299: two slabs)
+    for rows in (64, 100, 299):
+        slabbed = mw._median_wavelet_filter(
+            img, 4, 3, mode=mode, cval=1, slab_rows=rows
+        )
+        cp.testing.assert_array_equal(slabbed, full)
+
+
+def test_slabs_with_other_rank_and_tiny_slab():
+    img = _random_image((50, 40), np.uint16)
+    full = mw._median_wavelet_filter(img, 2, 2, rank=3, slab_rows=50)
+    slabbed = mw._median_wavelet_filter(img, 2, 2, rank=3, slab_rows=1)
+    cp.testing.assert_array_equal(slabbed, full)
+
+
+def test_plan_slab_rows():
+    args = (4096, 4096, np.uint8, 15, 15)
+    whole = mw._slab_memory_estimate(4096, *args)
+    # enough memory: one slab
+    assert mw._plan_slab_rows(*args, budget=whole) == 4096
+    # less memory: smaller slabs that fit the budget, never below the minimum
+    prev = 4096
+    for fraction in (0.5, 0.2, 0.08):
+        rows = mw._plan_slab_rows(*args, budget=fraction * whole)
+        assert mw.WM_MIN_SLAB_ROWS <= rows < prev
+        assert mw._slab_memory_estimate(rows, *args) <= fraction * whole
+        prev = rows
+    # not even the smallest slab fits
+    assert mw._plan_slab_rows(*args, budget=1024) is None
+
+
+def test_default_slabbing_uses_memory_fraction(monkeypatch):
+    img = _random_image((400, 64), np.uint8)
+    expected = mw._median_wavelet_filter(img, 5, 5, slab_rows=400)
+    whole = mw._estimate_memory_usage(400, 64, img.dtype, 5, 5)
+    # available memory such that the budget is a quarter of the whole image
+    monkeypatch.setattr(
+        mw, "_available_memory", lambda: 0.25 * whole / mw.WM_MEMORY_FRACTION
+    )
+    rows = mw._plan_slab_rows(400, 64, img.dtype, 5, 5)
+    assert 64 <= rows < 400
+    cp.testing.assert_array_equal(
+        mw._median_wavelet_filter(img, 5, 5), expected
+    )
+
+
+def test_slab_memory_matches_estimate():
+    """The peak pool size, also with a shorter last slab, is as estimated."""
+    pool = cp.get_default_memory_pool()
+    img = _random_image((2000, 256), np.uint16)
+    height, width, ry, rx = 2000, 256, 5, 5
+    mw._median_wavelet_filter(img, ry, rx, slab_rows=700)  # compile kernels
+    for rows in (700, 2000):
+        pool.free_all_blocks()
+        base = pool.total_bytes()  # the input image
+        out = mw._median_wavelet_filter(img, ry, rx, slab_rows=rows)
+        actual = pool.total_bytes() - base
+        estimate = mw._slab_memory_estimate(
+            rows, height, width, img.dtype, ry, rx
+        )
+        # the estimate counts the output, as `actual` does
+        assert 0.8 * actual <= estimate <= 1.2 * actual
+        del out

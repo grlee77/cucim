@@ -22,7 +22,9 @@
  *
  * The kernels here are adapted from the OpenCV code (rewritten for CuPy
  * RawKernels and NVRTC, with a different data layout, a rank argument and a
- * different thread block shape). See LICENSE-3rdparty.md.
+ * different thread block shape). See LICENSE-3rdparty.md, and the docstring of
+ * _median_wavelet.py for the full list of changes (more dtypes, border modes,
+ * any rank, run-time bit counts, filtering in slabs of rows to limit memory).
  *
  * Layout: images are C-contiguous; axis 0 (rows) is Y and axis 1 (columns) is
  * X; ry and rx are the filter radii along axes 0 and 1.

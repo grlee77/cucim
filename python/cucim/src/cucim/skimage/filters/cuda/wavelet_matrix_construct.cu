@@ -16,6 +16,7 @@
  * - wavelet_last_pass: Final column wavelet matrix construction
  *
  * Adapted from OpenCV's wavelet_matrix_2d.cuh for use with CuPy RawKernels.
+ * See the docstring of _median_wavelet.py for the changes to the original code.
  */
 
 // Note: wavelet_matrix_common.cuh is prepended by Python

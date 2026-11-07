@@ -10,10 +10,9 @@ algorithm described in:
   Matrix," in ACM Trans. Graph. Volume 41, Issue 6, Article No.: 267,
   December 2022. https://doi.org/10.1145/3550454.3555512
 
-The wavelet matrix approach is faster than histogram-based methods, especially
-for larger kernel sizes and higher bit-depth images. The same data structure
-answers any rank query, so `_median_wavelet_filter` accepts a ``rank`` (the
-median is the default).
+The run time of the query does not depend on the size of the window. The same
+data structure answers any rank query, so `_median_wavelet_filter` accepts a
+``rank`` (the median is the default).
 
 The implementation here was adapted from the MIT-licensed one provided by the
 authors at:
@@ -21,6 +20,38 @@ https://github.com/TumoiYorozu/WMatrixMedian?tab=readme-ov-file
 
 That same implementation was also contributed to Open-CV in the following PR:
 https://github.com/opencv/opencv_contrib/pull/3627
+
+Changes relative to the code of the authors and of OpenCV
+---------------------------------------------------------
+The kernels were rewritten for CuPy RawKernels and NVRTC (see
+LICENSE-3rdparty.md for the attribution). Beyond that, this module adds:
+
+- Support for every numeric dtype: signed integers, 64-bit integers and
+  float16/32/64 (OpenCV handles unsigned 8, 16 and 32-bit integers and 32-bit
+  floats). Types of up to 16 bits are mapped to order-preserving unsigned
+  keys; wider types use the ranks of the values from an ``argsort``, so the
+  number of value levels is the number of bits of the image size.
+- The border modes of `scipy.ndimage` (``reflect``, ``mirror``, ``nearest``,
+  ``constant`` and ``wrap``, with ``cval``) by padding the image explicitly,
+  instead of cropping the border or shrinking the window.
+- Any rank (the original code computes the median).
+- The numbers of value and column bit levels are run-time arguments of the
+  query kernel instead of template parameters.
+- Filtering in slabs of rows, each with a halo of ``radius_y`` rows, so that
+  large images need a bounded amount of device memory: the matrices need
+  about 70 to 210 bytes per pixel, so a whole 8192 x 8192 `uint8` image would
+  need 4.6 GB. The slab height is chosen from an estimate of the memory use
+  (`_estimate_memory_usage`) and the available memory (`_plan_slab_rows`);
+  small images are filtered in a single slab.
+- Query thread blocks ordered down the image (concurrently running blocks
+  cover a tall strip), which matters for large images, a 16 x 64 thread block
+  shape, and construction buffers that are not zero-filled when they are
+  fully written.
+- A check that the estimated memory use fits (`_has_enough_memory`), used by
+  `median` to select an algorithm.
+
+Not included: the polygonal windows and the multi-channel launch of the
+original, and the 64-bit bit-vector words.
 
 Data flow
 ---------
@@ -62,6 +93,15 @@ WM_THREADS_H = 64  # Threads per block in Y for median query
 
 # Column indices are stored as uint16
 WM_MAX_PADDED_WIDTH = 65534
+
+# Large images are filtered in slabs of rows (each with a halo of ``radius_y``
+# rows) when the matrices of the whole image would not fit in this fraction of
+# the available device memory. The estimate is not exact and the memory pool
+# fragments, so the fraction is well below 1.
+WM_MEMORY_FRACTION = 0.5
+# The slab height is at least this many rows and at least ``4 * radius_y``
+# (so that recomputing the halo rows costs at most 50% more work).
+WM_MIN_SLAB_ROWS = 64
 
 # CuPy compilation options for CUB
 CUB_COMPILE_OPTIONS = ("--std=c++17", "-DCUB_DISABLE_BF16_SUPPORT")
@@ -271,13 +311,61 @@ def _estimate_memory_usage(height, width, dtype, ry, rx):
     return total + height * width * dtype.itemsize
 
 
-def _has_enough_memory(image, footprint_shape):
-    """True if the free device memory covers `_estimate_memory_usage`."""
-    ry, rx = footprint_shape[0] // 2, footprint_shape[1] // 2
-    needed = _estimate_memory_usage(*image.shape, image.dtype, ry, rx)
+def _slab_memory_estimate(rows, height, width, dtype, ry, rx):
+    """Estimated peak memory (bytes) when filtering in slabs of ``rows``."""
+    if rows >= height:
+        return _estimate_memory_usage(height, width, dtype, ry, rx)
+    # the matrices of one slab plus the padded image and the output, which are
+    # kept for all slabs
+    itemsize = np.dtype(dtype).itemsize
+    whole = ((height + 2 * ry) * (width + 2 * rx) + height * width) * itemsize
+    return _estimate_memory_usage(rows, width, dtype, ry, rx) + whole
+
+
+def _available_memory():
+    """Free device memory plus the free blocks of the CuPy memory pool."""
     free = cp.cuda.runtime.memGetInfo()[0]
-    free += cp.get_default_memory_pool().free_bytes()
-    return needed <= free
+    return free + cp.get_default_memory_pool().free_bytes()
+
+
+def _plan_slab_rows(height, width, dtype, ry, rx, budget=None):
+    """Number of output rows to filter at a time.
+
+    Returns ``height`` (a single slab) if the whole image fits in ``budget``
+    bytes (default: ``WM_MEMORY_FRACTION`` of the available memory), else the
+    largest slab height that does. Returns None if not even the smallest slab
+    (see ``WM_MIN_SLAB_ROWS``) fits.
+    """
+    if budget is None:
+        budget = WM_MEMORY_FRACTION * _available_memory()
+    # the matrix positions are 32-bit
+    max_rows = min(height, (2**32 - 1) // (width + 2 * rx) - 2 * ry)
+    if max_rows < 1:
+        return None
+
+    def estimate(rows):
+        return _slab_memory_estimate(rows, height, width, dtype, ry, rx)
+
+    if max_rows == height and estimate(height) <= budget:
+        return height
+    lo = min(max_rows, max(WM_MIN_SLAB_ROWS, 4 * ry))
+    if estimate(lo) > budget:
+        return None
+    hi = max_rows  # the estimate grows with the slab height
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate(mid) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _has_enough_memory(image, footprint_shape):
+    """True if the image can be filtered within the memory budget."""
+    ry, rx = footprint_shape[0] // 2, footprint_shape[1] // 2
+    rows = _plan_slab_rows(*image.shape, image.dtype, ry, rx)
+    return rows is not None
 
 
 def _get_val_bit_len(dtype, total_pixels):
@@ -389,12 +477,9 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, mode=None):
         if ry < 1 or rx < 1:
             return False, "Footprint must be at least 3 along each axis"
 
-    padded_h = image.shape[0] + 2 * ry
     padded_w = image.shape[1] + 2 * rx
     if padded_w > WM_MAX_PADDED_WIDTH:
         return False, f"Padded width exceeds maximum ({WM_MAX_PADDED_WIDTH})"
-    if padded_h * padded_w > 2**32 - 1:
-        return False, "Padded image has more than 2**32 - 1 pixels"
 
     return True, None
 
@@ -920,9 +1005,15 @@ def _median_wavelet_filter(
     mode="reflect",
     cval=0.0,
     rank=None,
+    slab_rows=None,
 ):
     """
     Apply the wavelet matrix rank filter with a full rectangular footprint.
+
+    The image is filtered in slabs of rows, each with a halo of ``radius_y``
+    rows, when the matrices of the whole image would not fit in
+    ``WM_MEMORY_FRACTION`` of the available device memory. The results do not
+    depend on the slab height.
 
     Parameters
     ----------
@@ -940,6 +1031,9 @@ def _median_wavelet_filter(
         Index of the selected element when the window values are sorted in
         ascending order, in ``[0, (2*radius_y + 1) * (2*radius_x + 1))``.
         The default is the median, ``window_size // 2``.
+    slab_rows : int, optional
+        Number of output rows to filter at a time. The default is chosen from
+        the available memory (see `_plan_slab_rows`).
 
     Returns
     -------
@@ -961,9 +1055,16 @@ def _median_wavelet_filter(
         raise ValueError(f"rank must be in [0, {window_size}), got {rank}")
 
     height, width = image.shape
-    params = WaveletMatrixMedianParams(
-        height, width, image.dtype, radius_y, radius_x
-    )
+    if slab_rows is None:
+        slab_rows = _plan_slab_rows(
+            height, width, image.dtype, radius_y, radius_x
+        )
+        if slab_rows is None:
+            # nothing fits the budget: try the smallest slab anyway
+            slab_rows = min(height, max(WM_MIN_SLAB_ROWS, 4 * radius_y))
+    # use slabs of nearly equal height, so that the buffers can be reused
+    n_slabs = _div_ceil(height, min(slab_rows, height))
+    slab_rows = _div_ceil(height, n_slabs)
 
     # Pad (this also makes the array C-contiguous, as the kernels need)
     pad_kwargs = {"constant_values": cval} if mode == "constant" else {}
@@ -974,19 +1075,40 @@ def _median_wavelet_filter(
         **pad_kwargs,
     )
 
-    sorted_values = None
-    if params.is_rank_mode:
-        values, sorted_values = _to_ranks(padded)
-    else:
-        values = _to_keys(padded)
+    kernels = None
+    params = buffers = None
+    result = None if n_slabs == 1 else cp.empty_like(image)
+    for r0 in range(0, height, slab_rows):
+        r1 = min(height, r0 + slab_rows)
+        # the rows of the padded image are contiguous
+        slab = padded[r0 : r1 + 2 * radius_y]
+        if params is None or params.height != r1 - r0:
+            # (only the last slab can be shorter) release the old buffers
+            # before allocating the new ones
+            params = buffers = None
+            params = WaveletMatrixMedianParams(
+                r1 - r0, width, image.dtype, radius_y, radius_x
+            )
+            buffers = WaveletMatrixBuffers(params)
+        if kernels is None:
+            kernels = _get_construction_kernels(params.val_type)
 
-    buffers = WaveletMatrixBuffers(params)
-    kernels = _get_construction_kernels(params.val_type)
-    _run_wavelet_construction(values, params, buffers, kernels)
+        sorted_values = None
+        if params.is_rank_mode:
+            values, sorted_values = _to_ranks(slab)
+        else:
+            values = _to_keys(slab)
+        _run_wavelet_construction(values, params, buffers, kernels)
 
-    selected = cp.empty((height, width), dtype=params.matrix_dtype)
-    _run_median_query(params, buffers, selected, rank)
-
-    if params.is_rank_mode:
-        return sorted_values[selected]
-    return _from_keys(selected, image.dtype)
+        selected = cp.empty((r1 - r0, width), dtype=params.matrix_dtype)
+        _run_median_query(params, buffers, selected, rank)
+        if params.is_rank_mode:
+            filtered = sorted_values[selected]
+        else:
+            filtered = _from_keys(selected, image.dtype)
+        if result is None:
+            return filtered
+        result[r0:r1] = filtered
+        # free the temporary arrays before the next slab allocates its own
+        del values, sorted_values, selected, filtered
+    return result
