@@ -10,12 +10,13 @@ import numpy as np
 
 import cucim.skimage._vendored.ndimage as ndi
 
-from ._median_hist import KernelResourceError, _can_use_histogram, _median_hist
 from ._median_wavelet import (
     _can_use_wavelet_matrix,
     _has_enough_memory,
     _median_wavelet_filter,
 )
+
+_histogram_warned = False
 
 
 def median(
@@ -68,26 +69,26 @@ def median(
         Determines which algorithm is used to compute the median. The default
         of 'auto' will attempt to use a wavelet matrix-based algorithm for 2D
         images with square or rectangular footprints with odd length on each
-        axis. Falls back to histogram-based or sorting-based algorithms when
-        wavelet matrix is not suitable.
+        axis. Falls back to a sorting-based algorithm when the wavelet matrix
+        is not suitable.
 
-        - 'wavelet_matrix': Fast wavelet matrix algorithm [2]_. Best for larger
+        - 'wavelet_matrix': Fast wavelet matrix algorithm [1]_. Best for larger
           footprints on 2D images.
-        - 'histogram': Histogram-based algorithm [1]_. Works for 2D integer
-          images, but in practice only when range is does not substantially
-          exceed uint8_t range.
         - 'sorting': Sorting-based algorithm via scipy.ndimage. Works for any
-          dtype and dimensionality, but is slower than the histogram or
-          wavelet_matrix approaches.
+          dtype and dimensionality, but is slower than the wavelet_matrix
+          approach for larger footprints.
+        - 'histogram': Deprecated. The histogram-based algorithm that this
+          option used to select was removed. It now behaves as 'auto' (with a
+          one-time warning) and gives identical results.
         - 'auto': Automatically selects the best algorithm.
 
         Note: this parameter is cuCIM-specific and does not exist in upstream
         scikit-image.
     algorithm_kwargs : dict
-        Any additional algorithm-specific keywords. Currently can only be used
-        to set the number of parallel partitions for the 'histogram' algorithm.
-        (e.g. ``algorithm_kwargs={'partitions': 256}``). Note: this parameter is
-        cuCIM-specific and does not exist in upstream scikit-image.
+        Deprecated and ignored (a warning is issued if it is not empty). It
+        was only used by the removed 'histogram' algorithm.
+        Note: this parameter is cuCIM-specific and does not exist in upstream
+        scikit-image.
 
     Returns
     -------
@@ -103,7 +104,7 @@ def median(
     Notes
     -----
     For 2D images and full rectangular footprints, a wavelet matrix-based
-    median filter [2]_ provides the fastest performance for larger kernel
+    median filter [1]_ provides the fastest performance for larger kernel
     sizes (the run time is independent of the footprint size). All integer and
     floating point dtypes are supported. It builds a succinct data structure
     that answers range median queries in time proportional to the number of
@@ -114,26 +115,16 @@ def median(
     the image is filtered in slabs of rows, which takes a little longer but
     needs much less memory (about 350 MB for a 8192 x 8192 uint8 image instead
     of 4.6 GB, with a 31 x 31 footprint). 'auto' does not choose the wavelet
-    matrix algorithm if not even a slab of a few dozen rows fits.
-
-    For cases where the wavelet matrix approach is not applicable, a histogram-
-    based median filter [1]_ may be used. It is faster than sorting for larger
-    kernels (e.g., greater than 13x13) and has near-constant run time regardless
-    of kernel size. For 8 and 16-bit integer images, 'auto' uses it at larger
-    footprints (more than 150 elements) only when the wavelet matrix algorithm
-    cannot be used. Whenever the wavelet matrix algorithm can be used, it is
-    faster.
+    matrix algorithm if not even a slab of a few dozen rows fits. Smaller
+    footprints, other dimensionalities and footprints that are not full
+    rectangles use the sorting-based algorithm.
 
     When algorithm='auto', the best available algorithm is selected based on
     image dtype, dimensionality, and footprint size.
 
     References
     ----------
-    .. [1] O. Green, "Efficient Scalable Median Filtering Using Histogram-Based
-       Operations," in IEEE Transactions on Image Processing, vol. 27, no. 5,
-       pp. 2217-2228, May 2018.
-       :DOI:`10.1109/TIP.2017.2781375`
-    .. [2] Y. Moroto and N. Umetani., "Constant Time Median Filter Using 2D
+    .. [1] Y. Moroto and N. Umetani., "Constant Time Median Filter Using 2D
        Wavelet Matrix," in ACM Trans. Graph. Volume 41, Issue 6,
        Article No.: 267, December 2022.
        :DOI:`10.1145/3550454.3555512`
@@ -184,11 +175,29 @@ def median(
             f"Valid options are: {sorted(valid_algorithms)}"
         )
 
+    if algorithm == "histogram":
+        global _histogram_warned
+        if not _histogram_warned:
+            _histogram_warned = True
+            warn(
+                "algorithm='histogram' is deprecated: the histogram-based "
+                "algorithm was removed and the algorithm is now chosen as for "
+                "algorithm='auto'. The output is identical.",
+                FutureWarning,
+                stacklevel=2,
+            )
+        algorithm = "auto"
+
+    if algorithm_kwargs:
+        warn(
+            f"algorithm_kwargs={algorithm_kwargs} ignored: it was only used "
+            "by the removed histogram-based algorithm",
+            stacklevel=2,
+        )
+
     # Check algorithm compatibility
     can_use_wavelet = False
-    can_use_histogram = False
     wm_reason = None
-    hist_reason = None
 
     if algorithm in ["auto", "wavelet_matrix"]:
         # Wavelet matrix supports rectangular footprints with odd dimensions
@@ -208,11 +217,6 @@ def median(
                 image, footprint_shape=footprint_shape, mode=mode
             )
 
-    if algorithm in ["auto", "histogram"]:
-        can_use_histogram, hist_reason = _can_use_histogram(
-            image, footprint, footprint_shape
-        )
-
     # Explicit algorithm requests with validation
     if algorithm == "wavelet_matrix" and not can_use_wavelet:
         raise ValueError(
@@ -220,14 +224,8 @@ def median(
             f"be used for this image and footprint (reason: {wm_reason})."
         )
 
-    if algorithm == "histogram" and not can_use_histogram:
-        raise ValueError(
-            "The histogram-based algorithm was requested, but it cannot "
-            f"be used for this image and footprint (reason: {hist_reason})."
-        )
-
     # Algorithm selection for 'auto' mode
-    # Priority: wavelet_matrix > histogram > sorting
+    # Priority: wavelet_matrix > sorting
     # Sorting is faster for small footprints. On an RTX A6000 with 2048 x 2048
     # images, wavelet matrix overtakes sorting at 11 x 11 (121 elements) for
     # uint16 (12.9 vs 30 ms) and uint8 (6.1 vs 7.1 ms), while sorting is
@@ -238,7 +236,6 @@ def median(
     footprint_size = math.prod(footprint_shape)
     wavelet_min_size = 100 if image.dtype.itemsize <= 2 else 150
     use_wavelet = False
-    use_histogram = False
 
     if algorithm == "auto":
         if (
@@ -247,12 +244,8 @@ def median(
             and _has_enough_memory(image, footprint_shape)
         ):
             use_wavelet = True
-        elif can_use_histogram and footprint_size > 150:
-            use_histogram = True
     elif algorithm == "wavelet_matrix":
         use_wavelet = True
-    elif algorithm == "histogram":
-        use_histogram = True
 
     # Try wavelet matrix first
     if use_wavelet:
@@ -290,68 +283,14 @@ def median(
                 out = temp
             return out
         except cp.cuda.memory.OutOfMemoryError as e:
-            # The matrices need many bytes per pixel: fall back to the other
-            # algorithms if there is not enough memory
+            # fall back to sorting if there is not enough memory even for
+            # slabs of rows
             if algorithm == "wavelet_matrix":
                 raise  # Re-raise if explicitly requested
             warn(
                 f"Wavelet matrix median ran out of memory: {e}\n"
-                "Falling back to histogram or sorting-based median."
+                "Falling back to sorting-based median."
             )
-            # Try histogram as fallback
-            if can_use_histogram:
-                use_histogram = True
-
-    # Try histogram-based approach
-    if use_histogram:
-        try:
-            # as in SciPy, a user-provided `out` can be an array or a dtype
-            output_array_provided = False
-            out_dtype = None
-            if out is not None:
-                output_array_provided = isinstance(out, cp.ndarray)
-                if not output_array_provided:
-                    try:
-                        out_dtype = cp.dtype(out)
-                    except TypeError:
-                        raise TypeError(
-                            "out must be either a cupy.array or a valid input "
-                            "to cupy.dtype"
-                        )
-
-            # TODO: Can't currently pass an output array into _median_hist as a
-            #       new array currently needs to be created during padding.
-
-            # pass shape if explicit footprint isn't needed
-            # (use new variable name in case KernelResourceError occurs)
-            temp = _median_hist(
-                image,
-                footprint_shape if footprint is None else footprint,
-                mode=mode,
-                cval=cval,
-                **algorithm_kwargs,
-            )
-            if output_array_provided:
-                out[:] = temp
-            else:
-                if out_dtype is not None:
-                    temp = temp.astype(out_dtype, copy=False)
-                out = temp
-            return out
-        except KernelResourceError as e:
-            # Fall back to sorting-based implementation if we encounter a
-            # resource limit (e.g. insufficient shared memory per block).
-            warn(
-                "Kernel resource error encountered in histogram-based "
-                f"median kernel: {e}\n"
-                "Falling back to sorting-based median instead."
-            )
-
-    if algorithm_kwargs:
-        warn(
-            f"algorithm_kwargs={algorithm_kwargs} ignored for sorting-based "
-            f"algorithm"
-        )
 
     size = footprint_shape if footprint is None else None
     return ndi.median_filter(

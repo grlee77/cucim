@@ -147,7 +147,6 @@ repos:
             ^python/cucim/src/cucim/skimage/filters/_sparse[.]py$|
             ^python/cucim/src/cucim/skimage/filters/_unsharp_mask[.]py$|
             ^python/cucim/src/cucim/skimage/filters/_window[.]py$|
-            ^python/cucim/src/cucim/skimage/filters/cuda/histogram_median[.]cu$|
             ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_common[.]cuh$|
             ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_construct[.]cu$|
             ^python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_median[.]cu$|
@@ -580,7 +579,6 @@ repos:
         args: [--fix, --spdx, "--spdx-license-identifier=Apache-2.0 AND BSD-3-Clause"]
         files: |
           (?x)^(
-            python/cucim/src/cucim/skimage/filters/cuda/histogram_median[.]cu$|
             python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_common[.]cuh$|
             python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_construct[.]cu$|
             python/cucim/src/cucim/skimage/filters/cuda/wavelet_matrix_median[.]cu$

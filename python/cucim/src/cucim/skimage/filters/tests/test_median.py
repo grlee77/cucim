@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-import math
+import warnings
 
 import cupy as cp
 import pytest
@@ -11,8 +11,7 @@ from cupyx.scipy import ndimage
 from skimage import data
 
 from cucim.skimage import morphology
-from cucim.skimage._shared.testing import expected_warnings
-from cucim.skimage.filters import median, rank
+from cucim.skimage.filters import _median as median_module, median, rank
 
 
 @pytest.fixture
@@ -123,18 +122,11 @@ def test_median_rank_behavior_matches_rank_median(camera, footprint_tuple, out):
 @pytest.mark.parametrize(
     "mode", ["reflect", "mirror", "nearest", "constant", "wrap"]
 )
-# use an anisotropic footprint large enough to trigger the histogram-based path
+# the large anisotropic footprint triggers the wavelet matrix algorithm
 @pytest.mark.parametrize("footprint_shape", [(3, 3), (3, 5), (15, 23)])
 @pytest.mark.parametrize("int_dtype", [cp.uint8, cp.int8, cp.uint16, cp.int16])
-@pytest.mark.parametrize("algorithm", ["auto", "histogram", "sorting"])
-@pytest.mark.parametrize("algorithm_kwargs", [{}, {"partitions": 32}])
-def test_median_hist_dtypes(
-    mode,
-    footprint_shape,
-    int_dtype,
-    algorithm,
-    algorithm_kwargs,
-):
+@pytest.mark.parametrize("algorithm", ["auto", "wavelet_matrix", "sorting"])
+def test_median_int_dtypes(mode, footprint_shape, int_dtype, algorithm):
     footprint = cp.ones(footprint_shape, dtype=bool)
     rng = cp.random.default_rng(123)
     shape = (350, 407)
@@ -143,47 +135,18 @@ def test_median_hist_dtypes(
     elif int_dtype == cp.int8:
         img = rng.integers(-128, 128, shape, dtype=int).astype(cp.int8)
     elif int_dtype == cp.uint16:
-        if False:
-            # test with 12-bit range stored in 16-bit integers (e.g. DICOM)
-            img = rng.integers(0, 4096, shape, dtype=cp.uint16)
-        else:
-            # smaller dynamic range
-            #    (range 4096 fails only on CI, but couldn't reproduce locally)
-            img = rng.integers(0, 1024, shape, dtype=cp.uint16)
+        img = rng.integers(0, 1024, shape, dtype=cp.uint16)
     elif int_dtype == cp.int16:
-        # chose a limited range of values to test 512 hist_size case
         img = rng.integers(-128, 384, shape, dtype=int).astype(cp.int16)
 
-    # 150 is the value used to auto-select between sorting vs. histogram
-    small_kernel = math.prod(footprint_shape) < 150
-    if algorithm_kwargs and (
-        algorithm == "sorting" or (algorithm == "auto" and small_kernel)
-    ):
-        msg = ["algorithm_kwargs={'partitions': 32} ignored"]
-    else:
-        msg = []
-    with expected_warnings(msg):
-        out = median(
-            img,
-            footprint,
-            mode=mode,
-            behavior="ndimage",
-            algorithm=algorithm,
-            algorithm_kwargs=algorithm_kwargs,
-        )
+    out = median(
+        img, footprint, mode=mode, behavior="ndimage", algorithm=algorithm
+    )
     expected = ndimage.median_filter(img, size=footprint.shape, mode=mode)
     assert_allclose(expected, out)
 
 
-# TODO: Determine source of isolated remote test failures when 16-bit range
-#       is > 1024. Could not reproduce locally.
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "reflect",
-    ],
-)
-# use an anisotropic footprint large enough to trigger the histogram-based path
+@pytest.mark.parametrize("mode", ["reflect"])
 @pytest.mark.parametrize("footprint_shape", [(7, 11)])
 @pytest.mark.parametrize(
     "int_dtype, irange",
@@ -191,77 +154,40 @@ def test_median_hist_dtypes(
         (cp.uint16, (0, 256)),
         (cp.uint16, (0, 15)),
         (cp.uint16, (128, 384)),
-        (cp.uint16, (0, 200)),
         (cp.uint16, (0, 510)),
         (cp.uint16, (500, 550)),
         (cp.uint16, (0, 1024)),
-        pytest.param(
-            cp.uint16,
-            (0, 2048),
-            marks=pytest.mark.skip(reason="isolated failure on CI only"),
-        ),  # noqa
-        pytest.param(
-            cp.uint16,
-            (1024, 3185),
-            marks=pytest.mark.skip(reason="isolated failure on CI only"),
-        ),  # noqa
+        (cp.uint16, (0, 2048)),
+        (cp.uint16, (1024, 3185)),
+        (cp.uint16, (0, 65536)),
         (cp.int16, (0, 256)),
         (cp.int16, (-15, 15)),
-        (cp.int16, (128, 384)),
         (cp.int16, (-128, 384)),
         (cp.int16, (-400, 400)),
-        pytest.param(
-            cp.int16,
-            (-1024, 2048),
-            marks=pytest.mark.skip(reason="isolated failure on CI only"),
-        ),  # noqa
-        pytest.param(
-            cp.int16,
-            (150, 2048),
-            marks=pytest.mark.skip(reason="isolated failure on CI only"),
-        ),  # noqa
+        (cp.int16, (-1024, 2048)),
+        (cp.int16, (150, 2048)),
+        (cp.int16, (-32768, 32767)),
     ],
 )
-def test_median_hist_16bit_offsets(mode, footprint_shape, int_dtype, irange):
+def test_median_16bit_value_ranges(mode, footprint_shape, int_dtype, irange):
     """Make sure 16-bit cases are robust to various value ranges"""
     footprint = cp.ones(footprint_shape, dtype=bool)
     rng = cp.random.default_rng(123)
     shape = (350, 407)
-    if int_dtype == cp.uint16:
-        # test with 12-bit range stored in 16-bit integers (e.g. DICOM)
-        img = rng.integers(irange[0], irange[1], shape, dtype=cp.uint16)
-    elif int_dtype == cp.int16:
-        # chose a limited range of values to test 512 hist_size case
-        img = rng.integers(irange[0], irange[1], shape, dtype=int)
-        img = img.astype(cp.int16)
+    img = rng.integers(irange[0], irange[1], shape, dtype=int).astype(int_dtype)
     out = median(
-        img, footprint, mode=mode, behavior="ndimage", algorithm="histogram"
+        img,
+        footprint,
+        mode=mode,
+        behavior="ndimage",
+        algorithm="wavelet_matrix",
     )
     expected = ndimage.median_filter(img, size=footprint.shape, mode=mode)
     assert_allclose(expected, out)
 
 
-@pytest.mark.parametrize("int_dtype", [cp.uint16, cp.int16])
-def test_median_hist_kernel_resource_limit_try_except(int_dtype):
-    # use an anisotropic footprint large enough to trigger
-    # the histogram-based path
-    footprint = cp.ones((15, 23), dtype=bool)
-    mode = "nearest"
-    rng = cp.random.default_rng(123)
-    shape = (350, 407)  # use anisotropic size
-    if int_dtype == cp.uint16:
-        # test with range likely to exceed the shared memory limit
-        img = rng.integers(0, 65536, shape, dtype=cp.uint16)
-    elif int_dtype == cp.int16:
-        # test with range likely to exceed the shared memory limit
-        img = rng.integers(-32768, 32767, shape, dtype=int).astype(cp.int16)
-    out = median(img, footprint, mode=mode)
-    expected = ndimage.median_filter(img, size=footprint.shape, mode=mode)
-    assert_allclose(expected, out)
-
-
 @pytest.mark.parametrize(
-    "algorithm", ["auto", "histogram", "sorting", "invalid"]
+    "algorithm", ["auto", "wavelet_matrix", "sorting", "invalid"]
 )
 def test_median_algorithm_parameter(algorithm):
     """Call all algorithms for float32 input."""
@@ -270,8 +196,7 @@ def test_median_algorithm_parameter(algorithm):
     rng = cp.random.default_rng(123)
     shape = (350, 407)  # use anisotropic size
     img = rng.standard_normal(shape, dtype=cp.float32)
-    if algorithm in ["invalid", "histogram"]:
-        # histogram supports only integer-valued dtypes
+    if algorithm == "invalid":
         # 'invalid' is an uncrecognized algorithm
         with pytest.raises(ValueError):
             median(img, footprint, mode=mode, algorithm=algorithm)
@@ -279,6 +204,35 @@ def test_median_algorithm_parameter(algorithm):
         out = median(img, footprint, mode=mode, algorithm=algorithm)
         expected = ndimage.median_filter(img, size=footprint.shape, mode=mode)
         assert_allclose(expected, out)
+
+
+def test_median_histogram_algorithm_is_deprecated(monkeypatch):
+    """'histogram' warns once and behaves as 'auto'."""
+    monkeypatch.setattr(median_module, "_histogram_warned", False)
+    footprint = cp.ones((15, 23), dtype=bool)
+    rng = cp.random.default_rng(123)
+    img = rng.integers(0, 256, (120, 130), dtype=cp.uint8)
+    expected = ndimage.median_filter(img, size=footprint.shape, mode="nearest")
+    with pytest.warns(FutureWarning, match="histogram"):
+        out = median(img, footprint, algorithm="histogram")
+    assert_allclose(expected, out)
+    # no warning the second time
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = median(img, footprint, algorithm="histogram")
+    assert_allclose(expected, out)
+    # float input used to be an error
+    img = img.astype(cp.float32)
+    out = median(img, footprint, algorithm="histogram")
+    assert_allclose(
+        ndimage.median_filter(img, size=footprint.shape, mode="nearest"), out
+    )
+
+
+def test_median_algorithm_kwargs_ignored():
+    img = cp.zeros((20, 20), dtype=cp.uint8)
+    with pytest.warns(UserWarning, match="algorithm_kwargs"):
+        median(img, algorithm_kwargs={"partitions": 32})
 
 
 @pytest.mark.parametrize("dtype", [cp.uint8, cp.uint16, cp.float32, cp.float64])
