@@ -49,6 +49,16 @@ LICENSE-3rdparty.md for the attribution). Beyond that, this module adds:
   fully written.
 - A check that the estimated memory use fits (`_has_enough_memory`), used by
   `median` to select an algorithm.
+- A 3D version of the query for volumes with a box footprint
+  (`_median_wavelet_filter_3d`): the padded planes are stacked as the rows of
+  one 2D image, so the construction is unchanged, and the window of a voxel is
+  one range of rows in each of the ``2 * radius_z + 1`` planes it covers. At
+  each value level the query adds up the counts of the ranges, and every range
+  then follows the same 0 or 1 branch, so the cost is that of the 2D query
+  times the depth of the window (``wavelet_median3d``, with the state of the
+  ranges in per-thread arrays, which limits ``radius_z`` to
+  ``WM_MAX_RADIUS_Z``). Volumes are filtered in slabs of planes with a halo of
+  ``radius_z`` planes.
 
 Not included: the polygonal windows and the multi-channel launch of the
 original, and the 64-bit bit-vector words.
@@ -77,6 +87,7 @@ Data flow
    walking the value levels from the most significant bit down.
 """
 
+import math
 import os
 from collections import namedtuple
 
@@ -103,6 +114,10 @@ WM_THREADS_H = 64  # Threads per block in Y for median query
 # Column indices are stored as uint16
 WM_MAX_PADDED_WIDTH = 65534
 
+# The 3D query keeps the state of one row range per plane of the window in
+# per-thread arrays
+WM_MAX_RADIUS_Z = 31
+
 # Large images are filtered in slabs of rows (each with a halo of ``radius_y``
 # rows) when the matrices of the whole image would not fit in this fraction of
 # the available device memory. The estimate is not exact and the memory pool
@@ -111,6 +126,8 @@ WM_MEMORY_FRACTION = 0.5
 # The slab height is at least this many rows and at least ``4 * radius_y``
 # (so that recomputing the halo rows costs at most 50% more work).
 WM_MIN_SLAB_ROWS = 64
+# The same for the planes of a volume
+WM_MIN_SLAB_PLANES = 4
 
 # CuPy compilation options for CUB
 CUB_COMPILE_OPTIONS = ("--std=c++17", "-DCUB_DISABLE_BF16_SUPPORT")
@@ -337,6 +354,22 @@ def _available_memory():
     return free + cp.get_default_memory_pool().free_bytes()
 
 
+def _largest_fitting(lo, hi, estimate, budget):
+    """Largest n in [lo, hi] with ``estimate(n) <= budget`` (None if none).
+
+    ``estimate`` must grow with n.
+    """
+    if estimate(lo) > budget:
+        return None
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate(mid) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def _plan_slab_rows(height, width, dtype, ry, rx, budget=None):
     """Number of output rows to filter at a time.
 
@@ -358,23 +391,52 @@ def _plan_slab_rows(height, width, dtype, ry, rx, budget=None):
     if max_rows == height and estimate(height) <= budget:
         return height
     lo = min(max_rows, max(WM_MIN_SLAB_ROWS, 4 * ry))
-    if estimate(lo) > budget:
+    return _largest_fitting(lo, max_rows, estimate, budget)
+
+
+def _slab_memory_estimate_3d(planes, nz, height, width, dtype, rz, ry, rx):
+    """Estimated peak memory (bytes) of the 3D filter in slabs of ``planes``."""
+    # the matrices are those of an image of (planes + 2 rz) * (H + 2 ry) rows
+    rows = (planes + 2 * rz) * (height + 2 * ry)
+    itemsize = np.dtype(dtype).itemsize
+    # (the output has planes * H rows, not `rows`)
+    slab = _estimate_memory_usage(rows, width, dtype, 0, rx)
+    slab += (planes * height - rows) * width * itemsize
+    if planes >= nz:
+        return slab
+    padded = (nz + 2 * rz) * (height + 2 * ry) * (width + 2 * rx)
+    return slab + (padded + nz * height * width) * itemsize
+
+
+def _plan_slab_planes(nz, height, width, dtype, rz, ry, rx, budget=None):
+    """Number of output planes of a volume to filter at a time (see
+    `_plan_slab_rows`); None if not even the smallest slab fits."""
+    if budget is None:
+        budget = WM_MEMORY_FRACTION * _available_memory()
+    plane = (height + 2 * ry) * (width + 2 * rx)
+    max_planes = min(nz, (2**32 - 1) // plane - 2 * rz)
+    if max_planes < 1:
         return None
-    hi = max_rows  # the estimate grows with the slab height
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if estimate(mid) <= budget:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+
+    def estimate(planes):
+        return _slab_memory_estimate_3d(
+            planes, nz, height, width, dtype, rz, ry, rx
+        )
+
+    if max_planes == nz and estimate(nz) <= budget:
+        return nz
+    lo = min(max_planes, max(WM_MIN_SLAB_PLANES, 4 * rz))
+    return _largest_fitting(lo, max_planes, estimate, budget)
 
 
 def _has_enough_memory(image, footprint_shape):
     """True if the image can be filtered within the memory budget."""
-    ry, rx = footprint_shape[0] // 2, footprint_shape[1] // 2
-    rows = _plan_slab_rows(*image.shape, image.dtype, ry, rx)
-    return rows is not None
+    radii = [s // 2 for s in footprint_shape]
+    if image.ndim == 3:
+        planned = _plan_slab_planes(*image.shape, image.dtype, *radii)
+    else:
+        planned = _plan_slab_rows(*image.shape, image.dtype, *radii)
+    return planned is not None
 
 
 def _get_val_bit_len(dtype, total_pixels):
@@ -398,6 +460,7 @@ def _gen_preamble(val_type):
 #define WM_SRC_CACHE_DIV {WM_SRC_CACHE_DIV}
 #define WM_THREADS_W {WM_THREADS_W}
 #define WM_THREADS_H {WM_THREADS_H}
+#define WM_MAX_NZ {WM_MAX_RADIUS_Z * 2 + 1}
 """
 
 
@@ -410,12 +473,14 @@ def _read_kernel_source(*names):
 
 
 @cp.memoize(for_each_device=True)
-def _get_median_query_kernel(val_type):
-    """Compile the query kernel for a matrix value type."""
+def _get_median_query_kernel(val_type, ndim=2):
+    """Compile the query kernel (2D or 3D) for a matrix value type."""
     code = _gen_preamble(val_type) + _read_kernel_source(
         "wavelet_matrix_common.cuh", "wavelet_matrix_median.cu"
     )
-    return cp.RawKernel(code, "wavelet_median2d", options=CUB_COMPILE_OPTIONS)
+    return cp.RawKernel(
+        code, f"wavelet_median{ndim}d", options=CUB_COMPILE_OPTIONS
+    )
 
 
 _CONSTRUCTION_KERNELS = (
@@ -466,8 +531,8 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, mode=None):
     reason : str or None
         Reason for incompatibility, or None if compatible
     """
-    if image.ndim != 2:
-        return False, "Only 2D images are supported"
+    if image.ndim not in (2, 3):
+        return False, "Only 2D and 3D images are supported"
 
     if image.dtype.kind not in "uif" or image.dtype.itemsize > 8:
         return False, f"Unsupported dtype: {image.dtype}"
@@ -475,18 +540,22 @@ def _can_use_wavelet_matrix(image, footprint_shape=None, mode=None):
     if mode is not None and mode not in _SUPPORTED_MODES:
         return False, f"Unsupported mode: {mode!r}"
 
-    ry = rx = 0
+    rx = 0
     if footprint_shape is not None:
-        if len(footprint_shape) != 2:
-            return False, "Footprint must be 2D"
-        if footprint_shape[0] % 2 == 0 or footprint_shape[1] % 2 == 0:
+        if len(footprint_shape) != image.ndim:
+            return False, "Footprint must have as many axes as the image"
+        if any(s % 2 == 0 for s in footprint_shape):
             return False, "Footprint dimensions must be odd"
-        ry = footprint_shape[0] // 2
-        rx = footprint_shape[1] // 2
-        if ry < 1 or rx < 1:
+        if any(s < 3 for s in footprint_shape):
             return False, "Footprint must be at least 3 along each axis"
+        rx = footprint_shape[-1] // 2
+        if image.ndim == 3 and footprint_shape[0] // 2 > WM_MAX_RADIUS_Z:
+            return (
+                False,
+                f"Footprint radius along axis 0 exceeds {WM_MAX_RADIUS_Z}",
+            )
 
-    padded_w = image.shape[1] + 2 * rx
+    padded_w = image.shape[-1] + 2 * rx
     if padded_w > WM_MAX_PADDED_WIDTH:
         return False, f"Padded width exceeds maximum ({WM_MAX_PADDED_WIDTH})"
 
@@ -1119,5 +1188,176 @@ def _median_wavelet_filter(
             return filtered
         result[r0:r1] = filtered
         # free the temporary arrays before the next slab allocates its own
+        del values, sorted_values, selected, filtered
+    return result
+
+
+def _run_median_query_3d(params, buffers, output, rank, geometry):
+    """Run the 3D query kernel (``output`` is ``(planes, H, W)``).
+
+    ``params`` describe the matrices, which were built on the padded planes
+    stacked as the rows of a 2D image; ``geometry`` is ``(planes, H, W,
+    padded_H, rz, ry, rx)`` with ``planes`` the number of output planes.
+    """
+    planes, height, width, padded_h, rz, ry, rx = geometry
+    kernel = _get_median_query_kernel(params.val_type, 3)
+    level_bytes = params.bv_block_len * WM_BLOCK_T_SIZE
+    bv_start_offset = (params.val_bit_len - 1) * level_bytes
+    wm_start_offset = (
+        (params.val_bit_len - 1) * params.w_bit_len + (params.w_bit_len - 1)
+    ) * level_bytes
+    grid = (
+        _div_ceil(height, WM_THREADS_H),
+        _div_ceil(width, WM_THREADS_W),
+        planes,
+    )
+    kernel(
+        grid,
+        (WM_THREADS_W, WM_THREADS_H, 1),
+        (
+            np.int32(height),
+            np.int32(width),
+            np.int32(padded_h),
+            np.int32(params.padded_w),
+            np.int32(rz),
+            np.int32(ry),
+            np.int32(rx),
+            np.uint32(rank),
+            output,
+            buffers.wm_blocks[wm_start_offset:],
+            np.uint32(params.nsum_pos),
+            np.uint32(level_bytes // 32),
+            buffers.bv_blocks[bv_start_offset:],
+            np.uint8(params.w_bit_len),
+            np.uint8(params.val_bit_len),
+        ),
+    )
+    return output
+
+
+def _median_wavelet_filter_3d(
+    image,
+    radius_z,
+    radius_y,
+    radius_x,
+    mode="reflect",
+    cval=0.0,
+    rank=None,
+    slab_planes=None,
+):
+    """
+    Apply the wavelet matrix rank filter with a full box footprint to a volume.
+
+    The padded volume is the sequence of its planes, so the matrices are those
+    of a 2D image with ``planes * (H + 2 * radius_y)`` rows, and the window of
+    a voxel is one range of rows in each of ``2 * radius_z + 1`` planes. The
+    query kernel handles these ranges together (cost proportional to the
+    window depth). As in `_median_wavelet_filter`, the volume is filtered in
+    slabs of planes, each with a halo of ``radius_z`` planes, when the matrices
+    of the whole volume would not fit in ``WM_MEMORY_FRACTION`` of the
+    available device memory; the results do not depend on the slab height.
+
+    Parameters
+    ----------
+    image : cupy.ndarray
+        Input 3D volume (see `_can_use_wavelet_matrix`).
+    radius_z, radius_y, radius_x : int
+        Filter radii along axes 0, 1 and 2.
+    mode, cval :
+        Boundary mode (scipy.ndimage names) and constant value.
+    rank : int, optional
+        Index of the selected element of the sorted window values, in
+        ``[0, window_size)``. The default is the median, ``window_size // 2``.
+    slab_planes : int, optional
+        Number of output planes to filter at a time (default: chosen from the
+        available memory).
+
+    Returns
+    -------
+    result : cupy.ndarray
+        Filtered volume with the same shape and dtype as the input.
+    """
+    footprint_shape = (2 * radius_z + 1, 2 * radius_y + 1, 2 * radius_x + 1)
+    ok, reason = _can_use_wavelet_matrix(
+        image, footprint_shape=footprint_shape, mode=mode
+    )
+    if not ok or image.ndim != 3:
+        raise ValueError(f"Cannot use wavelet matrix filter: {reason}")
+
+    window_size = math.prod(footprint_shape)
+    if rank is None:
+        rank = window_size // 2
+    elif not 0 <= rank < window_size:
+        raise ValueError(f"rank must be in [0, {window_size}), got {rank}")
+
+    nz, height, width = image.shape
+    if slab_planes is None:
+        slab_planes = _plan_slab_planes(
+            nz, height, width, image.dtype, radius_z, radius_y, radius_x
+        )
+        if slab_planes is None:
+            # nothing fits the budget: try the smallest slab anyway
+            slab_planes = min(nz, max(WM_MIN_SLAB_PLANES, 4 * radius_z))
+    n_slabs = _div_ceil(nz, min(slab_planes, nz))
+    slab_planes = _div_ceil(nz, n_slabs)
+
+    pad_kwargs = {"constant_values": cval} if mode == "constant" else {}
+    padded = cp.pad(
+        image,
+        (
+            (radius_z, radius_z),
+            (radius_y, radius_y),
+            (radius_x, radius_x),
+        ),
+        mode=_to_np_mode(mode),
+        **pad_kwargs,
+    )
+    padded_h = height + 2 * radius_y
+
+    kernels = None
+    params = buffers = None
+    result = None if n_slabs == 1 else cp.empty_like(image)
+    for z0 in range(0, nz, slab_planes):
+        z1 = min(nz, z0 + slab_planes)
+        # the planes of the padded volume are contiguous
+        slab = padded[z0 : z1 + 2 * radius_z]
+        if (
+            params is None
+            or params.height != (z1 - z0 + 2 * radius_z) * padded_h
+        ):
+            params = buffers = None
+            params = WaveletMatrixMedianParams(
+                (z1 - z0 + 2 * radius_z) * padded_h,
+                width,
+                image.dtype,
+                0,
+                radius_x,
+            )
+            buffers = WaveletMatrixBuffers(params)
+        if kernels is None:
+            kernels = _get_construction_kernels(params.val_type)
+
+        sorted_values = None
+        if params.is_rank_mode:
+            values, sorted_values = _to_ranks(slab)
+        else:
+            values = _to_keys(slab)
+        _run_wavelet_construction(values, params, buffers, kernels)
+
+        selected = cp.empty((z1 - z0, height, width), dtype=params.matrix_dtype)
+        _run_median_query_3d(
+            params,
+            buffers,
+            selected,
+            rank,
+            (z1 - z0, height, width, padded_h, radius_z, radius_y, radius_x),
+        )
+        if params.is_rank_mode:
+            filtered = sorted_values[selected]
+        else:
+            filtered = _from_keys(selected, image.dtype)
+        if result is None:
+            return filtered
+        result[z0:z1] = filtered
         del values, sorted_values, selected, filtered
     return result

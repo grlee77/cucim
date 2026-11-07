@@ -34,6 +34,65 @@
  */
 
 /*
+ * Number of elements with a 0 at the current value bit in the window that is
+ * bounded by the rows [top, bot) of the sequence (given as the positions
+ * `top0` and `bot0` in the 0 half of the value level) and the columns
+ * [xa, xb), found with the column wavelet matrix of that value level
+ * (inclusion-exclusion on the four window corners). `wm_ptr` points to the
+ * most significant column level of the value level. The sums are modulo 2^32,
+ * so the count of several windows can be accumulated in one variable.
+ */
+__device__ __forceinline__ XYIdxT wavelet_window_zeros(
+    const XYIdxT top0,
+    const XYIdxT bot0,
+    const XIdxT xa,
+    const XIdxT xb,
+    const BlockT* __restrict__ wm_ptr,
+    const unsigned int nsum_pos,
+    const size_t level_bytes,
+    const int w_bit_len
+) {
+    XYIdxT l_ya_xa = top0;
+    XYIdxT l_yb_xa = bot0;
+    XYIdxT l_ya_xb = top0;
+    XYIdxT l_yb_xb = bot0;
+    XYIdxT d = 0;
+
+    const BlockT* wm_level_ptr = wm_ptr;
+    for (int j = w_bit_len; j-- > 0; ) {
+        const XYIdxT zeros = wm_level_ptr[nsum_pos].nsum;
+
+        const XYIdxT l_ya_xa_rank0 = wavelet_rank0(l_ya_xa, wm_level_ptr);
+        const XYIdxT l_ya_xb_rank0 = wavelet_rank0(l_ya_xb, wm_level_ptr);
+        const XYIdxT l_yb_xb_rank0 = wavelet_rank0(l_yb_xb, wm_level_ptr);
+        const XYIdxT l_yb_xa_rank0 = wavelet_rank0(l_yb_xa, wm_level_ptr);
+
+        if (((xa >> j) & 1) == 0) {
+            l_ya_xa = l_ya_xa_rank0;
+            l_yb_xa = l_yb_xa_rank0;
+        } else {
+            d += l_ya_xa_rank0;
+            l_ya_xa += zeros - l_ya_xa_rank0;
+            d -= l_yb_xa_rank0;
+            l_yb_xa += zeros - l_yb_xa_rank0;
+        }
+
+        if (((xb >> j) & 1) == 0) {
+            l_ya_xb = l_ya_xb_rank0;
+            l_yb_xb = l_yb_xb_rank0;
+        } else {
+            d -= l_ya_xb_rank0;
+            l_ya_xb += zeros - l_ya_xb_rank0;
+            d += l_yb_xb_rank0;
+            l_yb_xb += zeros - l_yb_xb_rank0;
+        }
+
+        wm_level_ptr = (const BlockT*)((const char*)wm_level_ptr - level_bytes);
+    }
+    return d;
+}
+
+/*
  * Each thread computes the element of rank `k` (0-based, ascending order; the
  * median is k = window_size / 2) of the (2*ry+1) x (2*rx+1) window of one
  * output pixel. The input was padded by ry rows and rx columns on each side
@@ -101,45 +160,9 @@ extern "C" __global__ void wavelet_median2d(
         const XYIdxT top0 = wavelet_rank0(ya, bv_ptr);
         const XYIdxT bot0 = wavelet_rank0(yb, bv_ptr);
 
-        XYIdxT l_ya_xa = top0;
-        XYIdxT l_yb_xa = bot0;
-        XYIdxT l_ya_xb = top0;
-        XYIdxT l_yb_xb = bot0;
-
         // Number of window elements with a 0 at the current value bit
-        XYIdxT d = 0;
-
-        const BlockT* wm_level_ptr = wm_ptr;
-        for (int j = w_bit_len; j-- > 0; ) {
-            const XYIdxT zeros = wm_level_ptr[nsum_pos].nsum;
-
-            const XYIdxT l_ya_xa_rank0 = wavelet_rank0(l_ya_xa, wm_level_ptr);
-            const XYIdxT l_ya_xb_rank0 = wavelet_rank0(l_ya_xb, wm_level_ptr);
-            const XYIdxT l_yb_xb_rank0 = wavelet_rank0(l_yb_xb, wm_level_ptr);
-            const XYIdxT l_yb_xa_rank0 = wavelet_rank0(l_yb_xa, wm_level_ptr);
-
-            if (((xa >> j) & 1) == 0) {
-                l_ya_xa = l_ya_xa_rank0;
-                l_yb_xa = l_yb_xa_rank0;
-            } else {
-                d += l_ya_xa_rank0;
-                l_ya_xa += zeros - l_ya_xa_rank0;
-                d -= l_yb_xa_rank0;
-                l_yb_xa += zeros - l_yb_xa_rank0;
-            }
-
-            if (((xb >> j) & 1) == 0) {
-                l_ya_xb = l_ya_xb_rank0;
-                l_yb_xb = l_yb_xb_rank0;
-            } else {
-                d -= l_ya_xb_rank0;
-                l_ya_xb += zeros - l_ya_xb_rank0;
-                d += l_yb_xb_rank0;
-                l_yb_xb += zeros - l_yb_xb_rank0;
-            }
-
-            wm_level_ptr = (const BlockT*)((const char*)wm_level_ptr - level_bytes);
-        }
+        const XYIdxT d = wavelet_window_zeros(
+            top0, bot0, xa, xb, wm_ptr, nsum_pos, level_bytes, w_bit_len);
 
         const XYIdxT bv_h_zeros = bv_ptr[nsum_pos].nsum;
 
@@ -161,4 +184,104 @@ extern "C" __global__ void wavelet_median2d(
     }
 
     res_cu[(XYIdxT)y * W + x] = res;
+}
+
+/*
+ * 3D version of the query: the element of rank `k` of the
+ * (2*rz+1) x (2*ry+1) x (2*rx+1) window of one output voxel.
+ *
+ * The padded volume (padded by rz planes, ry rows and rx columns on each side)
+ * is the sequence of its planes, each `padded_H` rows of `padded_W` elements,
+ * so the matrices are those of a 2D image of `planes * padded_H` rows. The
+ * window of the voxel (z, y, x) consists of 2*rz+1 ranges of rows, one in each
+ * of the planes z .. z + 2*rz of the padded volume. At each value level the
+ * number d of window elements with a 0 at the current bit is the sum of the
+ * counts of the ranges (`wavelet_window_zeros`), and every range then moves to
+ * the 0 or the 1 half of the next level together. The cost of a query is
+ * therefore that of the 2D query times 2*rz+1. The state of the ranges is
+ * kept in per-thread arrays of at most WM_MAX_NZ entries.
+ *
+ * Parameters (those not described at wavelet_median2d):
+ *   H, W:       size of the output planes; the grid z index is the plane
+ *   padded_H:   rows of a padded plane (H + 2*ry)
+ *   rz:         filter radius along the planes
+ *   res_cu:     output (planes x H x W, C-contiguous)
+ */
+#ifndef WM_MAX_NZ
+#define WM_MAX_NZ 63
+#endif
+
+extern "C" __global__ void wavelet_median3d(
+    const int H,
+    const int W,
+    const int padded_H,
+    const int padded_W,
+    const int rz,
+    const int ry,
+    const int rx,
+    const unsigned int k_in,
+    WM_VAL_T* __restrict__ res_cu,
+    const BlockT* __restrict__ wm_nbit_bp,
+    const unsigned int nsum_pos,
+    const unsigned int bv_block_h_byte_div32,
+    const BlockT* __restrict__ bv_nbit_bp,
+    const unsigned char w_bit_len,
+    const unsigned char val_bit_len
+) {
+    const int y = blockIdx.x * WM_THREADS_H + threadIdx.y;
+    if (y >= H) return;
+    const int x = blockIdx.y * WM_THREADS_W + threadIdx.x;
+    if (x >= W) return;
+    const int z = blockIdx.z;
+
+    const XIdxT xa = x;
+    const XIdxT xb = x + 2 * rx + 1;
+    const int nz = 2 * rz + 1;
+
+    // Row ranges [ya_s[i], yb_s[i]) of the planes z + i, as sequence positions
+    XYIdxT ya_s[WM_MAX_NZ];
+    XYIdxT yb_s[WM_MAX_NZ];
+    for (int i = 0; i < nz; i++) {
+        const XYIdxT row = (XYIdxT)(z + i) * padded_H + y;
+        ya_s[i] = row * padded_W;
+        yb_s[i] = (row + 2 * ry + 1) * padded_W;
+    }
+    XYIdxT k = k_in;
+
+    WM_VAL_T res = 0;
+
+    const size_t level_bytes = bv_block_h_byte_div32 * 32ull;
+    const BlockT* bv_ptr = bv_nbit_bp;
+    const BlockT* wm_ptr = wm_nbit_bp;
+
+    for (int h = val_bit_len; h-- > 0; ) {
+        XYIdxT d = 0;
+        for (int i = 0; i < nz; i++) {
+            const XYIdxT top0 = wavelet_rank0(ya_s[i], bv_ptr);
+            const XYIdxT bot0 = wavelet_rank0(yb_s[i], bv_ptr);
+            d += wavelet_window_zeros(
+                top0, bot0, xa, xb, wm_ptr, nsum_pos, level_bytes, w_bit_len);
+        }
+
+        if (k < d) {
+            // The result has a 0 at this bit: all ranges move to the 0 half
+            for (int i = 0; i < nz; i++) {
+                ya_s[i] = wavelet_rank0(ya_s[i], bv_ptr);
+                yb_s[i] = wavelet_rank0(yb_s[i], bv_ptr);
+            }
+        } else {
+            k -= d;
+            res |= (WM_VAL_T)1 << h;
+            const XYIdxT bv_h_zeros = bv_ptr[nsum_pos].nsum;
+            for (int i = 0; i < nz; i++) {
+                ya_s[i] += bv_h_zeros - wavelet_rank0(ya_s[i], bv_ptr);
+                yb_s[i] += bv_h_zeros - wavelet_rank0(yb_s[i], bv_ptr);
+            }
+        }
+
+        bv_ptr = (const BlockT*)((const char*)bv_ptr - level_bytes);
+        wm_ptr = (const BlockT*)((const char*)wm_ptr - level_bytes * w_bit_len);
+    }
+
+    res_cu[((XYIdxT)z * H + y) * W + x] = res;
 }

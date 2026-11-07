@@ -150,12 +150,14 @@ def test_wavelet_footprint_checks():
     expected = median(img, footprint, algorithm="sorting")
     cp.testing.assert_array_equal(median(img, footprint), expected)
 
-    # even footprint sizes and 3D images are not supported either
+    # even footprint sizes and 4D images are not supported either
     with pytest.raises(ValueError, match="wavelet_matrix"):
         median(img, (4, 4), algorithm="wavelet_matrix")
     with pytest.raises(ValueError, match="wavelet_matrix"):
         median(
-            cp.zeros((5, 5, 5), np.uint8), (3, 3, 3), algorithm="wavelet_matrix"
+            cp.zeros((5, 5, 5, 5), np.uint8),
+            (3, 3, 3, 3),
+            algorithm="wavelet_matrix",
         )
 
 
@@ -394,14 +396,134 @@ def test_auto_uses_wavelet_per_channel_for_rgb(monkeypatch):
 
 def test_wavelet_multichannel_unsupported_footprints():
     img = _random_image((40, 40, 3), np.uint8)
-    # no axis of size 1, or a footprint with zeros: not supported
-    for footprint in (
-        np.ones((5, 5, 3), dtype=bool),
-        np.ones((5, 5, 1), dtype=bool) & (np.arange(25).reshape(5, 5, 1) != 7),
-    ):
-        with pytest.raises(ValueError):
-            median(img, footprint, algorithm="wavelet_matrix")
-        cp.testing.assert_array_equal(
-            median(img, footprint),
-            median(img, footprint, algorithm="sorting"),
+    # a footprint with zeros is not supported
+    footprint = np.ones((5, 5, 1), dtype=bool)
+    footprint[2, 2, 0] = False
+    with pytest.raises(ValueError):
+        median(img, footprint, algorithm="wavelet_matrix")
+    cp.testing.assert_array_equal(
+        median(img, footprint), median(img, footprint, algorithm="sorting")
+    )
+    # more than one axis of size 1
+    with pytest.raises(ValueError):
+        median(img, np.ones((5, 1, 1), dtype=bool), algorithm="wavelet_matrix")
+
+
+# 3D volumes -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("mode", ["reflect", "constant", "wrap"])
+def test_wavelet_3d_matches_sorting(dtype, mode):
+    img = _random_image((9, 14, 12), dtype)
+    footprint = np.ones((3, 5, 3), dtype=bool)
+    expected = median(img, footprint, mode=mode, cval=2, algorithm="sorting")
+    out = median(img, footprint, mode=mode, cval=2, algorithm="wavelet_matrix")
+    assert out.shape == img.shape and out.dtype == img.dtype
+    cp.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize(
+    "footprint_shape", [(3, 3, 3), (5, 3, 3), (3, 3, 5), (5, 5, 3), (3, 7, 5)]
+)
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_wavelet_3d_footprint_shapes(footprint_shape, dtype):
+    img = _random_image((12, 16, 14), dtype)
+    footprint = np.ones(footprint_shape, dtype=bool)
+    expected = median(img, footprint, mode="mirror", algorithm="sorting")
+    out = median(img, footprint, mode="mirror", algorithm="wavelet_matrix")
+    cp.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("rank", [0, 5, 13, 26])
+def test_wavelet_3d_rank(rank):
+    img = _random_image((8, 11, 10), np.uint16)
+    out = mw._median_wavelet_filter_3d(img, 1, 1, 1, mode="nearest", rank=rank)
+    expected = cndi.rank_filter(img, rank, size=(3, 3, 3), mode="nearest")
+    cp.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize("mode", ["reflect", "constant"])
+def test_wavelet_3d_slabs_match_single_slab(dtype, mode):
+    img = _random_image((23, 12, 9), dtype)
+    args = (2, 1, 1)
+    full = mw._median_wavelet_filter_3d(
+        img, *args, mode=mode, cval=1, slab_planes=23
+    )
+    # slab heights that do and do not divide the number of planes
+    for planes in (1, 4, 7, 22):
+        slabbed = mw._median_wavelet_filter_3d(
+            img, *args, mode=mode, cval=1, slab_planes=planes
         )
+        cp.testing.assert_array_equal(slabbed, full)
+
+
+def test_plan_slab_planes():
+    args = (128, 256, 256, np.uint8, 3, 3, 3)
+    whole = mw._slab_memory_estimate_3d(128, *args)
+    assert mw._plan_slab_planes(*args, budget=whole) == 128
+    prev = 128
+    for fraction in (0.7, 0.4, 0.2):
+        planes = mw._plan_slab_planes(*args, budget=fraction * whole)
+        assert mw.WM_MIN_SLAB_PLANES <= planes < prev
+        assert mw._slab_memory_estimate_3d(planes, *args) <= fraction * whole
+        prev = planes
+    assert mw._plan_slab_planes(*args, budget=1024) is None
+
+
+def test_wavelet_3d_memory_estimate():
+    pool = cp.get_default_memory_pool()
+    img = _random_image((40, 48, 48), np.uint16)
+    radii = (2, 2, 2)
+    for planes in (12, 40):
+        mw._median_wavelet_filter_3d(img, *radii, slab_planes=planes)
+        pool.free_all_blocks()
+        base = pool.total_bytes()  # the input volume
+        out = mw._median_wavelet_filter_3d(img, *radii, slab_planes=planes)
+        actual = pool.total_bytes() - base
+        estimate = mw._slab_memory_estimate_3d(
+            planes, 40, 48, 48, img.dtype, *radii
+        )
+        # the estimate must not be low, and not much too high
+        assert 0.9 * actual <= estimate <= 1.5 * actual
+        del out
+
+
+def test_wavelet_3d_footprint_limits():
+    img = _random_image((8, 8, 8), np.uint8)
+    # the depth radius is limited by the per-thread state of the query
+    deep = np.ones((2 * mw.WM_MAX_RADIUS_Z + 3, 3, 3), dtype=bool)
+    with pytest.raises(ValueError):
+        median(cp.zeros((70, 8, 8), np.uint8), deep, algorithm="wavelet_matrix")
+    # even sizes and footprints with zeros are not supported
+    with pytest.raises(ValueError):
+        median(img, np.ones((3, 3, 4), dtype=bool), algorithm="wavelet_matrix")
+    holes = np.ones((3, 3, 3), dtype=bool)
+    holes[1, 1, 1] = False
+    with pytest.raises(ValueError):
+        median(img, holes, algorithm="wavelet_matrix")
+
+
+@pytest.mark.parametrize(
+    "footprint_shape,expect_wavelet",
+    [((3, 3, 3), False), ((5, 5, 5), False), ((5, 5, 7), True)],
+)
+def test_auto_algorithm_threshold_3d(
+    monkeypatch, footprint_shape, expect_wavelet
+):
+    img = _random_image((12, 12, 12), np.uint8)
+    footprint = np.ones(footprint_shape, dtype=bool)
+    expected = median(img, footprint, algorithm="sorting")
+    calls = []
+    original = mw._median_wavelet_filter_3d
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "cucim.skimage.filters._median._median_wavelet_filter_3d", counting
+    )
+    cp.testing.assert_array_equal(median(img, footprint), expected)
+    assert bool(calls) == expect_wavelet

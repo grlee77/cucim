@@ -14,24 +14,28 @@ from ._median_wavelet import (
     _can_use_wavelet_matrix,
     _has_enough_memory,
     _median_wavelet_filter,
+    _median_wavelet_filter_3d,
 )
 
 _histogram_warned = False
 
 
 def _get_wavelet_planes(image, footprint_shape):
-    """Find the 2D planes of ``image`` that the wavelet matrix filters.
+    """Find the images that the wavelet matrix filters.
 
-    Returns ``(channel_axis, plane, plane_footprint_shape)``. For a 2D image
-    ``channel_axis`` is None and the plane is the image. For a 3D image with
-    a footprint of size 1 along exactly one axis, ``channel_axis`` is that
-    axis, ``plane`` is the first plane (a view) and the footprint shape is
-    that of the other two axes. Otherwise ``plane`` is None.
+    Returns ``(channel_axis, plane, plane_footprint_shape)``. For a 2D image,
+    or a 3D volume with a footprint without axes of size 1, ``channel_axis``
+    is None and ``plane`` is the image. For a 3D image with a footprint of
+    size 1 along exactly one axis, ``channel_axis`` is that axis, ``plane`` is
+    the first plane (a view) and the footprint shape is that of the other two
+    axes. Otherwise ``plane`` is None.
     """
     if image.ndim == 2:
         return None, image, footprint_shape
     if image.ndim == 3:
         ones = [i for i, s in enumerate(footprint_shape) if s == 1]
+        if not ones:
+            return None, image, footprint_shape
         if len(ones) == 1 and image.shape[ones[0]] > 0:
             axis = ones[0]
             plane = image[(slice(None),) * axis + (0,)]
@@ -140,6 +144,14 @@ def median(
     footprints, other dimensionalities and footprints that are not full
     rectangles use the sorting-based algorithm.
 
+    For 3D volumes and full box footprints the same data structure is used
+    with the rows of all the planes stacked, and the query handles the window
+    of every plane (its cost is proportional to the depth of the window). It is
+    faster than sorting from about 150 footprint elements, e.g. 4.4 (uint8) to
+    1.3 (float32) times for a 5 x 5 x 7 footprint, and 11 and 33 times for
+    7 x 7 x 7 and 9 x 9 x 9 footprints of uint8 (measured on 96^3 to 128^3
+    volumes).
+
     A 3D image with a footprint of size 1 along one axis (for example an RGB
     image and a footprint of shape ``(h, w, 1)``) is filtered one plane at a
     time with the wavelet matrix algorithm, which gives the same result as
@@ -237,8 +249,8 @@ def median(
         if plane is None:
             can_use_wavelet = False
             wm_reason = (
-                "Only 2D images, or 3D images with a footprint of size 1 "
-                "along one axis (e.g. RGB), are supported"
+                "Only 2D images, 3D volumes and 3D images with a footprint "
+                "of size 1 along one axis (e.g. RGB), are supported"
             )
         elif footprint is not None and not bool(cp.all(cp.asarray(footprint))):
             # Footprint has zeros - wavelet matrix only supports full rectangles
@@ -270,6 +282,12 @@ def median(
     # still wins at 11 x 11 (10.8 ms), but not at 13 x 13 (96 ms).
     footprint_size = math.prod(footprint_shape)
     wavelet_min_size = 100 if image.dtype.itemsize <= 2 else 150
+    if image.ndim == 3 and channel_axis is None:
+        # volumes: on 96^3 to 128^3 volumes the wavelet matrix is faster than
+        # sorting from about 150 elements (e.g. 5 x 5 x 7: 4.4 (uint8),
+        # 2.4 (uint16) and 1.3 (float32) times faster) and slower below
+        # (e.g. 5 x 5 x 5: 20 times slower for float32)
+        wavelet_min_size = 150
     use_wavelet = False
 
     if algorithm == "auto":
@@ -300,9 +318,18 @@ def median(
                         )
 
             # Support rectangular footprints
-            radius_y = plane_footprint_shape[0] // 2
-            radius_x = plane_footprint_shape[1] // 2
-            if channel_axis is None:
+            radius_y = plane_footprint_shape[-2] // 2
+            radius_x = plane_footprint_shape[-1] // 2
+            if channel_axis is None and image.ndim == 3:
+                temp = _median_wavelet_filter_3d(
+                    image,
+                    radius_z=plane_footprint_shape[0] // 2,
+                    radius_y=radius_y,
+                    radius_x=radius_x,
+                    mode=mode,
+                    cval=cval,
+                )
+            elif channel_axis is None:
                 temp = _median_wavelet_filter(
                     image,
                     radius_y=radius_y,
