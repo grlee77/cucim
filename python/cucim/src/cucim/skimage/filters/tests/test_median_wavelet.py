@@ -23,6 +23,23 @@ ALL_DTYPES = [
 ]
 
 
+@pytest.fixture
+def private_pool():
+    """Route CuPy allocations to a fresh memory pool for the test.
+
+    The memory tests compare an estimate with the growth of the pool's total
+    size. In the default pool, arrays left alive by earlier tests can pin part
+    of a large chunk: ``free_all_blocks`` cannot release the free remainder of
+    a partly used chunk, and the measured call then reuses it without growing
+    the pool, so the measured size depends on the tests that ran before. A
+    private pool holds only this test's allocations.
+    """
+    pool = cp.cuda.MemoryPool()
+    with cp.cuda.using_allocator(pool.malloc):
+        yield pool
+    pool.free_all_blocks()
+
+
 def _random_image(shape, dtype, seed=0):
     rng = np.random.default_rng(seed)
     dtype = np.dtype(dtype)
@@ -210,8 +227,8 @@ def test_auto_skips_wavelet_when_memory_is_short(monkeypatch):
     cp.testing.assert_array_equal(median(img, footprint), expected)
 
 
-def test_memory_estimate_is_close_to_actual():
-    pool = cp.get_default_memory_pool()
+def test_memory_estimate_is_close_to_actual(private_pool):
+    pool = private_pool
     img = _random_image((512, 512), np.uint16)
     mw._median_wavelet_filter(img, 3, 3)  # compile kernels
     pool.free_all_blocks()
@@ -307,9 +324,9 @@ def test_default_slabbing_uses_memory_fraction(monkeypatch):
     )
 
 
-def test_slab_memory_matches_estimate():
+def test_slab_memory_matches_estimate(private_pool):
     """The peak pool size, also with a shorter last slab, is as estimated."""
-    pool = cp.get_default_memory_pool()
+    pool = private_pool
     img = _random_image((2000, 256), np.uint16)
     height, width, ry, rx = 2000, 256, 5, 5
     mw._median_wavelet_filter(img, ry, rx, slab_rows=700)  # compile kernels
@@ -472,8 +489,8 @@ def test_plan_slab_planes():
     assert mw._plan_slab_planes(*args, budget=1024) is None
 
 
-def test_wavelet_3d_memory_estimate():
-    pool = cp.get_default_memory_pool()
+def test_wavelet_3d_memory_estimate(private_pool):
+    pool = private_pool
     img = _random_image((40, 48, 48), np.uint16)
     radii = (2, 2, 2)
     for planes in (12, 40):
