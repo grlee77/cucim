@@ -275,6 +275,24 @@ def _unsupported_shmem_cval(cval, dtype):
     return False
 
 
+def _shmem_default_3d(input, weights, axis):
+    """Whether algorithm=None uses the shared-memory 1D kernel for 3D input.
+
+    On an RTX A6000 it was faster than the elementwise kernel for float32
+    and integer inputs (median 1.2-2.6x over sizes and axes for 3 to 33
+    taps) and for float64 with up to 17 taps (median 1.05-2.1x), with
+    identical results. For float64 with more taps along the first two axes
+    it was slower (0.11-0.96x), and so it was for any dtype and axis when
+    the last axis is short (e.g. 0.3x for channels-last RGB images with 9
+    taps; the crossover was at 12 elements for float32 and 16 for float64).
+    """
+    if input.ndim != 3 or input.shape[2] < 16:
+        return False
+    if input.dtype.char == "d" and weights.size > 17:
+        return axis in (-1, 2)
+    return True
+
+
 def _correlate_or_convolve1d(
     input,
     weights,
@@ -294,7 +312,7 @@ def _correlate_or_convolve1d(
         default_algorithm = True
         if (
             _is_not_windows
-            and input.ndim == 2
+            and (input.ndim == 2 or _shmem_default_3d(input, weights, axis))
             and weights.size <= 256
             and not (
                 mode == "constant"

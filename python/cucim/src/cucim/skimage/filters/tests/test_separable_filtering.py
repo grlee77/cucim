@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 import platform
@@ -376,4 +376,49 @@ def test_separable_image_shapes_and_modes_3d(shape, axis, kernel_size, mode):
         mode=mode,
         cval=cval,
         origin=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, kernel_size, axis, expected",
+    [
+        ((20, 24, 28), cp.float32, 9, 0, True),
+        ((20, 24, 28), cp.uint8, 33, 1, True),
+        ((20, 24, 28), cp.float64, 17, 0, True),
+        ((20, 24, 28), cp.float64, 33, 2, True),
+        ((20, 24, 28), cp.float64, 33, -1, True),
+        ((20, 24, 28), cp.float64, 33, 0, False),
+        ((20, 24, 28), cp.float64, 33, -2, False),
+        ((40, 30, 16), cp.float32, 9, 1, True),
+        ((40, 30, 3), cp.float32, 9, 1, False),
+        ((40, 30, 3), cp.float32, 9, 2, False),
+    ],
+)
+def test_default_algorithm_3d(
+    monkeypatch, shape, dtype, kernel_size, axis, expected
+):
+    """With algorithm=None, 3D inputs use the shared-memory kernel except
+    when the last axis has fewer than 16 elements or for float64 with more
+    than 17 taps along the first two axes, and the result equals that of the
+    other kernel."""
+    from cucim.skimage._vendored import _ndimage_filters
+
+    calls = []
+    original = _ndimage_filters._shmem_convolve1d
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_ndimage_filters, "_shmem_convolve1d", counting)
+    image = _get_image(shape, dtype)
+    weights = cp.random.default_rng(0).random(kernel_size)
+    result = correlate1d(image, weights, axis=axis, mode="constant", cval=2)
+    assert bool(calls) == expected
+    other = "elementwise" if expected else "shared_memory"
+    cp.testing.assert_array_equal(
+        result,
+        correlate1d(
+            image, weights, axis=axis, mode="constant", cval=2, algorithm=other
+        ),
     )
