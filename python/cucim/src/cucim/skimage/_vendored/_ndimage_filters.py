@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Infrastructure, Inc.
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Networks, Inc.
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 
 """A vendored subset of cupyx.scipy.ndimage._filters"""
@@ -281,6 +281,7 @@ def _correlate_or_convolve1d(
 ):
     # Calls fast shared-memory convolution when possible, otherwise falls back
     # to the vendored elementwise _correlate_or_convolve
+    mode = _util._check_mode(mode)
     default_algorithm = False
     if algorithm is None:
         default_algorithm = True

@@ -728,7 +728,8 @@ def test_edge_filters_negative_axis(func, shape):
 @pytest.mark.parametrize("shape", [(15, 22), (9, 11, 13)])
 @pytest.mark.parametrize("axis", [None, 0, -1])
 @pytest.mark.parametrize("cval", [0.0, 0.25, -3.0])
-def test_edge_filters_constant_mode_cval(func, shape, axis, cval):
+@pytest.mark.parametrize("mode", ["constant", "grid-constant"])
+def test_edge_filters_constant_mode_cval(func, shape, axis, cval, mode):
     """mode='constant' pads the input with cval as an n-dimensional
     convolution does (scikit-image applies ndi.convolve with the full kernel);
     the separable passes must not pad each intermediate result with cval."""
@@ -739,7 +740,7 @@ def test_edge_filters_constant_mode_cval(func, shape, axis, cval):
     # scikit-image mishandles negative axes (see the docstrings)
     sk_axis = axis if axis is None else axis % len(shape)
     expected = getattr(skimage_filters, func.__name__)(
-        image, axis=sk_axis, mode="constant", cval=cval
+        image, axis=sk_axis, mode=mode, cval=cval
     )
-    result = func(cp.asarray(image), axis=axis, mode="constant", cval=cval)
+    result = func(cp.asarray(image), axis=axis, mode=mode, cval=cval)
     assert_allclose(result, cp.asarray(expected), rtol=1e-12, atol=1e-12)

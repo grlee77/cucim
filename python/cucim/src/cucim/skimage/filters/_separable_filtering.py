@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 import math
@@ -991,7 +991,7 @@ def _shmem_convolve1d(
     origin = util._check_origin(origin, weights.size)
     if weights.size == 0:
         return cp.zeros_like(input)
-    util._check_mode(mode)
+    mode = util._check_mode(mode)
 
     if convolution:
         # use flip_kernel to avoid cp.ascontiguousarray(weights[::-1]))

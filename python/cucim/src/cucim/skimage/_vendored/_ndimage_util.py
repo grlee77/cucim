@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Infrastructure, Inc.
 # SPDX-FileCopyrightText: Copyright (c) 2015 Preferred Networks, Inc.
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND MIT
 
 """A vendored subset of cupyx.scipy.ndimage._util"""
@@ -93,6 +93,13 @@ def _check_origin(origin, width):
 
 
 def _check_mode(mode):
+    """Check a filter boundary mode and return its canonical name.
+
+    As in SciPy's filters, 'grid-constant' is a synonym for 'constant'.
+    ('grid-mirror' and 'grid-wrap' are kept; the kernels handle them.)
+    """
+    if mode == "grid-constant":
+        return "constant"
     if mode not in (
         "reflect",
         "constant",
@@ -101,7 +108,6 @@ def _check_mode(mode):
         "wrap",
         "grid-mirror",
         "grid-wrap",
-        "grid-reflect",
     ):
         msg = f"boundary mode not supported (actual: {mode})"
         raise RuntimeError(msg)

@@ -224,7 +224,7 @@ def _generic_edge_filter(
     # times the sums of the weights of the passes applied so far. Each pass is
     # given that value as its cval, which makes the separable result equal to
     # the n-dimensional one (padding every intermediate with cval would not).
-    if mode == "constant" and cval != 0:
+    if mode in ("constant", "grid-constant") and cval != 0:
         edge_sum = float(cp.asnumpy(edge_weights).sum())
         smooth_sum = float(cp.asnumpy(smooth_weights).sum())
     else:

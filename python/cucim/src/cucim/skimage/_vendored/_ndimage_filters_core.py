@@ -82,9 +82,8 @@ def _check_nd_args(
 ):
     axes = _util._check_axes(axes, input.ndim)
     num_axes = len(axes)
-    modes = _util._fix_sequence_arg(mode, num_axes, "origin", str)
-    for mode in modes:
-        _util._check_mode(mode)
+    modes = _util._fix_sequence_arg(mode, num_axes, "mode", str)
+    modes = [_util._check_mode(mode) for mode in modes]
     origins = _util._fix_sequence_arg(origin, num_axes, "origin", int)
     if isinstance(weights, cupy.ndarray) and num_axes < input.ndim:
         # expand origins ,footprint and structure if num_axes < input.ndim
