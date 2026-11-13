@@ -17,6 +17,7 @@ from cucim.skimage._vendored import (
     _ndimage_filters_core as _filters_core,
     _ndimage_util as _util,
 )
+from cucim.skimage.filters import _fused_separable_2d as _fused2d
 from cucim.skimage.filters._separable_filtering import (
     ResourceLimitError,
     _shmem_convolve1d,
@@ -368,6 +369,122 @@ def _get_correlate_kernel(modes, w_shape, int_type, offsets, cval):
     )
 
 
+def _fused_weights_dtype(input_dtype, weights_dtype):
+    """_util._get_weights_dtype(..., use_cucim_casting=True) for real
+    dtypes, without arrays."""
+    if weights_dtype.kind in "iub":
+        from cucim.skimage._shared.utils import _supported_float_type
+
+        return cupy.dtype(_supported_float_type(weights_dtype))
+    return cupy.promote_types(input_dtype, cupy.float32)
+
+
+def _fused_2d_correlate(
+    input, axes, weights, output, modes, cval, origin, algorithm
+):
+    """Both 1D correlations of a 2D separable filter in one launch.
+
+    Returns the result, or None when the case is left to the per-axis
+    passes (the result is then theirs; the fused kernel gives identical
+    values where it is used). It is used for 2D real inputs whose two
+    passes would both use the shared-memory 1D kernels, when ``algorithm``
+    is None and the fused kernel is expected to be faster. The checks avoid
+    allocations, so that declining costs little.
+    """
+    if algorithm is not None or input.ndim != 2 or len(weights) != 2:
+        return None
+    in_dtype = input.dtype
+    w0, w1 = weights
+    if w0 is None or w1 is None:
+        return None
+    # quick decline of the most common case left to the per-axis passes:
+    # float64 with a radius above _FLOAT64_MAX_RADIUS (any origin) on a GPU
+    # with low FP64 throughput
+    if (
+        in_dtype.char == "d"
+        and max(w0.size, w1.size) > 2 * _fused2d._FLOAT64_MAX_RADIUS + 1
+        and not _fused2d.fast_fp64()
+    ):
+        return None
+    if not _is_not_windows:
+        return None
+    if in_dtype.kind == "c" or in_dtype.char == "e" or input.size == 0:
+        return None
+    for w in weights:
+        if w.ndim != 1 or not 1 <= w.size <= 256:
+            return None
+        if w.dtype.kind == "c":
+            return None
+    if output is None:
+        out_dtype = in_dtype
+    elif isinstance(output, cupy.ndarray):
+        if output.shape != input.shape or not output.flags.c_contiguous:
+            return None
+        out_dtype = output.dtype
+    else:
+        try:
+            out_dtype = cupy.dtype(output)
+        except TypeError:
+            return None
+    # (float16: the shared-memory 1D kernels do not compile for it, so the
+    # per-axis path uses its elementwise kernels)
+    if out_dtype.kind == "c" or out_dtype.char == "e":
+        return None
+    pass_dtypes = (in_dtype, out_dtype)  # inputs of the two passes
+    w_dtypes = [
+        _fused_weights_dtype(d, w.dtype) for d, w in zip(pass_dtypes, weights)
+    ]
+    origins = _util._fix_sequence_arg(origin, 2, "origin", int)
+    anchors = [w.size // 2 + o for w, o in zip(weights, origins)]
+    if any(not 0 <= a < w.size for a, w in zip(anchors, weights)):
+        return None  # invalid origin: the per-axis path raises
+    if cupy.float64 in w_dtypes:
+        max_radius = max(
+            max(a, w.size - 1 - a) for a, w in zip(anchors, weights)
+        )
+        if not _fused2d.float64_preferred(input.shape, max_radius):
+            return None
+    if not isinstance(cval, (int, float)) or not math.isfinite(cval):
+        return None
+    axes = _util._check_axes(axes, input.ndim)
+    if len(axes) != 2:
+        return None
+    modes = _util._fix_sequence_arg(modes, 2, "mode", _util._check_mode)
+    modes = ["grid-wrap" if m == "wrap" else m for m in modes]
+    # the per-axis path uses its shared-memory kernels for both passes
+    for dtype, mode in zip(pass_dtypes, modes):
+        if mode == "constant" and _unsupported_shmem_cval(cval, dtype):
+            return None
+    first = axes[0]
+    k_axis = {ax: w.size for ax, w in zip(axes, weights)}
+    smem = _fused2d.plain_shared_memory(
+        k_axis[0], k_axis[1], first, in_dtype, out_dtype
+    )
+    if smem > _fused2d.MAX_SHARED_MEMORY:
+        return None
+    if isinstance(output, cupy.ndarray):
+        if cupy.shares_memory(output, input, "MAY_SHARE_BOUNDS"):
+            return None
+        out = output
+    else:
+        out = cupy.empty(input.shape, dtype=out_dtype)
+
+    by_axis = {}
+    for ax, w, wd, a, m in zip(axes, weights, w_dtypes, anchors, modes):
+        by_axis[ax] = (cupy.ascontiguousarray(w, dtype=wd), a, m)
+    return _fused2d.correlate_2d(
+        cupy.ascontiguousarray(input),
+        by_axis[0][0],
+        by_axis[1][0],
+        out,
+        first_axis=first,
+        modes=(by_axis[0][2], by_axis[1][2]),
+        cval_in=cval,
+        cval_mid=cval,
+        anchors=(by_axis[0][1], by_axis[1][1]),
+    )
+
+
 def _run_1d_correlates(
     input,
     axes,
@@ -391,6 +508,18 @@ def _run_1d_correlates(
         if param not in wghts:
             wghts[param] = get_weights(param)
     wghts = [wghts[param] for param in params]
+    fused = _fused_2d_correlate(
+        input,
+        axes,
+        wghts,
+        output,
+        modes,
+        cval,
+        origin,
+        filter_kwargs.get("algorithm"),
+    )
+    if fused is not None:
+        return fused
     return _filters_core._run_1d_filters(
         [None if w is None else correlate1d for w in wghts],
         input,
