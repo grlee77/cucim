@@ -790,15 +790,19 @@ def _prewitt_or_sobel(input, axis, output, mode, cval, weights, algorithm):
             cupy.array([-1, 0, 1], dtype=weights_dtype) if is_diff else weights
         )  # noqa
 
-    axes = tuple(range(input.ndim))
-    modes = (mode,) * input.ndim
+    # As in SciPy: the derivative along `axis` first, then the smoothing along
+    # the other axes in increasing order. The order matters for
+    # mode='constant' with a nonzero cval, because each pass pads its input
+    # with cval. `mode` may also be one mode per axis, as in SciPy.
+    axes = (axis,) + tuple(a for a in range(input.ndim) if a != axis)
+    modes = _util._fix_sequence_arg(mode, input.ndim, "mode", _util._check_mode)
     return _run_1d_correlates(
         input,
         axes,
-        [a == axis for a in range(input.ndim)],
+        [a == axis for a in axes],
         get,
         output,
-        modes,
+        [modes[a] for a in axes],
         cval,
         algorithm=algorithm,
     )

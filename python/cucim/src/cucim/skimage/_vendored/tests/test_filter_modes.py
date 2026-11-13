@@ -66,3 +66,23 @@ def test_grid_reflect_unsupported(name, args):
     """'grid-reflect' is not a filter mode (SciPy raises RuntimeError)."""
     with pytest.raises(RuntimeError, match="boundary mode not supported"):
         _call(ndi, name, args, mode="grid-reflect")
+
+
+@pytest.mark.parametrize("name", ["sobel", "prewitt"])
+@pytest.mark.parametrize("shape", [(9, 10), (9, 10, 11)])
+@pytest.mark.parametrize(
+    "mode", ["constant", "grid-constant", "reflect", "per-axis"]
+)
+def test_sobel_prewitt_match_scipy(name, shape, mode):
+    """The derivative pass comes first, as in SciPy (this matters for
+    mode='constant' with a nonzero cval), and `mode` may be one mode per
+    axis."""
+    image = np.random.default_rng(1).random(shape)
+    if mode == "per-axis":
+        mode = ("reflect", "constant", "wrap")[: len(shape)]
+    for axis in range(-len(shape), len(shape)):
+        expected = getattr(ndi_cpu, name)(image, axis, mode=mode, cval=0.7)
+        result = getattr(ndi, name)(
+            cp.asarray(image), axis, mode=mode, cval=0.7
+        )
+        cp.testing.assert_allclose(result, expected, rtol=1e-12, atol=1e-12)
