@@ -806,8 +806,104 @@ def _get_code_stage2_convolve_3d(ndim, axis, flip_kernel):
     return code
 
 
+# (thread index, block dimension, size, output offset with position "pos",
+#  shared memory access with row "r") of the filtered axis, for the axes
+# that are not the last one
+_REGBLOCK_AXIS_CODE = {
+    (2, 0): (
+        "threadIdx.y",
+        "BLOCK_DIM_Y",
+        "blockIdx.y",
+        "n_rows",
+        "pos * row_stride + x",
+        "smem[r][threadIdx.x]",
+    ),
+    (3, 0): (
+        "threadIdx.z",
+        "BLOCK_DIM_Z",
+        "blockIdx.z",
+        "s_0",
+        "pos * stride_0 + y * stride_1 + x",
+        "smem[r][threadIdx.y][threadIdx.x]",
+    ),
+    (3, 1): (
+        "threadIdx.y",
+        "BLOCK_DIM_Y",
+        "blockIdx.y",
+        "s_1",
+        "z * stride_0 + pos * stride_1 + x",
+        "smem[threadIdx.z][r][threadIdx.x]",
+    ),
+}
+
+
+def _get_code_weights_to_registers(flip_kernel):
+    kernel_idx = "KSIZE - 1 - k" if flip_kernel else "k"
+    return f"""
+    W w[KSIZE];
+    #pragma unroll
+    for (int k = 0; k < KSIZE; ++k) w[k] = kernel[{kernel_idx}];
+    """
+
+
+def _get_code_stage2_register_blocked(ndim, axis, flip_kernel):
+    """Stage 2 for an axis that is not the last one, with the weights in
+    registers and each thread computing PATCH_PER_BLOCK consecutive outputs
+    along the axis: the PATCH_PER_BLOCK + KSIZE - 1 inputs they need are
+    read from shared memory once and streamed through registers. Every
+    output still sums its taps in order k = 0 .. KSIZE - 1 with the same
+    expression as the other stage 2, so the results are identical."""
+    tid, bdim, bid, size, out_offset, smem = _REGBLOCK_AXIS_CODE[(ndim, axis)]
+    return (
+        _get_code_weights_to_registers(flip_kernel)
+        + f"""
+    const int r0 = HALO_SIZE * {bdim} + {tid} * PATCH_PER_BLOCK - anchor;
+    W acc[PATCH_PER_BLOCK];
+    #pragma unroll
+    for (int j = 0; j < PATCH_PER_BLOCK; ++j) acc[j] = static_cast<W>(0);
+    #pragma unroll
+    for (int i = 0; i < PATCH_PER_BLOCK + KSIZE - 1; ++i)
+    {{
+        const int r = r0 + i;
+        const W v = static_cast<W>({smem});
+        #pragma unroll
+        for (int j = 0; j < PATCH_PER_BLOCK; ++j)
+        {{
+            const int k = i - j;
+            if (k >= 0 && k < KSIZE) acc[j] = acc[j] + v * w[k];
+        }}
+    }}
+    const int pos0 = {bid} * ({bdim} * PATCH_PER_BLOCK) + {tid} * PATCH_PER_BLOCK;
+    #pragma unroll
+    for (int j = 0; j < PATCH_PER_BLOCK; ++j)
+    {{
+        const int pos = pos0 + j;
+        if (pos < {size}) dst[{out_offset}] = cast<D>(acc[j]);
+    }}
+    """
+    )
+
+
+def _get_code_stage2_last_axis_register_weights(ndim, axis, flip_kernel):
+    """Stage 2 for the last axis with the weights in registers (consecutive
+    outputs per thread would make shared-memory bank conflicts here)."""
+    code = (
+        _get_code_stage2_convolve_2d(ndim, axis, False)
+        if ndim == 2
+        else _get_code_stage2_convolve_3d(ndim, axis, False)
+    )
+    code = code.replace("* kernel[k]", "* w[k]")
+    return _get_code_weights_to_registers(flip_kernel) + code
+
+
 @cp.memoize(for_each_device=False)
-def _get_code_stage2_convolve(ndim, axis, flip_kernel):
+def _get_code_stage2_convolve(ndim, axis, flip_kernel, register_blocking=False):
+    if register_blocking:
+        if axis < ndim - 1:
+            return _get_code_stage2_register_blocked(ndim, axis, flip_kernel)
+        return _get_code_stage2_last_axis_register_weights(
+            ndim, axis, flip_kernel
+        )
     if ndim == 2:
         return _get_code_stage2_convolve_2d(ndim, axis, flip_kernel)
     elif ndim == 3:
@@ -827,11 +923,15 @@ def _get_separable_conv_kernel_src(
     cval,
     patch_per_block=None,
     flip_kernel=False,
+    register_blocking=False,
 ):
     blocks, patch_per_block, halo_size = _get_constants(
         ndim, axis, kernel_size, anchor, patch_per_block
     )
     block_x, block_y, block_z = blocks
+    register_blocking = register_blocking and _use_register_blocking(
+        kernel_size, patch_per_block, kernel_c_type
+    )
 
     mode_str = mode
     if "constant" in mode_str:
@@ -850,6 +950,8 @@ def _get_separable_conv_kernel_src(
         .replace("unsigned ", "u")
     )  # noqa
     func_name += f"_patch{patch_per_block}_halo{halo_size}"
+    if register_blocking:
+        func_name += "_rb"
     # func_name += f"_bx{block_x}_by{block_y}" // these are fixed per axis
 
     code = """
@@ -876,17 +978,19 @@ def _get_separable_conv_kernel_src(
     if ndim == 2:
         code += f"""
         extern "C"{{
-        __global__ void {func_name}(const T *src, D *dst, const W* kernel, const int anchor, int n_rows, int n_cols)
+        __global__ void {func_name}(const T * __restrict__ src, D * __restrict__ dst, const W * __restrict__ kernel, const int anchor, int n_rows, int n_cols)
         {{
         """  # noqa
     elif ndim == 3:
         code += f"""
         extern "C"{{
-        __global__ void {func_name}(const T *src, D *dst, const W* kernel, const int anchor, int s_0, int s_1, int s_2)
+        __global__ void {func_name}(const T * __restrict__ src, D * __restrict__ dst, const W * __restrict__ kernel, const int anchor, int s_0, int s_1, int s_2)
         {{
         """  # noqa
     code += _get_code_stage1_shared_memory_load(ndim, axis, mode, cval)
-    code += _get_code_stage2_convolve(ndim, axis, flip_kernel)
+    code += _get_code_stage2_convolve(
+        ndim, axis, flip_kernel, register_blocking
+    )
     code += """
     }  // end of function
     }  // extern "C"
@@ -907,6 +1011,7 @@ def _get_separable_conv_kernel(
     cval=0,
     patch_per_block=None,
     flip_kernel=False,
+    register_blocking=False,
 ):
     func_name, block, patch_per_block, code = _get_separable_conv_kernel_src(
         kernel_size=kernel_size,
@@ -920,9 +1025,29 @@ def _get_separable_conv_kernel(
         cval=cval,
         patch_per_block=patch_per_block,
         flip_kernel=flip_kernel,
+        register_blocking=register_blocking,
     )
     m = cp.RawModule(code=code)
     return m.get_function(func_name), block, patch_per_block
+
+
+# Stage 2 with the weights in registers and, for axes other than the last,
+# PATCH_PER_BLOCK consecutive outputs per thread (see
+# _get_code_stage2_register_blocked); limited to weights that fit in
+# registers.
+_REGISTER_BLOCKING = True
+_MAX_REGISTER_WEIGHT_BYTES = 256
+_MAX_REGISTER_PATCH = 8
+
+
+def _use_register_blocking(kernel_size, patch_per_block, kernel_c_type):
+    if kernel_c_type not in ("float", "double"):
+        return False
+    itemsize = 4 if kernel_c_type == "float" else 8
+    return (
+        kernel_size * itemsize <= _MAX_REGISTER_WEIGHT_BYTES
+        and patch_per_block <= _MAX_REGISTER_PATCH
+    )
 
 
 def _get_grid(shape, block, axis, patch_per_block):
@@ -1056,6 +1181,7 @@ def _shmem_convolve1d(
         cval=cval,
         patch_per_block=None,
         flip_kernel=convolution,
+        register_blocking=_REGISTER_BLOCKING,
     )
     grid = _get_grid(image.shape, block, axis, patch_per_block)
     args = (image, output, weights, anchor) + image.shape[:ndim]

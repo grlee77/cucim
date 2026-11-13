@@ -422,3 +422,48 @@ def test_default_algorithm_3d(
             image, weights, axis=axis, mode="constant", cval=2, algorithm=other
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, kernel_size, mode, convolution",
+    [
+        ((37, 70), cp.float32, 17, "reflect", False),
+        ((130, 40), cp.float64, 9, "constant", True),
+        ((9, 12, 70), cp.float32, 3, "wrap", True),
+        ((20, 33, 18), cp.uint8, 33, "constant", False),
+        ((5, 3, 70), cp.int16, 6, "reflect", False),
+        ((11, 40, 24), cp.float32, 64, "mirror", True),
+    ],
+)
+def test_register_blocking_identical(
+    monkeypatch, shape, dtype, kernel_size, mode, convolution
+):
+    """The register-blocked stage 2 of the shared-memory kernels gives the
+    same results as the per-tap one, for every axis and for extreme
+    origins."""
+    from cucim.skimage.filters import _separable_filtering
+
+    image = _get_image(shape, dtype)
+    weights = cp.random.default_rng(1).random(kernel_size)
+    func = convolve1d if convolution else correlate1d
+    for axis in range(len(shape)):
+        for origin in sorted({0, -(kernel_size // 2), (kernel_size - 1) // 2}):
+            results = []
+            for register_blocking in (False, True):
+                monkeypatch.setattr(
+                    _separable_filtering,
+                    "_REGISTER_BLOCKING",
+                    register_blocking,
+                )
+                results.append(
+                    func(
+                        image,
+                        weights,
+                        axis=axis,
+                        mode=mode,
+                        cval=2,
+                        origin=origin,
+                        algorithm="shared_memory",
+                    )
+                )
+            cp.testing.assert_array_equal(results[1], results[0])
