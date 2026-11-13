@@ -86,3 +86,27 @@ def test_sobel_prewitt_match_scipy(name, shape, mode):
             cp.asarray(image), axis, mode=mode, cval=0.7
         )
         cp.testing.assert_allclose(result, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.int16, np.int32])
+@pytest.mark.parametrize("cval", [0.5, 2.7, -1.25, -3, 70000])
+@pytest.mark.parametrize("shape", [(9, 10), (6, 7, 8)])
+@pytest.mark.parametrize(
+    "name, args",
+    [
+        ("correlate1d", (np.array([0.5, 1.0, 0.25]), 1)),
+        ("uniform_filter", (3,)),
+        ("gaussian_filter", (1.0,)),
+        ("sobel", (0,)),
+    ],
+)
+def test_integer_input_cval(dtype, cval, shape, name, args):
+    """Integer inputs in constant mode are padded with cval itself, as in
+    SciPy, also when the input type cannot hold it (the shared-memory
+    kernels converted cval to the input type)."""
+    image = (_rng.random(shape) * 100).astype(dtype)
+    kwargs = dict(mode="constant", cval=cval, output=np.float64)
+    expected = getattr(ndi_cpu, name)(image, *args, **kwargs)
+    cp_args = [cp.asarray(a) if isinstance(a, np.ndarray) else a for a in args]
+    result = getattr(ndi, name)(cp.asarray(image), *cp_args, **kwargs)
+    cp.testing.assert_allclose(result, expected, rtol=1e-6, atol=1e-6)

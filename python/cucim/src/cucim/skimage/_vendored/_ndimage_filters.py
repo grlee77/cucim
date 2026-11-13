@@ -260,12 +260,18 @@ def _correlate_or_convolve(
 def _unsupported_shmem_cval(cval, dtype):
     """returns True if the cval + dtype combination is unsupported for the
     shared memory kernels."""
-    return (
+    if not numpy.isfinite(cval):
         # shared_memory kernels fail to compile for non-finite cval
-        not numpy.isfinite(cval)
-        # incorrect output for negative cval and unsigned integer input
-        or (cval < 0 and dtype.kind == "u")
-    )
+        return True
+    if dtype.kind in "biu":
+        # they pad with cval converted to the input type, which changes
+        # values it cannot hold (fractional, negative unsigned or out of
+        # range); SciPy and the elementwise kernels pad with cval itself
+        if dtype.kind == "b":
+            return cval not in (0, 1)
+        info = numpy.iinfo(dtype)
+        return not (info.min <= cval <= info.max and cval == int(cval))
+    return False
 
 
 def _correlate_or_convolve1d(
@@ -290,7 +296,8 @@ def _correlate_or_convolve1d(
             and input.ndim == 2
             and weights.size <= 256
             and not (
-                cval < 0 and mode == "constant" and input.dtype.kind == "u"
+                mode == "constant"
+                and _unsupported_shmem_cval(cval, input.dtype)
             )
         ):
             algorithm = "shared_memory"
