@@ -397,30 +397,80 @@ def _fused_weights_dtype(input_dtype, weights_dtype):
     return cupy.promote_types(input_dtype, cupy.float32)
 
 
-def _fused_2d_correlate(
+def _fused_correlate(
     input, axes, weights, output, modes, cval, origin, algorithm
 ):
-    """Both 1D correlations of a 2D separable filter in one launch.
+    """Separable correlations of 2D and 3D arrays with fewer launches.
+
+    For a 2D array both 1D passes run in one launch. For a 3D array, two
+    passes over a pair of axes run in one launch that filters the planes of
+    that pair, and a third pass (if any) runs as the 1D correlation it would
+    be otherwise, before or after it so that the passes keep their order.
 
     Returns the result, or None when the case is left to the per-axis
-    passes (the result is then theirs; the fused kernel gives identical
-    values where it is used). It is used for 2D real inputs whose two
-    passes would both use the shared-memory 1D kernels, when ``algorithm``
-    is None and the fused kernel is expected to be faster. The checks avoid
+    passes (the result is then theirs; the fused kernel gives the values of
+    the shared-memory 1D kernels where it is used). It is used for real
+    inputs when ``algorithm`` is None, the fused pair would use the
+    shared-memory 1D kernels, its axes include the last one, and the fused
+    kernel is expected to be faster. (A pair with strided columns, such as
+    the two spatial axes of a channels-last RGB image, was slower than the
+    per-axis passes at 2048 x 2048 x 3.) The checks avoid
     allocations, so that declining costs little.
     """
-    if algorithm is not None or input.ndim != 2 or len(weights) != 2:
+    ndim = input.ndim
+    if algorithm is not None or ndim not in (2, 3):
         return None
     in_dtype = input.dtype
-    w0, w1 = weights
-    if w0 is None or w1 is None:
+    nw = len(weights)
+    if nw < 2 or nw > ndim:
+        return None
+    active = [i for i in range(nw) if weights[i] is not None]
+    if len(active) < 2 or (ndim == 2 and len(active) != 2):
         return None
     # quick decline of the most common case left to the per-axis passes:
-    # float64 with a radius above _FLOAT64_MAX_RADIUS (any origin) on a GPU
-    # with low FP64 throughput
+    # float64 with a radius above _FLOAT64_MAX_RADIUS (any origin) for every
+    # pass, on a GPU with low FP64 throughput (checked again below for the
+    # fused pair only)
+    max_size = 2 * _fused2d._FLOAT64_MAX_RADIUS + 1
     if (
         in_dtype.char == "d"
-        and max(w0.size, w1.size) > 2 * _fused2d._FLOAT64_MAX_RADIUS + 1
+        and min(weights[i].size for i in active) > max_size
+        and not _fused2d.fast_fp64()
+    ):
+        return None
+    # The axes, normalized here rather than by _check_axes, which costs more;
+    # anything unusual (including invalid axes, for which the per-axis path
+    # raises) is left to the per-axis path.
+    if axes is None:
+        axes = range(ndim)
+    elif isinstance(axes, (int, numpy.integer)):
+        axes = (axes,)
+    if len(axes) != nw:
+        return None
+    norm = []
+    for a in axes:
+        if not isinstance(a, (int, numpy.integer)) or not -ndim <= a < ndim:
+            return None
+        norm.append(int(a) % ndim)
+    act_axes = [norm[i] for i in active]
+    if len(set(act_axes)) != len(act_axes):
+        return None
+    # the pair fused into one launch (it must include the last axis), and
+    # the 1D pass before or after it
+    last = ndim - 1
+    pre = post = None
+    if len(active) == 3:
+        if last in act_axes[1:]:
+            pre, pair_idx = active[0], active[1:]
+        else:
+            pair_idx, post = active[:2], active[2]
+    else:
+        pair_idx = active
+    if norm[pair_idx[0]] != last and norm[pair_idx[1]] != last:
+        return None
+    if (
+        in_dtype.char == "d"
+        and min(weights[i].size for i in pair_idx) > max_size
         and not _fused2d.fast_fp64()
     ):
         return None
@@ -428,10 +478,9 @@ def _fused_2d_correlate(
         return None
     if in_dtype.kind == "c" or in_dtype.char == "e" or input.size == 0:
         return None
-    for w in weights:
-        if w.ndim != 1 or not 1 <= w.size <= 256:
-            return None
-        if w.dtype.kind == "c":
+    for i in active:
+        w = weights[i]
+        if w.ndim != 1 or not 1 <= w.size <= 256 or w.dtype.kind == "c":
             return None
     if output is None:
         out_dtype = in_dtype
@@ -448,35 +497,50 @@ def _fused_2d_correlate(
     # per-axis path uses its elementwise kernels)
     if out_dtype.kind == "c" or out_dtype.char == "e":
         return None
-    pass_dtypes = (in_dtype, out_dtype)  # inputs of the two passes
-    w_dtypes = [
-        _fused_weights_dtype(d, w.dtype) for d, w in zip(pass_dtypes, weights)
-    ]
-    origins = _util._fix_sequence_arg(origin, 2, "origin", int)
-    anchors = [w.size // 2 + o for w, o in zip(weights, origins)]
-    if any(not 0 <= a < w.size for a, w in zip(anchors, weights)):
-        return None  # invalid origin: the per-axis path raises
-    if cupy.float64 in w_dtypes:
+    if not isinstance(cval, (int, float)) or not math.isfinite(cval):
+        return None
+    modes = _util._fix_sequence_arg(modes, nw, "mode", _util._check_mode)
+    modes = ["grid-wrap" if m == "wrap" else m for m in modes]
+    origins = _util._fix_sequence_arg(origin, nw, "origin", int)
+
+    def pass_of(i):
+        return (norm[i], weights[i], modes[i], origins[i])
+
+    pair = [pass_of(i) for i in pair_idx]
+    pre = None if pre is None else pass_of(pre)
+    post = None if post is None else pass_of(post)
+    pair_axes = [p[0] for p in pair]
+    col_axis = max(pair_axes)
+    row_axis = min(pair_axes)
+    pair_in_dtype = out_dtype if pre is not None else in_dtype
+    by_axis = {}
+    for ax, w, mode, o in pair:
+        wd = _fused_weights_dtype(
+            pair_in_dtype if ax == pair[0][0] else out_dtype, w.dtype
+        )
+        a = w.size // 2 + o
+        if not 0 <= a < w.size:
+            return None  # invalid origin: the per-axis path raises
+        by_axis[ax] = (w, wd, a, mode)
+    # the per-axis path would use its shared-memory kernels for both passes
+    for ax, dtype in ((pair[0][0], pair_in_dtype), (pair[1][0], out_dtype)):
+        if by_axis[ax][3] == "constant" and _unsupported_shmem_cval(
+            cval, dtype
+        ):
+            return None
+    if any(by_axis[ax][1] == cupy.float64 for ax in pair_axes):
         max_radius = max(
-            max(a, w.size - 1 - a) for a, w in zip(anchors, weights)
+            max(a, w.size - 1 - a) for w, _, a, _ in by_axis.values()
         )
         if not _fused2d.float64_preferred(input.shape, max_radius):
             return None
-    if not isinstance(cval, (int, float)) or not math.isfinite(cval):
-        return None
-    axes = _util._check_axes(axes, input.ndim)
-    if len(axes) != 2:
-        return None
-    modes = _util._fix_sequence_arg(modes, 2, "mode", _util._check_mode)
-    modes = ["grid-wrap" if m == "wrap" else m for m in modes]
-    # the per-axis path uses its shared-memory kernels for both passes
-    for dtype, mode in zip(pass_dtypes, modes):
-        if mode == "constant" and _unsupported_shmem_cval(cval, dtype):
-            return None
-    first = axes[0]
-    k_axis = {ax: w.size for ax, w in zip(axes, weights)}
+    first = 0 if pair[0][0] == row_axis else 1
     smem = _fused2d.plain_shared_memory(
-        k_axis[0], k_axis[1], first, in_dtype, out_dtype
+        by_axis[row_axis][0].size,
+        by_axis[col_axis][0].size,
+        first,
+        pair_in_dtype,
+        out_dtype,
     )
     if smem > _fused2d.MAX_SHARED_MEMORY:
         return None
@@ -487,20 +551,32 @@ def _fused_2d_correlate(
     else:
         out = cupy.empty(input.shape, dtype=out_dtype)
 
-    by_axis = {}
-    for ax, w, wd, a, m in zip(axes, weights, w_dtypes, anchors, modes):
-        by_axis[ax] = (cupy.ascontiguousarray(w, dtype=wd), a, m)
-    return _fused2d.correlate_2d(
-        cupy.ascontiguousarray(input),
-        by_axis[0][0],
-        by_axis[1][0],
-        out,
-        first_axis=first,
-        modes=(by_axis[0][2], by_axis[1][2]),
-        cval_in=cval,
-        cval_mid=cval,
-        anchors=(by_axis[0][1], by_axis[1][1]),
-    )
+    def fused_pair(src, dst):
+        r, c = by_axis[row_axis], by_axis[col_axis]
+        return _fused2d.correlate_2d(
+            cupy.ascontiguousarray(src),
+            cupy.ascontiguousarray(r[0], dtype=r[1]),
+            cupy.ascontiguousarray(c[0], dtype=c[1]),
+            dst,
+            first_axis=first,
+            modes=(r[3], c[3]),
+            cval_in=cval,
+            cval_mid=cval,
+            anchors=(r[2], c[2]),
+            axes=(row_axis, col_axis),
+        )
+
+    if pre is not None:
+        ax, w, mode, o = pre
+        temp = cupy.empty(input.shape, dtype=out_dtype)
+        correlate1d(input, w, ax, temp, mode, cval, o)
+        return fused_pair(temp, out)
+    if post is not None:
+        ax, w, mode, o = post
+        temp = cupy.empty(input.shape, dtype=out_dtype)
+        fused_pair(input, temp)
+        return correlate1d(temp, w, ax, out, mode, cval, o)
+    return fused_pair(input, out)
 
 
 def _run_1d_correlates(
@@ -526,7 +602,7 @@ def _run_1d_correlates(
         if param not in wghts:
             wghts[param] = get_weights(param)
     wghts = [wghts[param] for param in params]
-    fused = _fused_2d_correlate(
+    fused = _fused_correlate(
         input,
         axes,
         wghts,

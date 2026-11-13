@@ -24,6 +24,13 @@ The results equal those of the two shared-memory 1D passes bit for bit:
   (both cast to the respective input type), which is what two 1D passes
   with those cvals compute.
 
+The plain kernel also filters a pair of axes of a 3D array, plane by plane:
+the pair's columns are the contiguous last axis, its rows and the remaining
+(batch) axis have arbitrary element strides, and the grid's z dimension runs
+over the batch axis. With
+one more 1D pass along the third axis this computes a 3D separable filter in
+two launches instead of three.
+
 A second kernel computes the gradient magnitude of the 2D edge filters
 (``skimage.filters.sobel`` and others): both directional derivatives from one
 shared tile, then ``sqrt(d0*d0 + d1*d1)`` with the square and sum rounded
@@ -111,8 +118,13 @@ typedef {c["D"]} D;
 #define IN_W (TX + K1 - 1)
 #define VB {c["VB"]}
 
+// element offset of (row gy, column gx) in the current plane
+#define AT(gy, gx) ((long long)(gy) * row_stride + (gx))
+
 extern "C" __global__ void {c["name"]}(
-    const T* __restrict__ src, D* __restrict__ dst, int H, int W,
+    const T* __restrict__ src_base, D* __restrict__ dst_base, int H, int W,
+    long long row_stride, int B,
+    long long batch_stride,
     const W0* __restrict__ w0g, const W1* __restrict__ w1g,
     double cval_in, double cval_mid)
 {{
@@ -131,10 +143,23 @@ extern "C" __global__ void {c["name"]}(
     const T pad_in = static_cast<T>(cval_in);
     const D pad_mid = static_cast<D>(cval_mid);
 
+    W0 w0[K0];
+    W1 w1[K1];
+#pragma unroll
+    for (int k = 0; k < K0; k++) w0[k] = w0g[FLIP0 ? K0 - 1 - k : k];
+#pragma unroll
+    for (int k = 0; k < K1; k++) w1[k] = w1g[FLIP1 ? K1 - 1 - k : k];
+
+    // one plane (a 2D image, or one index along the batch axis) per step
+    for (int b = blockIdx.z; b < B; b += gridDim.z) {{
+    const T* __restrict__ src = src_base + (long long)b * batch_stride;
+    D* __restrict__ dst = dst_base + (long long)b * batch_stride;
+    if (b != blockIdx.z) __syncthreads();  // s_in and s_mid are reused
+
     // load the tile and the halo of both passes
     if (y0 >= 0 && x0 >= 0 && y0 + IN_H <= H && x0 + IN_W <= W) {{
         for (int ly = ty; ly < IN_H; ly += blockDim.y) {{
-            const T* row = src + (long long)(y0 + ly) * W + x0;
+            const T* row = src + AT(y0 + ly, x0);
             for (int lx = tx; lx < IN_W; lx += blockDim.x) s_in[ly][lx] = row[lx];
         }}
     }} else {{
@@ -149,19 +174,12 @@ extern "C" __global__ void {c["name"]}(
                 if ((out_y && MODE0 == 4) || (out_x && MODE1 == 4)) {{
                     s_in[ly][lx] = pad_in;
                 }} else {{
-                    s_in[ly][lx] = src[(long long)gy * W + gx];
+                    s_in[ly][lx] = src[AT(gy, gx)];
                 }}
             }}
         }}
     }}
     __syncthreads();
-
-    W0 w0[K0];
-    W1 w1[K1];
-#pragma unroll
-    for (int k = 0; k < K0; k++) w0[k] = w0g[FLIP0 ? K0 - 1 - k : k];
-#pragma unroll
-    for (int k = 0; k < K1; k++) w1[k] = w1g[FLIP1 ? K1 - 1 - k : k];
 
 #if {c["first"]} == 0
     // axis 0 first: VB consecutive outputs of one column per thread, the
@@ -204,7 +222,7 @@ extern "C" __global__ void {c["name"]}(
             for (int k = 0; k < K1; k++) {{
                 sum = sum + static_cast<W1>(s_mid[ly][lx + k]) * w1[k];
             }}
-            dst[(long long)gy * W + gx] = cast<D>(sum);
+            dst[AT(gy, gx)] = cast<D>(sum);
         }}
     }}
 #else
@@ -237,10 +255,11 @@ extern "C" __global__ void {c["name"]}(
             for (int k = 0; k < K0; k++) {{
                 sum = sum + static_cast<W0>(s_mid[ly + k][lx]) * w0[k];
             }}
-            dst[(long long)gy * W + gx] = cast<D>(sum);
+            dst[AT(gy, gx)] = cast<D>(sum);
         }}
     }}
 #endif
+    }}  // planes
 }}
 """
 
@@ -401,6 +420,10 @@ def magnitude_shared_memory(k, dtype):
     ).itemsize
 
 
+# the grid's z dimension (planes beyond it are looped over in the kernel)
+_MAX_GRID_Z = 65535
+
+
 def correlate_2d(
     image,
     weights0,
@@ -413,19 +436,36 @@ def correlate_2d(
     cval_mid,
     anchors,
     flips=(False, False),
+    axes=(0, 1),
 ):
     """Both 1D passes of a separable 2D filter in one launch.
 
-    ``image`` is a C-contiguous 2D array; ``weights0``/``weights1`` are 1D
-    device arrays (of the accumulation types of the two passes) applied
-    along axis 0 and axis 1, in the order given by ``first_axis``; their
-    taps at index k read input position ``i - anchor + k`` (or the reversed
-    weight when the corresponding flip is True, i.e. a convolution).
-    ``output`` (C-contiguous, not overlapping ``image``) receives the result
-    in its dtype, which is also the intermediate dtype. ``modes`` holds the
-    boundary mode of each axis.
+    ``image`` is a C-contiguous 2D or 3D array. ``axes`` names the pair of
+    axes filtered, called axis 0 and axis 1 of the filter below (in that
+    order); axis 1 must be the last axis. For 3D input the remaining axis is
+    iterated over, each plane filtered independently. ``weights0``/``weights1`` are 1D device arrays
+    (of the accumulation types of the two passes) applied along filter axis
+    0 and filter axis 1, in the order given by ``first_axis``; their taps at
+    index k read input position ``i - anchor + k`` (or the reversed weight
+    when the corresponding flip is True, i.e. a convolution). ``output``
+    (C-contiguous, of the same shape, not overlapping ``image``) receives the
+    result in its dtype, which is also the intermediate dtype. ``modes``
+    holds the boundary mode of each filter axis.
     """
-    H, W = image.shape
+    ax0, ax1 = (a % image.ndim for a in axes)
+    if ax1 != image.ndim - 1 or ax0 == ax1:
+        raise ValueError("the second axis must be the last one")
+    H, W = image.shape[ax0], image.shape[ax1]
+    itemsize = image.dtype.itemsize
+    strides = [s // itemsize for s in image.strides]
+    if output.strides != tuple(s * output.dtype.itemsize for s in strides):
+        raise ValueError("output must have the same layout as image")
+    if image.ndim == 3:
+        (bax,) = {0, 1, 2} - {ax0, ax1}
+        B, batch_stride = image.shape[bax], strides[bax]
+    else:
+        B, batch_stride = 1, 0
+    row_stride = strides[ax0]
     key = (
         ("T", _dtype_char_to_c_types[image.dtype.char]),
         ("W0", _dtype_char_to_c_types[weights0.dtype.char]),
@@ -444,13 +484,16 @@ def correlate_2d(
     )
     kernel = _get_kernel("plain", key)
     kernel(
-        (math.ceil(W / TILE_X), math.ceil(H / TILE_Y)),
+        (math.ceil(W / TILE_X), math.ceil(H / TILE_Y), min(B, _MAX_GRID_Z)),
         BLOCK,
         (
             image,
             output,
             cp.int32(H),
             cp.int32(W),
+            cp.int64(row_stride),
+            cp.int32(B),
+            cp.int64(batch_stride),
             weights0,
             weights1,
             float(cval_in),

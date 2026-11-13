@@ -81,9 +81,8 @@ def test_fused_kernel_is_used(monkeypatch):
     ndi.uniform_filter(image, 3)
     ndi.sobel(image, 1)
     assert counter.calls == 3
-    # explicit algorithm, 3D input, a single axis: per-axis passes
+    # explicit algorithm, a single axis: per-axis passes
     ndi.gaussian_filter(image, 1.0, algorithm="shared_memory")
-    ndi.gaussian_filter(cp.stack([image, image]), 1.0)
     ndi.gaussian_filter(image, 1.0, axes=(1,))
     assert counter.calls == 3
 
@@ -131,6 +130,89 @@ def test_float64_dispatch(monkeypatch, ratio, expect_fused):
     ndi.gaussian_filter(image, 0.5)  # radius 2
     ndi.sobel(image, 0)
     assert counter.calls == 2 + int(expect_fused)
+
+
+_FILTERS_3D = {
+    "gaussian_0.5": lambda x, **kw: ndi.gaussian_filter(x, 0.5, **kw),
+    "gaussian_aniso_order": lambda x, **kw: ndi.gaussian_filter(
+        x, (0.7, 1.2, 0.5), order=(0, 1, 0), **kw
+    ),
+    "gaussian_0ss": lambda x, **kw: ndi.gaussian_filter(x, (0, 1.0, 0.5), **kw),
+    "gaussian_ss0": lambda x, **kw: ndi.gaussian_filter(x, (1.0, 0.5, 0), **kw),
+    "gaussian_s0s": lambda x, **kw: ndi.gaussian_filter(x, (1.0, 0, 0.5), **kw),
+    "gaussian_axes21": lambda x, **kw: ndi.gaussian_filter(
+        x, 0.8, axes=(2, 1), **kw
+    ),
+    "uniform_origin": lambda x, **kw: ndi.uniform_filter(
+        x, (3, 4, 2), origin=(0, 1, -1), **kw
+    ),
+    "sobel_axis0": lambda x, **kw: ndi.sobel(x, 0, **kw),
+    "sobel_axis1": lambda x, **kw: ndi.sobel(x, 1, **kw),
+    "prewitt_axis-1": lambda x, **kw: ndi.prewitt(x, -1, **kw),
+}
+
+_MODES_3D = _MODES[:5] + [(("constant", "wrap", "mirror"), -2.0)]
+
+# (with a pair (0, 1), e.g. sigma (s, s, 0), the per-axis passes are used)
+_SHAPES_3D = [(1, 1, 1), (2, 3, 4), (5, 70, 33), (17, 20, 130), (40, 9, 3)]
+
+
+@pytest.mark.parametrize("name", list(_FILTERS_3D))
+@pytest.mark.parametrize("dtype", [cp.uint8, cp.int16, cp.float32, cp.float64])
+@pytest.mark.parametrize("mode, cval", _MODES_3D)
+def test_fused_3d_equals_per_axis(name, dtype, mode, cval):
+    func = _FILTERS_3D[name]
+    if isinstance(mode, tuple) and name == "gaussian_axes21":
+        mode = mode[:2]
+    rng = np.random.default_rng(0)
+    for shape in _SHAPES_3D:
+        scale = 200 if cp.dtype(dtype).kind in "iu" else 1
+        image = cp.asarray((rng.random(shape) * scale).astype(dtype))
+        algorithm = (
+            "elementwise"
+            if "constant" in mode and _unsupported_shmem_cval(cval, image.dtype)
+            else "shared_memory"
+        )
+        expected = func(image, mode=mode, cval=cval, algorithm=algorithm)
+        result = func(image, mode=mode, cval=cval)
+        assert result.dtype == expected.dtype
+        cp.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "call, shape, expected_calls",
+    [
+        (lambda x: ndi.gaussian_filter(x, 1.0), (8, 20, 30), 1),
+        (lambda x: ndi.gaussian_filter(x, (0, 1.0, 1.0)), (8, 20, 30), 1),
+        (lambda x: ndi.sobel(x, 2), (8, 20, 30), 1),
+        # pairs without the last axis (e.g. channels-last images)
+        (lambda x: ndi.gaussian_filter(x, (1.0, 1.0, 0)), (8, 20, 30), 0),
+        (lambda x: ndi.gaussian_filter(x, 1.0, axes=(0, 1)), (8, 20, 3), 0),
+        (lambda x: ndi.gaussian_filter(x, 1.0, axes=(1,)), (8, 20, 30), 0),
+        (lambda x: ndi.gaussian_filter(x, 1.0), (4, 5, 6, 7), 0),
+    ],
+)
+def test_fused_3d_dispatch(monkeypatch, call, shape, expected_calls):
+    counter = _Counter(monkeypatch)
+    image = cp.random.default_rng(0).random(shape, dtype=cp.float32)
+    call(image)
+    assert counter.calls == expected_calls
+
+
+def test_fused_3d_many_planes():
+    """More planes than the grid's z dimension holds."""
+    image = cp.random.default_rng(0).random((70000, 3, 5), dtype=cp.float32)
+    expected = ndi.uniform_filter(image, (1, 3, 3), algorithm="shared_memory")
+    cp.testing.assert_array_equal(
+        ndi.uniform_filter(image, (1, 3, 3)), expected
+    )
+
+
+def test_fused_3d_noncontiguous_input():
+    image = cp.random.default_rng(0).random((30, 20, 10), dtype=cp.float32)
+    view = image.transpose(2, 0, 1)
+    expected = ndi.gaussian_filter(view, 0.7, algorithm="shared_memory")
+    cp.testing.assert_array_equal(ndi.gaussian_filter(view, 0.7), expected)
 
 
 _EDGE_MODES = [
