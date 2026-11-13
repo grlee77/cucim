@@ -218,14 +218,32 @@ def _generic_edge_filter(
     if return_magnitude:
         edge_weights /= math.sqrt(ndim)
 
+    # With mode='constant', scikit-image convolves with the n-dimensional
+    # kernel, so only the input is padded with cval. In the separable passes
+    # below, the intermediate result outside the image is then constant: cval
+    # times the sums of the weights of the passes applied so far. Each pass is
+    # given that value as its cval, which makes the separable result equal to
+    # the n-dimensional one (padding every intermediate with cval would not).
+    if mode == "constant" and cval != 0:
+        edge_sum = float(cp.asnumpy(edge_weights).sum())
+        smooth_sum = float(cp.asnumpy(smooth_weights).sum())
+    else:
+        edge_sum = smooth_sum = 1.0
+
     # CuPy Backend: Apply the smoothing and edge convolutions separably
     #               rather than forming an n-dimensional kernel. This is
     #               moderately faster for large 2D images and substantially
     #               faster in 3D and higher dimensions.
     for i, edge_dim in enumerate(axes):
         ax_output = ndi.convolve1d(
-            image, edge_weights, axis=edge_dim, mode=mode, output=float_dtype
+            image,
+            edge_weights,
+            axis=edge_dim,
+            mode=mode,
+            cval=cval,
+            output=float_dtype,
         )
+        pass_cval = cval * edge_sum
         smooth_axes = list(set(range(ndim)) - {edge_dim})
         for smooth_dim in smooth_axes:
             # TODO: why did this benchmark slower if output=ax_output was used?
@@ -234,8 +252,10 @@ def _generic_edge_filter(
                 smooth_weights,
                 axis=smooth_dim,
                 mode=mode,
+                cval=pass_cval,
                 output=float_dtype,
             )
+            pass_cval *= smooth_sum
         if return_magnitude:
             ax_output *= ax_output
         if i == 0:
