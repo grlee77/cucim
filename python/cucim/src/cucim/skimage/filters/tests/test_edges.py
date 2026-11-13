@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 import math
@@ -701,4 +701,22 @@ def test_range(detector):
     )
     assert_(
         out.max() <= 1, f"Maximum of `{detector.__name__}` is larger than 1."
+    )
+
+
+@pytest.mark.parametrize(
+    "func", [filters.sobel, filters.scharr, filters.prewitt, filters.farid]
+)
+@pytest.mark.parametrize("shape", [(15, 22), (9, 11, 13)])
+def test_edge_filters_negative_axis(func, shape):
+    """A negative axis selects the same edge axis as its positive
+    equivalent (the smoothing must not also be applied along it)."""
+    image = cp.asarray(cp.random.default_rng(5).random(shape, dtype=cp.float64))
+    ndim = len(shape)
+    for axis in range(-ndim, 0):
+        cp.testing.assert_array_equal(
+            func(image, axis=axis), func(image, axis=axis + ndim)
+        )
+    cp.testing.assert_array_equal(
+        func(image, axis=(-1, 0)), func(image, axis=(ndim - 1, 0))
     )

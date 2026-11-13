@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2003 Lee Kamentsky
 # SPDX-FileCopyrightText: 2003-2005 Peter J. Verveer
 # SPDX-FileCopyrightText: 2009-2022 the scikit-image team
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 AND (GPL-2.0-only OR BSD-3-Clause)
 
 """
@@ -24,6 +24,7 @@ import cupy as cp
 import numpy as np
 
 import cucim.skimage._vendored.ndimage as ndi
+from cucim.skimage._vendored import _internal as internal
 
 from .._shared.utils import _supported_float_type, check_nD
 from ..restoration.uft import laplacian
@@ -179,7 +180,10 @@ def _generic_edge_filter(
             edge_mag = np.sqrt(sum([_generic_edge_filter(image, ..., axis=i)**2
                                     for i in range(image.ndim)]) / image.ndim)
 
-        The magnitude is also computed if axis is a sequence.
+        The magnitude is also computed if axis is a sequence. Negative
+        values count from the last axis; scikit-image instead also smooths
+        along the edge axis for a negative `axis` (a defect), so its result
+        differs from that for the equivalent non-negative `axis`.
     mode : str or sequence of str, optional
         The boundary mode for the convolution. See `scipy.ndimage.convolve`
         for a description of the modes. This can be either a single boundary
@@ -195,6 +199,9 @@ def _generic_edge_filter(
         axes = [axis]
     else:
         axes = axis
+    # negative axes must be normalized: the smoothing is applied along all
+    # axes other than the edge axis
+    axes = [internal._normalize_axis_index(ax, ndim) for ax in axes]
     return_magnitude = len(axes) > 1
 
     if image.dtype.kind == "f":
@@ -258,7 +265,10 @@ def sobel(image, mask=None, *, axis=None, mode="reflect", cval=0.0):
             sobel_mag = np.sqrt(sum([sobel(image, axis=i)**2
                                      for i in range(image.ndim)]) / image.ndim)
 
-        The magnitude is also computed if axis is a sequence.
+        The magnitude is also computed if axis is a sequence. Negative
+        values count from the last axis; scikit-image instead also smooths
+        along the edge axis for a negative `axis` (a defect), so its result
+        differs from that for the equivalent non-negative `axis`.
     mode : str or sequence of str, optional
         The boundary mode for the convolution. See `scipy.ndimage.convolve`
         for a description of the modes. This can be either a single boundary
@@ -376,7 +386,10 @@ def scharr(image, mask=None, *, axis=None, mode="reflect", cval=0.0):
             sch_mag = np.sqrt(sum([scharr(image, axis=i)**2
                                    for i in range(image.ndim)]) / image.ndim)
 
-        The magnitude is also computed if axis is a sequence.
+        The magnitude is also computed if axis is a sequence. Negative
+        values count from the last axis; scikit-image instead also smooths
+        along the edge axis for a negative `axis` (a defect), so its result
+        differs from that for the equivalent non-negative `axis`.
     mode : str or sequence of str, optional
         The boundary mode for the convolution. See `scipy.ndimage.convolve`
         for a description of the modes. This can be either a single boundary
@@ -508,7 +521,10 @@ def prewitt(image, mask=None, *, axis=None, mode="reflect", cval=0.0):
             prw_mag = np.sqrt(sum([prewitt(image, axis=i)**2
                                    for i in range(image.ndim)]) / image.ndim)
 
-        The magnitude is also computed if axis is a sequence.
+        The magnitude is also computed if axis is a sequence. Negative
+        values count from the last axis; scikit-image instead also smooths
+        along the edge axis for a negative `axis` (a defect), so its result
+        differs from that for the equivalent non-negative `axis`.
     mode : str or sequence of str, optional
         The boundary mode for the convolution. See `scipy.ndimage.convolve`
         for a description of the modes. This can be either a single boundary
@@ -797,7 +813,10 @@ def farid(image, mask=None, *, axis=None, mode="reflect", cval=0.0):
             farid_mag = cp.sqrt(sum([farid(image, axis=i)**2
                                      for i in range(image.ndim)]) / image.ndim)
 
-        The magnitude is also computed if axis is a sequence.
+        The magnitude is also computed if axis is a sequence. Negative
+        values count from the last axis; scikit-image instead also smooths
+        along the edge axis for a negative `axis` (a defect), so its result
+        differs from that for the equivalent non-negative `axis`.
     mode : str or sequence of str, optional
         The boundary mode for the convolution. See `scipy.ndimage.convolve`
         for a description of the modes. This can be either a single boundary
