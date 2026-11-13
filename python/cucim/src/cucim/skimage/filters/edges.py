@@ -24,11 +24,16 @@ import cupy as cp
 import numpy as np
 
 import cucim.skimage._vendored.ndimage as ndi
-from cucim.skimage._vendored import _internal as internal
+from cucim.skimage._vendored import (
+    _internal as internal,
+    _ndimage_util as _ndi_util,
+)
+from cucim.skimage._vendored._ndimage_filters import _is_not_windows
 
 from .._shared.utils import _supported_float_type, check_nD
 from ..restoration.uft import laplacian
 from ..util.dtype import img_as_float
+from . import _fused_separable_2d as _fused2d
 
 # n-dimensional filter weights
 SOBEL_EDGE = np.array([1, 0, -1])
@@ -146,6 +151,75 @@ def _reshape_nd(arr, ndim, dim):
     return cp.reshape(arr, kernel_shape)
 
 
+def _fused_edge_filter_2d(
+    image, axes, edge_weights, smooth_weights, mode, cval, cval_mid
+):
+    """A 2D edge filter along one axis, or its magnitude, in one launch.
+
+    Returns None when the per-axis passes are used instead. The weights are
+    applied as convolutions (as ndi.convolve1d does) with the same
+    arithmetic, so the results are identical; ``cval_mid`` is the cval of
+    the second pass (see _generic_edge_filter).
+    """
+    if image.ndim != 2 or image.size == 0 or not _is_not_windows:
+        return None
+    k = edge_weights.size
+    if smooth_weights.size != k or k % 2 == 0:
+        return None
+    try:
+        mode = _ndi_util._check_mode(mode)
+    except RuntimeError:
+        return None  # the per-axis path reports the error
+    if mode == "wrap":
+        mode = "grid-wrap"
+    for value in (cval, cval_mid):
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+    dtype = edge_weights.dtype
+    if len(axes) == 1:
+        smem = _fused2d.plain_shared_memory(k, k, axes[0], dtype, dtype)
+    elif sorted(axes) == [0, 1]:
+        smem = _fused2d.magnitude_shared_memory(k, dtype)
+    else:
+        return None
+    if smem > _fused2d.MAX_SHARED_MEMORY:
+        return None
+    if dtype == cp.float64 and not _fused2d.float64_preferred(
+        image.shape, k // 2
+    ):
+        return None
+
+    image = cp.ascontiguousarray(image)
+    output = cp.empty(image.shape, dtype=dtype)
+    if len(axes) == 1:
+        edge_dim = axes[0]
+        if edge_dim == 0:
+            w0, w1 = edge_weights, smooth_weights
+        else:
+            w0, w1 = smooth_weights, edge_weights
+        return _fused2d.correlate_2d(
+            image,
+            w0,
+            w1,
+            output,
+            first_axis=edge_dim,
+            modes=(mode, mode),
+            cval_in=cval,
+            cval_mid=cval_mid,
+            anchors=(k // 2, k // 2),
+            flips=(True, True),
+        )
+    return _fused2d.edge_magnitude_2d(
+        image,
+        edge_weights,
+        smooth_weights,
+        output,
+        mode=mode,
+        cval_in=cval,
+        cval_mid=cval_mid,
+    )
+
+
 def _generic_edge_filter(
     image,
     *,
@@ -229,6 +303,14 @@ def _generic_edge_filter(
         smooth_sum = float(cp.asnumpy(smooth_weights).sum())
     else:
         edge_sum = smooth_sum = 1.0
+
+    # 2D: both passes (or, for the magnitude, both directional filters) in
+    # one launch, with the same results as the per-axis passes below
+    fused = _fused_edge_filter_2d(
+        image, axes, edge_weights, smooth_weights, mode, cval, cval * edge_sum
+    )
+    if fused is not None:
+        return fused
 
     # CuPy Backend: Apply the smoothing and edge convolutions separably
     #               rather than forming an n-dimensional kernel. This is

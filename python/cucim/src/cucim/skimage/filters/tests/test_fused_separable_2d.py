@@ -131,3 +131,55 @@ def test_float64_dispatch(monkeypatch, ratio, expect_fused):
     ndi.gaussian_filter(image, 0.5)  # radius 2
     ndi.sobel(image, 0)
     assert counter.calls == 2 + int(expect_fused)
+
+
+_EDGE_MODES = [
+    ("reflect", 0.0),
+    ("mirror", 0.0),
+    ("wrap", 0.0),
+    ("constant", 0.4),
+    ("grid-constant", -1.5),
+]
+
+
+@pytest.mark.parametrize("name", ["sobel", "scharr", "prewitt", "farid"])
+@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+@pytest.mark.parametrize("mode, cval", _EDGE_MODES)
+@pytest.mark.parametrize("axis", [None, 0, -1, (1, 0)])
+def test_fused_edge_filters_equal_per_axis(
+    monkeypatch, name, dtype, mode, cval, axis
+):
+    from cucim.skimage import filters
+    from cucim.skimage.filters import edges
+
+    func = getattr(filters, name)
+    rng = np.random.default_rng(0)
+    for shape in _SHAPES:
+        image = cp.asarray(rng.random(shape).astype(dtype))
+        result = func(image, axis=axis, mode=mode, cval=cval)
+        with monkeypatch.context() as m:
+            m.setattr(edges, "_fused_edge_filter_2d", lambda *a: None)
+            expected = func(image, axis=axis, mode=mode, cval=cval)
+        assert result.dtype == expected.dtype
+        cp.testing.assert_array_equal(result, expected)
+
+
+def test_fused_edge_kernels_are_used(monkeypatch):
+    from cucim.skimage import filters
+
+    calls = []
+    for name in ("correlate_2d", "edge_magnitude_2d"):
+        original = getattr(fused2d, name)
+
+        def counting(*args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(fused2d, name, counting)
+    image = cp.random.default_rng(0).random((64, 80), dtype=cp.float32)
+    filters.sobel(image)
+    filters.farid(image, axis=1)
+    filters.prewitt_h(image)
+    assert calls == ["edge_magnitude_2d", "correlate_2d", "correlate_2d"]
+    filters.sobel(cp.stack([image, image]))  # 3D: per-axis passes
+    assert len(calls) == 3
