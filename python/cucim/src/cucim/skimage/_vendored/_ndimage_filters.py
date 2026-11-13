@@ -18,6 +18,7 @@ from cucim.skimage._vendored import (
     _ndimage_util as _util,
 )
 from cucim.skimage.filters import _fused_separable_2d as _fused2d
+from cucim.skimage.filters import _fused_separable_3d as _fused3d
 from cucim.skimage.filters._separable_filtering import (
     ResourceLimitError,
     _shmem_convolve1d,
@@ -551,6 +552,13 @@ def _fused_correlate(
     else:
         out = cupy.empty(input.shape, dtype=out_dtype)
 
+    if pre is not None or post is not None:
+        result = _z_marching_correlate(
+            input, [pass_of(i) for i in active], in_dtype, out_dtype, cval, out
+        )
+        if result is not None:
+            return result
+
     def fused_pair(src, dst):
         r, c = by_axis[row_axis], by_axis[col_axis]
         return _fused2d.correlate_2d(
@@ -577,6 +585,57 @@ def _fused_correlate(
         fused_pair(input, temp)
         return correlate1d(temp, w, ax, out, mode, cval, o)
     return fused_pair(input, out)
+
+
+def _z_marching_correlate(input, passes, in_dtype, out_dtype, cval, out):
+    """All three passes of a 3D separable correlation in one launch (see
+    _fused_separable_3d), or None when that kernel does not apply: the pass
+    along axis 0 must be the first or the second, every pass must be one the
+    per-axis path would run with its shared-memory kernels, and the queues
+    and tiles must fit."""
+    if (
+        not _fused3d._Z_MARCHING
+        or input.size < _fused3d._PLAIN_MIN_SIZE_VS_PAIR
+    ):
+        return None
+    specs = []
+    max_radius = 0
+    has_float64 = False
+    for i, (ax, w, mode, o) in enumerate(passes):
+        pass_in = in_dtype if i == 0 else out_dtype
+        if mode == "constant" and _unsupported_shmem_cval(cval, pass_in):
+            return None
+        a = w.size // 2 + o
+        if not 0 <= a < w.size:
+            return None
+        wd = _fused_weights_dtype(pass_in, w.dtype)
+        has_float64 = has_float64 or wd == cupy.float64
+        max_radius = max(max_radius, a, w.size - 1 - a)
+        specs.append((ax, w, a, wd, mode))
+    if has_float64 and not _fused2d.float64_preferred(input.shape, max_radius):
+        return None
+    if not _fused3d.prefer_separable_3d(
+        input.size, [(ax, (w.size, wd)) for ax, w, a, wd, mode in specs], 2
+    ):
+        return None
+    plan = _fused3d.plan_separable_3d(
+        input.shape,
+        [(ax, (w.size, wd), a, False, mode) for ax, w, a, wd, mode in specs],
+        in_dtype,
+        out_dtype,
+    )
+    if plan is None:
+        return None
+    return _fused3d.separable_3d(
+        cupy.ascontiguousarray(input),
+        [
+            (ax, cupy.ascontiguousarray(w, dtype=wd), a, False, mode)
+            for ax, w, a, wd, mode in specs
+        ],
+        out,
+        (cval, cval, cval),
+        plan=plan,
+    )
 
 
 def _run_1d_correlates(

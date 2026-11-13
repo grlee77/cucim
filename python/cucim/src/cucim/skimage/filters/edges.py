@@ -33,7 +33,7 @@ from cucim.skimage._vendored._ndimage_filters import _is_not_windows
 from .._shared.utils import _supported_float_type, check_nD
 from ..restoration.uft import laplacian
 from ..util.dtype import img_as_float
-from . import _fused_separable_2d as _fused2d
+from . import _fused_separable_2d as _fused2d, _fused_separable_3d as _fused3d
 
 # n-dimensional filter weights
 SOBEL_EDGE = np.array([1, 0, -1])
@@ -220,6 +220,79 @@ def _fused_edge_filter_2d(
     )
 
 
+def _fused_edge_filter_3d(
+    image, axes, edge_weights, smooth_weights, mode, cvals
+):
+    """A 3D edge filter along one axis, or its magnitude over all three
+    axes, in one launch (z-marching kernels, see _fused_separable_3d).
+
+    Returns None when the per-axis passes are used instead. ``cvals`` are
+    the cvals of the three passes (see _generic_edge_filter). The passes
+    are the per-axis ones (edge axis first, then the other axes in
+    increasing order, as convolutions), so the results are identical.
+    """
+    if (
+        image.ndim != 3
+        or image.size == 0
+        or not _is_not_windows
+        or not _fused3d._Z_MARCHING
+    ):
+        return None
+    k = edge_weights.size
+    if smooth_weights.size != k or k % 2 == 0:
+        return None
+    try:
+        mode = _ndi_util._check_mode(mode)
+    except RuntimeError:
+        return None  # the per-axis path reports the error
+    if mode == "wrap":
+        mode = "grid-wrap"
+    for value in cvals:
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+    dtype = edge_weights.dtype
+    if dtype == cp.float64 and not _fused2d.float64_preferred(
+        image.shape, k // 2
+    ):
+        return None
+    if sorted(axes) == [0, 1, 2]:
+        plan = _fused3d.plan_edge_magnitude_3d(image.shape, k, dtype, mode)
+        if plan is None:
+            return None
+        output = cp.empty(image.shape, dtype=dtype)
+        return _fused3d.edge_magnitude_3d(
+            cp.ascontiguousarray(image),
+            edge_weights,
+            smooth_weights,
+            output,
+            cvals,
+            plan,
+        )
+    if len(axes) != 1:
+        return None
+    edge_dim = axes[0]
+    order = [edge_dim] + [ax for ax in range(3) if ax != edge_dim]
+    passes = [
+        (
+            ax,
+            edge_weights if ax == edge_dim else smooth_weights,
+            k // 2,
+            True,
+            mode,
+        )
+        for ax in order
+    ]
+    if not _fused3d.prefer_separable_3d(image.size, passes, 3):
+        return None
+    plan = _fused3d.plan_separable_3d(image.shape, passes, dtype, dtype)
+    if plan is None:
+        return None
+    output = cp.empty(image.shape, dtype=dtype)
+    return _fused3d.separable_3d(
+        cp.ascontiguousarray(image), passes, output, cvals, plan=plan
+    )
+
+
 def _generic_edge_filter(
     image,
     *,
@@ -309,6 +382,15 @@ def _generic_edge_filter(
     fused = _fused_edge_filter_2d(
         image, axes, edge_weights, smooth_weights, mode, cval, cval * edge_sum
     )
+    if fused is None:
+        fused = _fused_edge_filter_3d(
+            image,
+            axes,
+            edge_weights,
+            smooth_weights,
+            mode,
+            (cval, cval * edge_sum, cval * edge_sum * smooth_sum),
+        )
     if fused is not None:
         return fused
 
