@@ -982,7 +982,20 @@ def _get_mean_curvature_coefs(spacing):
             _CROFTON_3D_WEIGHTS[np.count_nonzero(m) - 1] for m in normals
         ]
     else:
-        weights = _get_voronoi_crofton_weights(tuple(1.0 / v for v in spacing))
+        try:
+            weights = _get_voronoi_crofton_weights(
+                tuple(1.0 / v for v in spacing)
+            )
+        except ValueError as e:
+            # (the weights are for the reciprocal spacing: report the
+            # caller's spacing, whose ratio is the same)
+            ratio = max(spacing) / min(spacing)
+            raise ValueError(
+                f"spacing {tuple(spacing)} is too anisotropic for the "
+                "direction weights of integral_mean_curvature: the ratio of "
+                f"the largest to the smallest spacing is {ratio:.3g}, "
+                "supported up to about 1e6"
+            ) from e
     distances = [1.0 / np.linalg.norm(m / np.asarray(spacing)) for m in normals]
     scale = (2 * math.pi / 12) * np.asarray(weights) * np.asarray(distances)
     return cp.asarray(_get_mean_curvature_lut() @ scale, dtype=cp.float64)
@@ -1052,7 +1065,9 @@ def regionprops_integral_mean_curvature(
     labels : (M, N, P) cupy.ndarray
         Label image.
     spacing : tuple of float, optional
-        The voxel spacing along each axis.
+        The voxel spacing along each axis. With anisotropic spacing, the ratio
+        of the largest to the smallest spacing can be up to about 1e6; larger
+        ratios raise a ValueError (the direction weights cannot be computed).
 
     Extra Parameters
     ----------------

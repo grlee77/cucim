@@ -3971,3 +3971,42 @@ def test_surface_area_anisotropic_permutation_and_scaling(ratio):
         spacing=tuple(3.0 * s for s in spacing),
     )["surface_area"]
     assert_allclose(scaled, 9.0 * area, rtol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "spacing", [(1e7, 1.0, 1.0), (1e-7, 1.0, 1.0), (1.0, 1e4, 1e-4)]
+)
+def test_integral_mean_curvature_extreme_spacing_raises(spacing):
+    """Aspect ratios beyond the supported range raise a ValueError that
+    names the caller's spacing (they raised SciPy's "Duplicate generators
+    present")."""
+    labels = cp.ones((3, 4, 5), dtype=cp.int32)
+    with pytest.raises(ValueError, match="too anisotropic") as info:
+        measure.regionprops_table(
+            labels, properties=["integral_mean_curvature"], spacing=spacing
+        )
+    assert str(tuple(float(s) for s in spacing)) in str(info.value)
+
+
+@pytest.mark.parametrize("ratio", [1e3, 1e5, 1e6])
+def test_integral_mean_curvature_anisotropic_permutation_and_scaling(ratio):
+    """Within the supported range: finite, invariant under axis permutations
+    of image and spacing, and scaled by s when the spacing is scaled by s
+    (the integral of mean curvature has the dimension of a length)."""
+    rng = np.random.default_rng(int(np.log10(ratio)))
+    labels = cp.asarray(rng.random((7, 8, 9)) > 0.4, dtype=cp.int32)
+    spacing = (ratio, 1.0, 0.5)
+    prop = ["integral_mean_curvature"]
+    value = regionprops_dict(labels, properties=prop, spacing=spacing)[prop[0]]
+    assert cp.isfinite(value).all()
+    for perm in [(1, 0, 2), (2, 1, 0), (1, 2, 0)]:
+        permuted = regionprops_dict(
+            cp.ascontiguousarray(labels.transpose(perm)),
+            properties=prop,
+            spacing=tuple(spacing[p] for p in perm),
+        )[prop[0]]
+        assert_allclose(permuted, value, rtol=1e-9)
+    scaled = regionprops_dict(
+        labels, properties=prop, spacing=tuple(3.0 * s for s in spacing)
+    )[prop[0]]
+    assert_allclose(scaled, 3.0 * value, rtol=1e-9)
