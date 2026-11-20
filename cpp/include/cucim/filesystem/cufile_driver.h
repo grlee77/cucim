@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2022, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #ifndef CUCIM_CUFILE_DRIVER_H
@@ -93,7 +93,8 @@ ssize_t EXPORT_VISIBLE pread(const std::shared_ptr<CuFileDriver>& fd, void* buf,
  * @param count The number of bytes to write.
  * @param file_offset An offset from the start of the file.
  * @param buf_offset An offset from the start of the buffer. Default value is 0.
- * @return The number of bytes written if succeed, -1 otherwise.
+ * @return The number of bytes written, including a partial count if a later operation fails, or -1 if the
+ * write fails before writing any bytes.
  */
 ssize_t EXPORT_VISIBLE pwrite(const std::shared_ptr<CuFileDriver>& fd, const void* buf, size_t count, off_t file_offset, off_t buf_offset = 0);
 

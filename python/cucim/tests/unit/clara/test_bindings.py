@@ -392,6 +392,7 @@ def _check_filesystem_pwrite_limit(path, flags, device, offset, count, limit):
         pytest.param(False, 0, 16384, id="buffered-short"),
         pytest.param(False, 8192, 4096, id="buffered-at-limit"),
         pytest.param(True, 0, 16384, id="direct-aligned-short"),
+        pytest.param(True, 0, 8192 + 16, id="direct-tail-error-after-block"),
         pytest.param(True, 100, 16384, id="direct-unaligned-short"),
     ],
 )

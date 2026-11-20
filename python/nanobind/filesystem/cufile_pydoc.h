@@ -37,8 +37,8 @@ Returns:
 
 // ssize_t pwrite(const void* buf, size_t count, off_t file_offset, off_t buf_offset = 0);
 PYDOC(pwrite, R"doc(
-Reads up to `count` bytes from the file driver at offset `file_offset` (from the start of the file) into the buffer
-`buf` starting at offset `buf_offset`. The file offset is not changed.
+Writes up to `count` bytes from the buffer `buf` starting at offset `buf_offset` to the file at `file_offset`.
+The file offset is not changed.
 
 Args:
     buf: A buffer where write bytes come from. Buffer can be either in CPU memory or (CUDA) GPU memory.
@@ -46,7 +46,8 @@ Args:
     file_offset: An offset from the start of the file.
     buf_offset: An offset from the start of the buffer. Default value is 0.
 Returns:
-    The number of bytes written if succeed, -1 otherwise.
+    The number of bytes written, including a partial count if a later operation fails, or -1 if the write fails
+    before writing any bytes.
 )doc")
 
 // bool close();

@@ -683,9 +683,17 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
     }
     memory_type = attributes.type;
 
-    // Writes `size` bytes from `src` at `offset` through the host cache. Returns the bytes written, which are
-    // fewer than `size` after a short write (with O_DIRECT, writing on from the resulting unaligned offset
-    // would fail), or -1 on an error.
+    auto finish_write = [&](bool failed = false) {
+        if (total_write_cnt > 0)
+        {
+            // close() truncates O_DIRECT padding to this logical size.
+            file_size_ = std::max(file_size_, file_offset + static_cast<size_t>(total_write_cnt));
+        }
+        return failed && total_write_cnt == 0 ? -1 : total_write_cnt;
+    };
+
+    // Stop at the first error or short write. With O_DIRECT, the next offset after a short write may be
+    // unaligned. Preserve the bytes written by earlier chunks if a later operation fails.
     auto write_staged = [&](const uint8_t* src, size_t size, off_t offset) -> ssize_t {
         const size_t cache_size = s_cufile_initializer.max_host_cache_size();
         auto* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
@@ -702,7 +710,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                 CUDA_TRY(cudaMemcpy(cache_buf, src + written, chunk_size, cudaMemcpyDeviceToHost));
                 if (cuda_status)
                 {
-                    return ssize_t{ -1 };
+                    return written > 0 ? static_cast<ssize_t>(written) : -1;
                 }
             }
             const off_t chunk_offset = offset + static_cast<off_t>(written);
@@ -711,7 +719,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
             {
                 fmt::print(
                     stderr, "Cannot write the file content at offset {}! ({})\n", chunk_offset, std::strerror(errno));
-                return ssize_t{ -1 };
+                return written > 0 ? static_cast<ssize_t>(written) : -1;
             }
             written += write_cnt;
             if (static_cast<size_t>(write_cnt) < chunk_size)
@@ -800,7 +808,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                 if (read_cnt < 0)
                 {
                     fmt::print(stderr, "Cannot read the remaining file content block! ({})\n", std::strerror(errno));
-                    return -1;
+                    return finish_write(true);
                 }
                 // Overwrite a buffer to write, to the intermediate remaining block (internal_buf_pos)
                 if (memory_type == cudaMemoryTypeUnregistered)
@@ -815,7 +823,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                                         remaining, cudaMemcpyDeviceToHost));
                     if (cuda_status)
                     {
-                        return -1;
+                        return finish_write(true);
                     }
                 }
                 // Write the constructed block
@@ -823,7 +831,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                 if (write_cnt < 0)
                 {
                     fmt::print(stderr, "Cannot write the remaining file content! ({})\n", std::strerror(errno));
-                    return -1;
+                    return finish_write(true);
                 }
 
                 total_write_cnt += covered(write_cnt, 0, remaining);
@@ -949,7 +957,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                     write_cnt = write_staged(input_buf, body_remaining_size, write_offset);
                     if (write_cnt < 0)
                     {
-                        return -1;
+                        return finish_write(true);
                     }
                     write_offset += write_cnt;
                     input_buf += write_cnt;
@@ -967,7 +975,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                     {
                         fmt::print(stderr, "Cannot read the tail part of the file content block! ({})\n",
                                    std::strerror(errno));
-                        return -1;
+                        return finish_write(true);
                     }
                     // Overwrite the region to write
                     bytes_to_copy = tail_size;
@@ -980,7 +988,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                         CUDA_TRY(cudaMemcpy(internal_buf_pos, input_buf, bytes_to_copy, cudaMemcpyDeviceToHost));
                         if (cuda_status)
                         {
-                            return -1;
+                            return finish_write(true);
                         }
                     }
 
@@ -990,7 +998,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                     {
                         fmt::print(stderr, "Cannot write the tail part of the file content block! ({})\n",
                                    std::strerror(errno));
-                        return -1;
+                        return finish_write(true);
                     }
                     total_write_cnt += covered(write_cnt, 0, tail_size);
                 }
@@ -1010,13 +1018,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
         }
         total_write_cnt += write_cnt;
     }
-    // Update file size
-    if (total_write_cnt > 0)
-    {
-        file_size_ = std::max(file_size_, file_offset + static_cast<size_t>(total_write_cnt));
-    }
-
-    return total_write_cnt;
+    return finish_write();
 }
 bool CuFileDriver::close()
 {
