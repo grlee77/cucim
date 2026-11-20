@@ -295,7 +295,7 @@ bool discard_page_cache(const char* file_path)
 }
 
 
-CuFileDriverInitializer::CuFileDriverInitializer()
+CuFileDriverInitializer::CuFileDriverInitializer() : max_host_cache_size_(DEFAULT_MAX_CACHE_SIZE)
 {
     // Initialize libcufile library
     s_cufile_stub.load();
@@ -311,7 +311,11 @@ CuFileDriverInitializer::CuFileDriverInitializer()
         {
             // kb -> bytes
             max_device_cache_size_ = static_cast<uint64_t>(props.max_device_cache_size) << 10;
-            max_host_cache_size_ = static_cast<uint64_t>(props.max_device_cache_size) << 10;
+            // POSIX staging needs a nonzero cache even when cuFile reports no device cache.
+            if (max_device_cache_size_ != 0)
+            {
+                max_host_cache_size_ = max_device_cache_size_;
+            }
         }
         else
         {
@@ -323,7 +327,6 @@ CuFileDriverInitializer::CuFileDriverInitializer()
     {
         is_available_ = false;
         max_device_cache_size_ = DEFAULT_MAX_CACHE_SIZE;
-        max_host_cache_size_ = DEFAULT_MAX_CACHE_SIZE;
 
         // fmt::print(stderr, "[Warning] CuFileDriver cannot be open. Falling back to use POSIX file IO APIs.\n");
     }
