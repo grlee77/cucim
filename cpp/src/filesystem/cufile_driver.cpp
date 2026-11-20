@@ -571,7 +571,11 @@ ssize_t CuFileDriver::pread(void* buf, size_t count, off_t file_offset, off_t bu
         }
         // The mapping covers the file size at open time; reading past it would fault.
         const auto offset = static_cast<size_t>(file_offset);
-        const size_t available = offset < file_size_ ? std::min(count, file_size_ - offset) : 0;
+        if (offset >= file_size_)
+        {
+            return 0;
+        }
+        const size_t available = std::min(count, file_size_ - offset);
         return finish_read(copy_from_host(output_buf, static_cast<uint8_t*>(mmap_ptr_) + offset, available) ?
                                static_cast<ssize_t>(available) :
                                -1);

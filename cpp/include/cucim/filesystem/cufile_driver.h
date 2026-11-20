@@ -44,6 +44,7 @@ bool EXPORT_VISIBLE is_gds_available();
  * - 'm': Use memory-mapped file. This flag is supported only for the read-only file descriptor.
  *
  * When 'm' is used, `PROT_READ` and `MAP_SHARED` are used for the parameter of mmap() function.
+ * The backing file must retain its size while mapped. Truncating it can cause SIGBUS on a subsequent read.
  *
  * @param file_path A file path to open.
  * @param flags File flags in string. Default value is "r".
@@ -57,7 +58,8 @@ std::shared_ptr<CuFileDriver> EXPORT_VISIBLE open(const char* file_path, const c
  *
  * @param fd A file descriptor. To use GDS, fd needs to be opened with O_DIRECT flag.
  * @param no_gds true if you do not want to use GDS. Default value is `false`.
- * @param use_mmap true if you want to use memory-mapped IO. This flag is supported only for the read-only file descriptor. Default value is `false`.
+ * @param use_mmap true to use memory-mapped I/O. Requires a read-only descriptor and a backing file whose
+ * size stays fixed while mapped. Defaults to `false`.
  * @return A std::shared_ptr object of CuFileDriver.
  */
 std::shared_ptr<CuFileDriver> EXPORT_VISIBLE open(int fd, bool no_gds = false, bool use_mmap = false);
@@ -162,6 +164,7 @@ class EXPORT_VISIBLE CuFileDriver : public std::enable_shared_from_this<CuFileDr
 public:
     CuFileDriver() = delete;
 
+    /// Memory-mapped I/O requires a read-only descriptor and a backing file whose size stays fixed until close().
     CuFileDriver(int fd, bool no_gds = false, bool use_mmap = false, const char* file_path = nullptr);
 
     ssize_t pread(void* buf, size_t count, off_t file_offset, off_t buf_offset = 0) const;

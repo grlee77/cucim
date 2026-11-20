@@ -44,6 +44,7 @@ The following is optional flags that can be added to above string:
 - 'm': Use memory-mapped file. This flag is supported only for the read-only file descriptor.
 
 When 'm' is used, `PROT_READ` and `MAP_SHARED` are used for the parameter of mmap() function.
+The backing file must retain its size while mapped. Truncating it can cause SIGBUS on a subsequent read.
 
 Args:
     file_path: A file path to open, as `str`, `bytes`, or `os.PathLike`.

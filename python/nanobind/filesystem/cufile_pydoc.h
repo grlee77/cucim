@@ -17,7 +17,8 @@ Constructor of CuFileDriver.
 Args:
     fd: A file descriptor (in `int` type) which is available through `os.open()` method.
     no_gds: If True, use POSIX APIs only even when GDS can be supported for the file.
-    use_mmap: If True, use memory-mapped IO. This flag is supported only for the read-only file descriptor. Default value is `False`.
+    use_mmap: Use memory-mapped I/O with a read-only file descriptor. The backing file must retain
+        its size while mapped. Truncating it can cause SIGBUS on a subsequent read. Defaults to `False`.
     file_path: A file path for the file descriptor, as `str`, `bytes`, or `os.PathLike`. It would retrieve the absolute file path of the file descriptor if not specified.
 )doc")
 
