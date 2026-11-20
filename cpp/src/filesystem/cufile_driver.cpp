@@ -683,36 +683,62 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
     }
     memory_type = attributes.type;
 
+    // Writes `size` bytes from `src` at `offset` through the host cache. Returns the bytes written, which are
+    // fewer than `size` after a short write (with O_DIRECT, writing on from the resulting unaligned offset
+    // would fail), or -1 on an error.
+    auto write_staged = [&](const uint8_t* src, size_t size, off_t offset) -> ssize_t {
+        const size_t cache_size = s_cufile_initializer.max_host_cache_size();
+        auto* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
+        size_t written = 0;
+        while (written < size)
+        {
+            const size_t chunk_size = std::min(cache_size, size - written);
+            if (memory_type == cudaMemoryTypeUnregistered)
+            {
+                memcpy(cache_buf, src + written, chunk_size);
+            }
+            else
+            {
+                CUDA_TRY(cudaMemcpy(cache_buf, src + written, chunk_size, cudaMemcpyDeviceToHost));
+                if (cuda_status)
+                {
+                    return ssize_t{ -1 };
+                }
+            }
+            const off_t chunk_offset = offset + static_cast<off_t>(written);
+            const ssize_t write_cnt = ::pwrite(handle_->fd, cache_buf, chunk_size, chunk_offset);
+            if (write_cnt < 0)
+            {
+                fmt::print(
+                    stderr, "Cannot write the file content at offset {}! ({})\n", chunk_offset, std::strerror(errno));
+                return ssize_t{ -1 };
+            }
+            written += write_cnt;
+            if (static_cast<size_t>(write_cnt) < chunk_size)
+            {
+                break;
+            }
+        }
+        return static_cast<ssize_t>(written);
+    };
+
+    // The number of bytes in [skip, skip + size) of a block that a write of write_cnt bytes covered.
+    auto covered = [](ssize_t write_cnt, size_t skip, size_t size) -> size_t {
+        const auto block_written = static_cast<size_t>(write_cnt);
+        return block_written > skip ? std::min(size, block_written - skip) : 0;
+    };
+
+    // Set when a write stops early, so that the later parts of the request are not written.
+    bool short_write = false;
+
     if (file_type == FileHandleType::kPosix)
     {
         if (memory_type != cudaMemoryTypeUnregistered)
         {
-            uint64_t cache_size = s_cufile_initializer.max_host_cache_size();
-            uint64_t remaining_size = count;
-            ssize_t write_cnt;
-            uint8_t* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
-            const uint8_t* input_buf = static_cast<const uint8_t*>(buf) + buf_offset;
-            off_t write_offset = file_offset;
-            while (true)
+            total_write_cnt = write_staged(static_cast<const uint8_t*>(buf) + buf_offset, count, file_offset);
+            if (total_write_cnt < 0)
             {
-                size_t bytes_to_copy = std::min(cache_size, remaining_size);
-
-                if (bytes_to_copy == 0)
-                {
-                    break;
-                }
-
-                CUDA_TRY(cudaMemcpy(cache_buf, input_buf, bytes_to_copy, cudaMemcpyDeviceToHost));
-                if (cuda_status)
-                {
-                    return -1;
-                }
-                write_cnt = ::pwrite(handle_->fd, cache_buf, bytes_to_copy, write_offset);
-                write_offset += write_cnt;
-                input_buf += write_cnt;
-                remaining_size -= write_cnt;
-
-                total_write_cnt += bytes_to_copy;
+                return -1;
             }
         }
         else
@@ -741,42 +767,27 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                 {
                     write_cnt = ::pwrite(
                         handle_->fd, reinterpret_cast<const char*>(buf) + buf_offset, block_write_size, file_offset);
-                    total_write_cnt += write_cnt;
+                    if (write_cnt < 0)
+                    {
+                        fmt::print(stderr, "Cannot write the file content block! ({})\n", std::strerror(errno));
+                        return -1;
+                    }
                 }
                 else
                 {
-                    uint64_t cache_size = s_cufile_initializer.max_host_cache_size();
-                    uint64_t remaining_size = block_write_size;
-                    ssize_t write_cnt;
-                    uint8_t* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
-                    const uint8_t* input_buf = static_cast<const uint8_t*>(buf) + buf_offset;
-                    off_t write_offset = file_offset;
-                    while (true)
+                    write_cnt =
+                        write_staged(static_cast<const uint8_t*>(buf) + buf_offset, block_write_size, file_offset);
+                    if (write_cnt < 0)
                     {
-                        size_t bytes_to_copy = std::min(cache_size, remaining_size);
-
-                        if (bytes_to_copy == 0)
-                        {
-                            break;
-                        }
-
-                        CUDA_TRY(cudaMemcpy(cache_buf, input_buf, bytes_to_copy, cudaMemcpyDeviceToHost));
-                        if (cuda_status)
-                        {
-                            return -1;
-                        }
-                        write_cnt = ::pwrite(handle_->fd, cache_buf, bytes_to_copy, write_offset);
-                        write_offset += write_cnt;
-                        input_buf += write_cnt;
-                        remaining_size -= write_cnt;
-
-                        total_write_cnt += bytes_to_copy;
+                        return -1;
                     }
                 }
+                total_write_cnt += write_cnt;
+                short_write = static_cast<size_t>(write_cnt) < block_write_size;
             }
 
             size_t remaining = count - block_write_size;
-            if (remaining)
+            if (remaining && !short_write)
             {
                 uint8_t internal_buf[PAGE_SIZE * 2]{};
                 uint8_t* internal_buf_pos =
@@ -815,7 +826,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                     return -1;
                 }
 
-                total_write_cnt += remaining;
+                total_write_cnt += covered(write_cnt, 0, remaining);
             }
         }
         else
@@ -873,7 +884,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                     return -1;
                 }
 
-                total_write_cnt += std::min(static_cast<size_t>(write_cnt - page_offset), count);
+                total_write_cnt += covered(write_cnt, page_offset, count);
             }
             else
             {
@@ -924,44 +935,31 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                                    std::strerror(errno));
                         return -1;
                     }
-                    input_buf += bytes_to_copy;
+                    const size_t header_written = covered(write_cnt, page_offset, header_size);
+                    input_buf += header_written;
                     write_offset += write_cnt;
 
-                    total_write_cnt += bytes_to_copy;
+                    total_write_cnt += header_written;
+                    short_write = header_written < header_size;
                 }
 
                 // Copy n * PAGE_SIZE bytes
-                while (true)
+                if (body_remaining_size > 0 && !short_write)
                 {
-                    size_t bytes_to_copy = std::min(cache_size, body_remaining_size);
-
-                    if (bytes_to_copy == 0)
+                    write_cnt = write_staged(input_buf, body_remaining_size, write_offset);
+                    if (write_cnt < 0)
                     {
-                        break;
+                        return -1;
                     }
-
-                    if (memory_type == cudaMemoryTypeUnregistered)
-                    {
-                        memcpy(cache_buf, input_buf, bytes_to_copy);
-                    }
-                    else
-                    {
-                        CUDA_TRY(cudaMemcpy(cache_buf, input_buf, bytes_to_copy, cudaMemcpyDeviceToHost));
-                        if (cuda_status)
-                        {
-                            return -1;
-                        }
-                    }
-                    write_cnt = ::pwrite(handle_->fd, cache_buf, bytes_to_copy, write_offset);
                     write_offset += write_cnt;
                     input_buf += write_cnt;
-                    body_remaining_size -= write_cnt;
 
-                    total_write_cnt += bytes_to_copy;
+                    total_write_cnt += write_cnt;
+                    short_write = static_cast<size_t>(write_cnt) < body_remaining_size;
                 }
 
                 // Handle the tail part of the file content
-                if (tail_size)
+                if (tail_size && !short_write)
                 {
                     memset(internal_buf_pos, 0, PAGE_SIZE);
                     read_cnt = ::pread(handle_->fd, internal_buf_pos, PAGE_SIZE, write_offset);
@@ -994,7 +992,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
                                    std::strerror(errno));
                         return -1;
                     }
-                    total_write_cnt += tail_size;
+                    total_write_cnt += covered(write_cnt, 0, tail_size);
                 }
             }
         }

@@ -9,6 +9,8 @@ import importlib
 import multiprocessing
 import os
 import pathlib
+import resource
+import signal
 
 import numpy as np
 import pytest
@@ -348,6 +350,73 @@ def test_filesystem_pread_eof(tmp_path, device, mode, file_size, offset, count):
         process.join(timeout=15)
         if process.is_alive():
             pytest.fail("CuFileDriver.pread hung at end of file")
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+        process.close()
+
+
+def _check_filesystem_pwrite_limit(path, flags, device, offset, count, limit):
+    array_module = _filesystem_array_module(device)
+    buffer = _page_aligned_buffer(array_module, count)
+    buffer[:] = array_module.arange(count, dtype=np.uint8)
+    if device == "cuda":
+        array_module.cuda.get_current_stream().synchronize()
+
+    # Writes beyond the file size limit fail with EFBIG instead of SIGXFSZ.
+    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, resource.RLIM_INFINITY))
+    fd = os.open(path, flags)
+    try:
+        with filesystem.CuFileDriver(fd, no_gds=True, file_path=path) as driver:
+            result = driver.pwrite(buffer, count, offset)
+    finally:
+        os.close(fd)
+
+    # pwrite reports the bytes written before the limit, or -1 if it could
+    # not write any.
+    expected = min(count, limit - offset) if offset < limit else -1
+    assert result == expected
+    if expected > 0:
+        written = path.read_bytes()[offset : offset + expected]
+        source = buffer if device == "host" else buffer.get()
+        assert written == source.tobytes()[:expected]
+
+
+@pytest.mark.parametrize("device", ["host", "cuda"])
+@pytest.mark.parametrize(
+    ("direct", "offset", "count"),
+    [
+        pytest.param(False, 0, 16384, id="buffered-short"),
+        pytest.param(False, 8192, 4096, id="buffered-at-limit"),
+        pytest.param(True, 0, 16384, id="direct-aligned-short"),
+        pytest.param(True, 100, 16384, id="direct-unaligned-short"),
+    ],
+)
+def test_filesystem_pwrite_file_size_limit(
+    tmp_path, device, direct, offset, count
+):
+    _filesystem_array_module(device)
+    path = tmp_path / "limited.bin"
+    path.write_bytes(b"")
+    flags = os.O_RDWR
+    if direct:
+        os.close(_open_odirect(path, flags))
+        flags |= os.O_DIRECT
+
+    # Isolate the write: it lowers the file size limit, and a regression could
+    # leave it looping in native code.
+    process = multiprocessing.get_context("spawn").Process(
+        target=_check_filesystem_pwrite_limit,
+        args=(path, flags, device, offset, count, 2 * 4096),
+    )
+    process.start()
+    try:
+        process.join(timeout=15)
+        if process.is_alive():
+            pytest.fail("CuFileDriver.pwrite hung at the file size limit")
         assert process.exitcode == 0
     finally:
         if process.is_alive():
