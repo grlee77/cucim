@@ -291,7 +291,7 @@ def test_filesystem_odirect_tail_offset(tmp_path, count, write, device):
         np.testing.assert_array_equal(buffer, expected)
 
 
-def _check_filesystem_pread_eof(path, flags, device, offset, count):
+def _check_filesystem_pread_eof(path, flags, device, offset, count, use_mmap):
     array_module = _filesystem_array_module(device)
     buffer = _page_aligned_buffer(array_module, count)
     buffer.fill(255)
@@ -301,7 +301,9 @@ def _check_filesystem_pread_eof(path, flags, device, offset, count):
     data = path.read_bytes()[offset : offset + count]
     fd = os.open(path, flags)
     try:
-        with filesystem.CuFileDriver(fd, no_gds=True, file_path=path) as driver:
+        with filesystem.CuFileDriver(
+            fd, no_gds=True, use_mmap=use_mmap, file_path=path
+        ) as driver:
             assert driver.pread(buffer, count, offset) == len(data)
     finally:
         os.close(fd)
@@ -314,31 +316,32 @@ def _check_filesystem_pread_eof(path, flags, device, offset, count):
 
 @pytest.mark.parametrize("device", ["host", "cuda"])
 @pytest.mark.parametrize(
-    ("direct", "file_size", "offset", "count"),
+    ("mode", "file_size", "offset", "count"),
     [
-        pytest.param(False, 12288, 8192, 8192, id="buffered-short"),
-        pytest.param(True, 12288, 0, 16384, id="direct-aligned-short"),
-        pytest.param(True, 12288, 0, 12304, id="direct-tail-at-eof"),
-        pytest.param(True, 4103, 4096, 16, id="direct-short-tail"),
-        pytest.param(True, 12288, 12272, 24, id="direct-unaligned-short"),
-        pytest.param(True, 4103, 4104, 16, id="direct-unaligned-past-eof"),
+        pytest.param("buffered", 12288, 8192, 8192, id="buffered-short"),
+        pytest.param("direct", 12288, 0, 16384, id="direct-aligned-short"),
+        pytest.param("direct", 12288, 0, 12304, id="direct-tail-at-eof"),
+        pytest.param("direct", 4103, 4096, 16, id="direct-short-tail"),
+        pytest.param("direct", 12288, 12272, 24, id="direct-unaligned-short"),
+        pytest.param("direct", 4103, 4104, 16, id="direct-unaligned-past-eof"),
+        pytest.param("mmap", 4103, 4096, 16, id="mmap-short"),
+        pytest.param("mmap", 4103, 0, 1 << 20, id="mmap-past-mapping"),
+        pytest.param("mmap", 4103, 4104, 16, id="mmap-past-eof"),
     ],
 )
-def test_filesystem_pread_eof(
-    tmp_path, device, direct, file_size, offset, count
-):
+def test_filesystem_pread_eof(tmp_path, device, mode, file_size, offset, count):
     _filesystem_array_module(device)
     path = tmp_path / "pages.bin"
     path.write_bytes(bytes(i % 251 for i in range(file_size)))
     flags = os.O_RDONLY
-    if direct:
+    if mode == "direct":
         os.close(_open_odirect(path, flags))
         flags |= os.O_DIRECT
 
     # Isolate the read in case a regression leaves it looping in native code.
     process = multiprocessing.get_context("spawn").Process(
         target=_check_filesystem_pread_eof,
-        args=(path, flags, device, offset, count),
+        args=(path, flags, device, offset, count, mode == "mmap"),
     )
     process.start()
     try:
