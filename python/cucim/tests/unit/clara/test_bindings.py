@@ -6,6 +6,7 @@
 import enum
 import errno
 import importlib
+import multiprocessing
 import os
 import pathlib
 
@@ -222,6 +223,34 @@ def test_filesystem_roundtrip(tmp_path):
     assert isinstance(filesystem.discard_page_cache(path), bool)
 
 
+def _filesystem_array_module(device):
+    if device == "host":
+        return np
+    cupy = pytest.importorskip("cupy")
+    if not cupy.cuda.is_available():
+        pytest.skip("CUDA device is unavailable")
+    return cupy
+
+
+def _page_aligned_buffer(array_module, count):
+    page_size = 4096
+    storage = array_module.empty(count + page_size - 1, dtype=np.uint8)
+    address = storage.ctypes.data if array_module is np else storage.data.ptr
+    start = (-address) % page_size
+    return storage[start : start + count]
+
+
+def _open_odirect(path, flags):
+    if not hasattr(os, "O_DIRECT"):
+        pytest.skip("O_DIRECT is unavailable")
+    try:
+        return os.open(path, flags | os.O_DIRECT)
+    except OSError as error:
+        if error.errno in (errno.EINVAL, errno.EOPNOTSUPP):
+            pytest.skip("test filesystem does not support O_DIRECT")
+        raise
+
+
 @pytest.mark.parametrize(
     "count", [16, 4096 + 16], ids=["tail", "block-and-tail"]
 )
@@ -236,25 +265,9 @@ def test_filesystem_odirect_tail_offset(tmp_path, count, write, device):
     )
     path.write_bytes(original)
 
-    if device == "cuda":
-        array_module = pytest.importorskip("cupy")
-        if not array_module.cuda.is_available():
-            pytest.skip("CUDA device is unavailable")
-    else:
-        array_module = np
-    storage = array_module.empty(count + page_size - 1, dtype=np.uint8)
-    address = storage.data.ptr if device == "cuda" else storage.ctypes.data
-    start = (-address) % page_size
-    buffer = storage[start : start + count]
-
-    if not hasattr(os, "O_DIRECT"):
-        pytest.skip("O_DIRECT is unavailable")
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_DIRECT)
-    except OSError as error:
-        if error.errno in (errno.EINVAL, errno.EOPNOTSUPP):
-            pytest.skip("test filesystem does not support O_DIRECT")
-        raise
+    array_module = _filesystem_array_module(device)
+    buffer = _page_aligned_buffer(array_module, count)
+    fd = _open_odirect(path, os.O_RDWR)
     try:
         with filesystem.CuFileDriver(fd, no_gds=True, file_path=path) as driver:
             if write:
@@ -276,6 +289,68 @@ def test_filesystem_odirect_tail_offset(tmp_path, count, write, device):
         if device == "cuda":
             buffer = buffer.get()
         np.testing.assert_array_equal(buffer, expected)
+
+
+def _check_filesystem_pread_eof(path, flags, device, offset, count):
+    array_module = _filesystem_array_module(device)
+    buffer = _page_aligned_buffer(array_module, count)
+    buffer.fill(255)
+    if device == "cuda":
+        array_module.cuda.get_current_stream().synchronize()
+
+    data = path.read_bytes()[offset : offset + count]
+    fd = os.open(path, flags)
+    try:
+        with filesystem.CuFileDriver(fd, no_gds=True, file_path=path) as driver:
+            assert driver.pread(buffer, count, offset) == len(data)
+    finally:
+        os.close(fd)
+
+    # Bytes past the returned count are unspecified: O_DIRECT reads into a
+    # host buffer can zero them.
+    actual = buffer if device == "host" else buffer.get()
+    assert actual.tobytes()[: len(data)] == data
+
+
+@pytest.mark.parametrize("device", ["host", "cuda"])
+@pytest.mark.parametrize(
+    ("direct", "file_size", "offset", "count"),
+    [
+        pytest.param(False, 12288, 8192, 8192, id="buffered-short"),
+        pytest.param(True, 12288, 0, 16384, id="direct-aligned-short"),
+        pytest.param(True, 12288, 0, 12304, id="direct-tail-at-eof"),
+        pytest.param(True, 4103, 4096, 16, id="direct-short-tail"),
+        pytest.param(True, 12288, 12272, 24, id="direct-unaligned-short"),
+        pytest.param(True, 4103, 4104, 16, id="direct-unaligned-past-eof"),
+    ],
+)
+def test_filesystem_pread_eof(
+    tmp_path, device, direct, file_size, offset, count
+):
+    _filesystem_array_module(device)
+    path = tmp_path / "pages.bin"
+    path.write_bytes(bytes(i % 251 for i in range(file_size)))
+    flags = os.O_RDONLY
+    if direct:
+        os.close(_open_odirect(path, flags))
+        flags |= os.O_DIRECT
+
+    # Isolate the read in case a regression leaves it looping in native code.
+    process = multiprocessing.get_context("spawn").Process(
+        target=_check_filesystem_pread_eof,
+        args=(path, flags, device, offset, count),
+    )
+    process.start()
+    try:
+        process.join(timeout=15)
+        if process.is_alive():
+            pytest.fail("CuFileDriver.pread hung at end of file")
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+        process.close()
 
 
 def test_device_cache():

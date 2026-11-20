@@ -440,7 +440,6 @@ ssize_t CuFileDriver::pread(void* buf, size_t count, off_t file_offset, off_t bu
     }
 
     cudaError_t cuda_status;
-    ssize_t total_read_cnt = 0;
 
     cudaPointerAttributes attributes;
     cudaMemoryType memory_type;
@@ -482,288 +481,171 @@ ssize_t CuFileDriver::pread(void* buf, size_t count, off_t file_offset, off_t bu
         return result;
     };
 
+    auto copy_from_host = [&](uint8_t* dest, const uint8_t* src, size_t size) {
+        if (size == 0)
+        {
+            return true;
+        }
+        if (memory_type != cudaMemoryTypeUnregistered)
+        {
+            return copy_to_device(dest, src, size);
+        }
+        memcpy(dest, src, size);
+        return true;
+    };
+
+    auto report_read_error = [&](off_t offset) {
+        const int saved_errno = errno;
+        fmt::print(stderr, "Cannot read the file content at offset {}! ({})\n", offset, std::strerror(saved_errno));
+        errno = saved_errno;
+        return ssize_t{ -1 };
+    };
+
+    auto read_staged = [&](uint8_t* dest, size_t size, off_t offset) -> ssize_t {
+        const size_t cache_size = s_cufile_initializer.max_host_cache_size();
+        auto* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
+        size_t copied = 0;
+        while (copied < size)
+        {
+            const size_t chunk_size = std::min(cache_size, size - copied);
+            const off_t chunk_offset = offset + static_cast<off_t>(copied);
+            const ssize_t read_cnt = ::pread(handle_->fd, cache_buf, chunk_size, chunk_offset);
+            if (read_cnt < 0)
+            {
+                return report_read_error(chunk_offset);
+            }
+            if (read_cnt == 0)
+            {
+                break;
+            }
+            if (!copy_from_host(dest + copied, cache_buf, read_cnt))
+            {
+                return -1;
+            }
+            copied += read_cnt;
+            if (static_cast<size_t>(read_cnt) < chunk_size)
+            {
+                break;
+            }
+        }
+        return copied;
+    };
+
+    // The aligned read may contain bytes before the range requested by the caller.
+    auto copy_available = [&](uint8_t* dest, const uint8_t* src, ssize_t read_cnt, off_t read_offset, size_t skip,
+                              size_t size) -> ssize_t {
+        if (read_cnt < 0)
+        {
+            return report_read_error(read_offset);
+        }
+        const auto available = static_cast<size_t>(read_cnt);
+        const size_t copied = available > skip ? std::min(size, available - skip) : 0;
+        return copy_from_host(dest, src + skip, copied) ? static_cast<ssize_t>(copied) : -1;
+    };
+
+    auto read_page = [&](uint8_t* dest, size_t size, off_t offset, size_t skip) -> ssize_t {
+        uint8_t page[PAGE_SIZE * 2];
+        auto* aligned_page = reinterpret_cast<uint8_t*>(ALIGN_UP(page, PAGE_SIZE));
+        const ssize_t read_cnt = ::pread(handle_->fd, aligned_page, PAGE_SIZE, offset);
+        return copy_available(dest, aligned_page, read_cnt, offset, skip, size);
+    };
+
+    auto* output_buf = static_cast<uint8_t*>(buf) + buf_offset;
     if (file_type == FileHandleType::kPosix)
     {
         if (memory_type != cudaMemoryTypeUnregistered)
         {
-            uint64_t cache_size = s_cufile_initializer.max_host_cache_size();
-            uint64_t remaining_size = count;
-            ssize_t read_cnt;
-            uint8_t* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
-            uint8_t* output_buf = static_cast<uint8_t*>(buf) + buf_offset;
-            off_t read_offset = file_offset;
-            while (true)
-            {
-                size_t bytes_to_copy = std::min(cache_size, remaining_size);
-
-                if (bytes_to_copy == 0)
-                {
-                    break;
-                }
-                read_cnt = ::pread(handle_->fd, cache_buf, bytes_to_copy, read_offset);
-                if (!copy_to_device(output_buf, cache_buf, bytes_to_copy))
-                {
-                    return finish_read(-1);
-                }
-                read_offset += read_cnt;
-                output_buf += read_cnt;
-                remaining_size -= read_cnt;
-
-                total_read_cnt += bytes_to_copy;
-            }
+            return count == 0 ? 0 : finish_read(read_staged(output_buf, count, file_offset));
         }
-        else
-        {
-            total_read_cnt = ::pread(handle_->fd, reinterpret_cast<char*>(buf) + buf_offset, count, file_offset);
-        }
+        return ::pread(handle_->fd, output_buf, count, file_offset);
     }
-    else if (file_type == FileHandleType::kMemoryMapped)
+    if (file_type == FileHandleType::kMemoryMapped)
     {
-        if (memory_type != cudaMemoryTypeUnregistered)
-        {
-            if (!copy_to_device(reinterpret_cast<char*>(buf) + buf_offset,
-                                reinterpret_cast<char*>(mmap_ptr_) + file_offset, count))
-            {
-                return finish_read(-1);
-            }
-        }
-        else
-        {
-            memcpy(reinterpret_cast<char*>(buf) + buf_offset, reinterpret_cast<char*>(mmap_ptr_) + file_offset, count);
-        }
-        total_read_cnt = count;
+        return finish_read(copy_from_host(output_buf, static_cast<uint8_t*>(mmap_ptr_) + file_offset, count) ?
+                               static_cast<ssize_t>(count) :
+                               -1);
     }
-    else if (memory_type == cudaMemoryTypeUnregistered || handle_->type == FileHandleType::kPosixODirect)
+    if (memory_type == cudaMemoryTypeUnregistered || file_type == FileHandleType::kPosixODirect)
     {
-        uint64_t buf_align = (reinterpret_cast<uint64_t>(buf) + buf_offset) % PAGE_SIZE;
-        bool is_aligned = (buf_align == 0) && ((file_offset % PAGE_SIZE) == 0);
+        if (file_offset < 0)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        if (count == 0)
+        {
+            return 0;
+        }
 
+        const bool is_aligned = reinterpret_cast<uintptr_t>(output_buf) % PAGE_SIZE == 0 && file_offset % PAGE_SIZE == 0;
         if (is_aligned)
         {
-            ssize_t read_cnt;
-            size_t block_read_size = ALIGN_DOWN(count, PAGE_SIZE);
-            if (block_read_size > 0)
+            const size_t block_size = ALIGN_DOWN(count, PAGE_SIZE);
+            if (block_size > 0)
             {
-                if (memory_type == cudaMemoryTypeUnregistered)
+                const ssize_t read_cnt = memory_type == cudaMemoryTypeUnregistered ?
+                                             ::pread(handle_->fd, output_buf, block_size, file_offset) :
+                                             read_staged(output_buf, block_size, file_offset);
+                if (read_cnt < 0 || static_cast<size_t>(read_cnt) < block_size)
                 {
-                    read_cnt =
-                        ::pread(handle_->fd, reinterpret_cast<char*>(buf) + buf_offset, block_read_size, file_offset);
-                    total_read_cnt += read_cnt;
-                }
-                else
-                {
-                    uint64_t cache_size = s_cufile_initializer.max_host_cache_size();
-                    uint64_t remaining_size = block_read_size;
-                    ssize_t read_cnt;
-                    uint8_t* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
-                    uint8_t* input_buf = static_cast<uint8_t*>(buf) + buf_offset;
-                    off_t read_offset = file_offset;
-                    while (true)
-                    {
-                        size_t bytes_to_copy = std::min(cache_size, remaining_size);
-
-                        if (bytes_to_copy == 0)
-                        {
-                            break;
-                        }
-
-                        read_cnt = ::pread(handle_->fd, cache_buf, bytes_to_copy, read_offset);
-                        if (!copy_to_device(input_buf, cache_buf, bytes_to_copy))
-                        {
-                            return finish_read(-1);
-                        }
-                        read_offset += read_cnt;
-                        input_buf += read_cnt;
-                        remaining_size -= read_cnt;
-
-                        total_read_cnt += bytes_to_copy;
-                    }
+                    return finish_read(read_cnt);
                 }
             }
 
-            size_t remaining = count - block_read_size;
-            if (remaining)
-            {
-                uint8_t internal_buf[PAGE_SIZE * 2]; // no need to initialize for pread()
-                uint8_t* buf_pos = reinterpret_cast<uint8_t*>(ALIGN_UP(static_cast<uint8_t*>(internal_buf), PAGE_SIZE));
-
-                // Read the remaining block (size of PAGE_SIZE)
-                ssize_t read_cnt;
-                read_cnt = ::pread(handle_->fd, buf_pos, PAGE_SIZE, file_offset + block_read_size);
-                if (read_cnt < 0)
-                {
-                    fmt::print(stderr, "Cannot read the remaining file content block! ({})\n", std::strerror(errno));
-                    return finish_read(-1);
-                }
-                // Copy a buffer to read, from the intermediate remaining block (buf_pos)
-                if (memory_type == cudaMemoryTypeUnregistered)
-                {
-                    memcpy(reinterpret_cast<uint8_t*>(buf) + buf_offset + block_read_size, buf_pos, remaining);
-                }
-                else
-                {
-                    if (!copy_to_device(reinterpret_cast<uint8_t*>(buf) + buf_offset + block_read_size, buf_pos,
-                                        remaining))
-                    {
-                        return finish_read(-1);
-                    }
-                }
-
-                total_read_cnt += remaining;
-            }
+            const size_t tail_size = count - block_size;
+            const ssize_t tail_read = tail_size ? read_page(output_buf + block_size, tail_size,
+                                                            file_offset + static_cast<off_t>(block_size), 0) :
+                                                  0;
+            return finish_read(tail_read < 0 ? -1 : static_cast<ssize_t>(block_size) + tail_read);
         }
-        else
+
+        const off_t first_page = ALIGN_DOWN(file_offset, PAGE_SIZE);
+        const size_t page_offset = file_offset - first_page;
+        const size_t aligned_size = ALIGN_UP(page_offset + count, PAGE_SIZE);
+        if (aligned_size <= s_cufile_initializer.max_host_cache_size())
         {
-            uint64_t cache_size = s_cufile_initializer.max_host_cache_size();
-            uint8_t* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
+            auto* cache_buf = static_cast<uint8_t*>(s_cufile_cache.host_cache());
+            const ssize_t read_cnt = ::pread(handle_->fd, cache_buf, aligned_size, first_page);
+            return finish_read(copy_available(output_buf, cache_buf, read_cnt, first_page, page_offset, count));
+        }
 
-            off_t file_start_offset = ALIGN_DOWN(file_offset, PAGE_SIZE);
-            off_t end_offset = count + file_offset;
-            off_t end_boundary_offset = ALIGN_UP(end_offset, PAGE_SIZE);
-            size_t large_block_size = end_boundary_offset - file_start_offset;
-            off_t page_offset = file_offset - file_start_offset;
-            uint8_t* output_buf = static_cast<uint8_t*>(buf) + buf_offset;
+        const size_t head_size = std::min(count, PAGE_SIZE - page_offset);
+        const ssize_t head_read = read_page(output_buf, head_size, first_page, page_offset);
+        if (head_read < 0 || static_cast<size_t>(head_read) < head_size)
+        {
+            return finish_read(head_read);
+        }
 
-            if (large_block_size <= cache_size) // Optimize if bytes to load is less than cache_size
+        const size_t body_size = ALIGN_DOWN(count - head_size, PAGE_SIZE);
+        if (body_size > 0)
+        {
+            const ssize_t body_read = read_staged(output_buf + head_size, body_size, first_page + PAGE_SIZE);
+            if (body_read < 0 || static_cast<size_t>(body_read) < body_size)
             {
-                ssize_t read_cnt = ::pread(handle_->fd, cache_buf, large_block_size, file_start_offset);
-                if (read_cnt < 0)
-                {
-                    fmt::print(stderr, "Cannot read the file content block! ({})\n", std::strerror(errno));
-                    return finish_read(-1);
-                }
-
-                if (memory_type == cudaMemoryTypeUnregistered)
-                {
-                    memcpy(output_buf, cache_buf + page_offset, count);
-                }
-                else
-                {
-                    if (!copy_to_device(output_buf, cache_buf + page_offset, count))
-                    {
-                        return finish_read(-1);
-                    }
-                }
-                total_read_cnt += std::min(static_cast<size_t>(read_cnt - page_offset), count);
-            }
-            else
-            {
-                off_t overflow_offset = page_offset + count;
-                size_t header_size = (overflow_offset > PAGE_SIZE) ? PAGE_SIZE - page_offset : count;
-                size_t tail_size = (overflow_offset > PAGE_SIZE) ? end_offset - ALIGN_DOWN(end_offset, PAGE_SIZE) : 0;
-                uint64_t body_remaining_size = count - header_size - tail_size;
-                off_t read_offset = file_start_offset;
-
-                size_t bytes_to_copy;
-                ssize_t read_cnt;
-
-                uint8_t internal_buf[PAGE_SIZE * 2]; // no need to initialize for pread()
-                uint8_t* internal_buf_pos =
-                    reinterpret_cast<uint8_t*>(ALIGN_UP(static_cast<uint8_t*>(internal_buf), PAGE_SIZE));
-
-
-                // Handle the head part of the file content
-                if (header_size)
-                {
-                    read_cnt = ::pread(handle_->fd, internal_buf_pos, PAGE_SIZE, read_offset);
-                    if (read_cnt < 0)
-                    {
-                        fmt::print(stderr, "Cannot read the head part of the file content block! ({})\n",
-                                   std::strerror(errno));
-                        return finish_read(-1);
-                    }
-
-                    bytes_to_copy = header_size;
-                    if (memory_type == cudaMemoryTypeUnregistered)
-                    {
-                        memcpy(output_buf, internal_buf_pos + page_offset, bytes_to_copy);
-                    }
-                    else
-                    {
-                        if (!copy_to_device(output_buf, internal_buf_pos + page_offset, bytes_to_copy))
-                        {
-                            return finish_read(-1);
-                        }
-                    }
-
-                    output_buf += bytes_to_copy;
-                    read_offset += read_cnt;
-
-                    total_read_cnt += bytes_to_copy;
-                }
-
-                // Copy n * PAGE_SIZE bytes
-                while (true)
-                {
-                    size_t bytes_to_copy = std::min(cache_size, body_remaining_size);
-
-                    if (bytes_to_copy == 0)
-                    {
-                        break;
-                    }
-
-                    read_cnt = ::pread(handle_->fd, cache_buf, bytes_to_copy, read_offset);
-                    if (memory_type == cudaMemoryTypeUnregistered)
-                    {
-                        memcpy(output_buf, cache_buf, bytes_to_copy);
-                    }
-                    else
-                    {
-                        if (!copy_to_device(output_buf, cache_buf, bytes_to_copy))
-                        {
-                            return finish_read(-1);
-                        }
-                    }
-                    read_offset += read_cnt;
-                    output_buf += read_cnt;
-                    body_remaining_size -= read_cnt;
-
-                    total_read_cnt += bytes_to_copy;
-                }
-
-                // Handle the tail part of the file content
-                if (tail_size)
-                {
-                    //                memset(internal_buf_pos, 0, PAGE_SIZE); // no need to initialize for pread()
-                    read_cnt = ::pread(handle_->fd, internal_buf_pos, PAGE_SIZE, read_offset);
-                    if (read_cnt < 0)
-                    {
-                        fmt::print(stderr, "Cannot read the tail part of the file content block! ({})\n",
-                                   std::strerror(errno));
-                        return finish_read(-1);
-                    }
-                    // Copy the region
-                    bytes_to_copy = tail_size;
-                    if (memory_type == cudaMemoryTypeUnregistered)
-                    {
-                        memcpy(output_buf, internal_buf_pos, bytes_to_copy);
-                    }
-                    else
-                    {
-                        if (!copy_to_device(output_buf, internal_buf_pos, bytes_to_copy))
-                        {
-                            return finish_read(-1);
-                        }
-                    }
-                    total_read_cnt += tail_size;
-                }
+                return finish_read(body_read < 0 ? -1 : head_read + body_read);
             }
         }
+
+        const size_t tail_size = count - head_size - body_size;
+        const ssize_t tail_read = tail_size ? read_page(output_buf + head_size + body_size, tail_size,
+                                                        first_page + PAGE_SIZE + static_cast<off_t>(body_size), 0) :
+                                              0;
+        return finish_read(tail_read < 0 ? -1 : head_read + static_cast<ssize_t>(body_size) + tail_read);
     }
-    else if (file_type == FileHandleType::kGPUDirect)
+    if (file_type == FileHandleType::kGPUDirect)
     {
         (void*)s_cufile_cache.device_cache(); // Lazy initialization
 
-        ssize_t read_cnt = cuFileRead(handle_->cufile, reinterpret_cast<char*>(buf) + buf_offset, count, file_offset, 0);
-        total_read_cnt += read_cnt;
+        const ssize_t read_cnt = cuFileRead(handle_->cufile, output_buf, count, file_offset, 0);
         if (read_cnt < 0)
         {
             fmt::print(stderr, "Failed to read file with cuFileRead().\n");
             return -1;
         }
+        return read_cnt;
     }
 
-    return finish_read(total_read_cnt);
+    return 0;
 }
 ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, off_t buf_offset)
 {
