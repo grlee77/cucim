@@ -137,10 +137,9 @@ def _label_roots_blocks(x, y):
     """`_label_roots` for the block kernels."""
     shape, bshape, nblocks, occupancy = _connect_blocks(x, y)
     ndim = x.ndim
-    count = cupy.zeros(2, dtype=y.dtype)
     block_root = cupy.empty(nblocks, dtype=y.dtype)
     _kernel_block_flatten(ndim, False)(
-        *shape, *bshape, occupancy, y, block_root, count, size=nblocks
+        *shape, *bshape, occupancy, y, block_root, size=nblocks
     )
     _kernel_block_write_roots(ndim)(
         *shape, *bshape, occupancy, block_root, y, size=nblocks
@@ -693,7 +692,7 @@ def _block_params(ndim):
 
 @functools.cache
 def _kernel_block_flatten(ndim, count_roots=True):
-    """Find the root of each block and count the roots (one thread per block).
+    """Find the root of each block, optionally counting the component roots.
 
     Store roots in a separate array so traversal can read a stable forest.
     The collect and finalize kernels read entries for occupied blocks only.
@@ -712,9 +711,12 @@ def _kernel_block_flatten(ndim, count_roots=True):
         block_root[i] = root;
         {"if (root == rep) atomicAdd(&count[0], 1);" if count_roots else ""}
         """
+    outputs = "raw Y y, raw Y block_root"
+    if count_roots:
+        outputs += ", raw Y count"
     return cupy.ElementwiseKernel(
         _block_params(ndim),
-        "raw Y y, raw Y block_root, raw Y count",
+        outputs,
         code,
         "cucim_skimage_measure_label_block_flatten",
     )
@@ -900,9 +902,8 @@ def _flood_blocks(image, seed, low, high, label_dtype):
     )
     _kernel_block_connect(ndim)(*shape, *bshape, occupancy, y, size=nblocks)
     block_root = cupy.empty(nblocks, dtype=label_dtype)
-    count = cupy.zeros(2, dtype=label_dtype)
     _kernel_block_flatten(ndim, False)(
-        *shape, *bshape, occupancy, y, block_root, count, size=nblocks
+        *shape, *bshape, occupancy, y, block_root, size=nblocks
     )
     seed_coords = numpy.unravel_index(int(seed), shape)
     seed_block = 0
