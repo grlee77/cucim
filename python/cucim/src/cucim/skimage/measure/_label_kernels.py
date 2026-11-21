@@ -37,6 +37,16 @@ def _half_structure_dirs(structure):
     return numpy.array(keep, dtype=numpy.int32).reshape(-1, structure.ndim)
 
 
+def _structure_dirs_key(structure):
+    return tuple(map(tuple, _half_structure_dirs(structure).tolist()))
+
+
+@functools.lru_cache(maxsize=32)
+def _cached_structure_dirs_key(shape, footprint):
+    structure = numpy.frombuffer(footprint, dtype=bool).reshape(shape)
+    return _structure_dirs_key(structure)
+
+
 def _use_blocks(x, structure, greyscale_mode):
     """Whether the 2 x 2 (x 2) block kernels can be used.
 
@@ -57,9 +67,16 @@ def _connect(x, structure, y, greyscale_mode=False):
     On return ``y[i]`` is the index of the parent of pixel ``i`` (-1 for
     background pixels); the trees are not flattened yet.
     """
-    dirs = _half_structure_dirs(structure)
+    structure = numpy.asarray(structure)
+    if structure.dtype == numpy.bool_ and structure.size <= 3**4:
+        # Common connectivities fit in this cache. Snapshot the footprint so
+        # edits to a caller's array are reflected on the next call.
+        dirs_key = _cached_structure_dirs_key(
+            structure.shape, structure.tobytes()
+        )
+    else:
+        dirs_key = _structure_dirs_key(structure)
     y_shape = cupy.array(y.shape, dtype=y.dtype)
-    dirs_key = tuple(map(tuple, dirs.tolist()))
     _kernel_init_link(greyscale_mode, x.ndim, dirs_key)(
         x, y_shape, y, size=y.size
     )

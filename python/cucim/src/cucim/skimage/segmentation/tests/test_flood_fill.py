@@ -216,6 +216,25 @@ def test_footprint_not_symmetric(footprint):
         )
 
 
+def test_flood_uses_current_footprint_contents():
+    image = cp.ones((3, 3), dtype=cp.uint8)
+    seed = (1, 1)
+    assert flood(image, seed, connectivity=1).all()
+
+    row = np.zeros((3, 3), dtype=bool)
+    row[1, :] = True
+    footprint = row.copy()
+    cp.testing.assert_array_equal(flood(image, seed, footprint=footprint), row)
+
+    footprint[:] = row.T
+    cp.testing.assert_array_equal(
+        flood(image, seed, footprint=footprint), row.T
+    )
+    cp.testing.assert_array_equal(
+        flood(image, seed, footprint=footprint.T), row
+    )
+
+
 def test_footprint():
     # Basic tests for nonstandard (symmetric) footprints
     footprint = cp.array([[0, 1, 0], [1, 1, 0], [0, 0, 0]])
