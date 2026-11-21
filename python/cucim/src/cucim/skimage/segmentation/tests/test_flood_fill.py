@@ -629,3 +629,49 @@ def test_flood_keeps_integer_seed_exact_with_float_tolerance(
     cp.testing.assert_array_equal(
         flood(image, seed, tolerance=tolerance), expected
     )
+
+
+@pytest.mark.parametrize("connectivity", [None, 1, 2])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_flood_distinguishes_signed_subnormals(connectivity, sign):
+    smallest = np.nextafter(np.float32(0), np.float32(1))
+    near_zero = sign * smallest
+    image = cp.asarray([0, near_zero, 0, 2 * near_zero], dtype=cp.float32)
+    seed_at_zero = (0,)
+    seed_at_subnormal = (1,)
+
+    # A repeated row lets us force the pixel or fused block implementation
+    # while preserving the same connectivity between columns.
+    if connectivity is not None:
+        image = cp.stack((image, image))
+        seed_at_zero = (0, 0)
+        seed_at_subnormal = (0, 1)
+
+    cases = [
+        (seed_at_zero, None, [True, False, False, False]),
+        (seed_at_zero, 0.0, [True, False, False, False]),
+        (seed_at_zero, smallest, [True, True, True, False]),
+        (seed_at_subnormal, 0.0, [False, True, False, False]),
+    ]
+    for seed, tolerance, expected in cases:
+        actual = flood(
+            image, seed, connectivity=connectivity, tolerance=tolerance
+        )
+        expected = cp.broadcast_to(cp.asarray(expected), image.shape)
+        cp.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("layout", ["fortran", "reversed"])
+def test_flood_pixel_threshold_marks_seed_in_strided_image(layout):
+    # A NaN seed has to be marked explicitly. Non-C input must use the
+    # logical C-order seed index when generating the mask.
+    image = cp.zeros((4, 5), dtype=cp.float32)
+    if layout == "fortran":
+        image = cp.asfortranarray(image)
+    else:
+        image = image[::-1, ::-1]
+    seed = (1, 3)
+    image[seed] = cp.nan
+    expected = cp.zeros(image.shape, dtype=bool)
+    expected[seed] = True
+    cp.testing.assert_array_equal(flood(image, seed, connectivity=1), expected)

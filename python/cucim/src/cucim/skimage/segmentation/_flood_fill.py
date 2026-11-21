@@ -18,10 +18,20 @@ from scipy import ndimage as cpu_ndi
 
 from ..measure._label import _label_dtype_for_size
 from ..measure._label_kernels import (
+    _FLOOD_RANGE_PREAMBLE,
     _flood_blocks,
     _label_roots,
     _use_blocks,
 )
+
+_threshold_mask = cp.ElementwiseKernel(
+    "T image, T low, T high, uint64 seed",
+    "bool mask",
+    "mask = i == seed || flood_in_range(image, low, high)",
+    "cucim_skimage_segmentation_flood_threshold",
+    preamble=_FLOOD_RANGE_PREAMBLE,
+)
+
 
 _set_where = cp.ElementwiseKernel(
     "bool mask, T value",
@@ -279,18 +289,22 @@ def flood(
     # image (a fractional bound of an integer image is truncated toward zero).
     low, high = image.dtype.type(low), image.dtype.type(high)
 
+    seed = int(np.ravel_multi_index(seed_point, image.shape))
     if _use_blocks(image, structure, False):
-        seed = int(np.ravel_multi_index(seed_point, image.shape))
         return _flood_blocks(
             image, seed, low, high, _label_dtype_for_size(image.size)
         )
 
-    if tolerance is None:
-        mask = image == low
+    if image.dtype.kind == "c":
+        # Preserve equality and CuPy's comparison rules for complex input.
+        mask = (
+            image == low
+            if tolerance is None
+            else (image >= low) & (image <= high)
+        )
+        mask[seed_point] = True
     else:
-        mask = (image >= low) & (image <= high)
-    # the seed is always part of the region
-    mask[seed_point] = True
+        mask = _threshold_mask(image, low, high, seed)
 
     roots = cp.empty(image.shape, dtype=_label_dtype_for_size(image.size))
     _label_roots(cp.ascontiguousarray(mask), structure, roots)

@@ -785,6 +785,26 @@ def _kernel_block_write_roots(ndim):
     )
 
 
+_FLOOD_RANGE_PREAMBLE = r"""
+template <typename T>
+__device__ bool flood_in_range(T value, T low, T high) {
+    return value >= low && value <= high;
+}
+
+__device__ bool flood_in_range(float value, float low, float high) {
+    // Use ordered comparisons without .ftz even when the surrounding
+    // kernel is compiled with flush-to-zero enabled.
+    unsigned int inside;
+    asm("{ .reg .pred p;\n\t"
+        "setp.ge.f32 p, %1, %2;\n\t"
+        "setp.le.and.f32 p, %1, %3, p;\n\t"
+        "selp.u32 %0, 1, 0, p; }"
+        : "=r"(inside) : "f"(value), "f"(low), "f"(high));
+    return inside != 0;
+}
+"""
+
+
 @functools.cache
 def _kernel_block_init_range(ndim):
     """`_kernel_block_init` for the pixels with ``low <= x <= high``.
@@ -795,7 +815,7 @@ def _kernel_block_init_range(ndim):
     pixels = list(_block_pixel_indices(ndim))
     load = "\n        ".join(
         f"bool in{c} = {inside}; Y i{c} = in{c} ? {index} : 0; "
-        f"bool f{c} = in{c} && (i{c} == seed || (x[i{c}] >= low && x[i{c}] <= high));"
+        f"bool f{c} = in{c} && (i{c} == seed || flood_in_range(x[i{c}], low, high));"
         for c, inside, index in pixels
     )
     occ = " | ".join(f"(f{c} << {c})" for c, _, _ in pixels)
@@ -818,6 +838,7 @@ def _kernel_block_init_range(ndim):
         "raw Y y, raw uint8 occupancy",
         code,
         "cucim_skimage_measure_label_block_init_range",
+        preamble=_FLOOD_RANGE_PREAMBLE,
     )
 
 
