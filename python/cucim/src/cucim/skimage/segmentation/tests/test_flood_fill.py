@@ -567,3 +567,65 @@ def test_inplace_fill_snapshots_aliased_device_scalar(monkeypatch):
     result = flood_fill(image, 0, replacement, tolerance=4096, in_place=True)
     assert result is image
     cp.testing.assert_array_equal(result, cp.full_like(image, 77))
+
+
+@pytest.mark.parametrize("use_blocks", [False, True])
+@pytest.mark.parametrize("tolerance", [np.uint8(10), np.int8(10)])
+def test_flood_normalizes_numpy_integer_tolerance(tolerance, use_blocks):
+    image = cp.array([240, 244, 250, 255], dtype=cp.uint8)
+    seed = (2,)
+    if use_blocks:
+        image = cp.stack((image, image))
+        seed = (0, 2)
+
+    # All pixels are within 10 of 250 after clipping to the uint8 range.
+    cp.testing.assert_array_equal(
+        flood(image, seed, tolerance=tolerance),
+        cp.ones(image.shape, dtype=bool),
+    )
+
+
+def test_flood_abs_of_minimum_signed_tolerance():
+    image = cp.array([-2, 0, 1], dtype=cp.int64)
+    cp.testing.assert_array_equal(
+        flood(image, 2, tolerance=np.int64(-(2**63))),
+        cp.ones(image.shape, dtype=bool),
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype, values, seed, tolerance, expected",
+    [
+        (cp.int64, [2**53, 2**53 + 1], 1, 0.0, [False, True]),
+        (cp.int64, [2**63 - 2, 2**63 - 1], 1, 0.0, [False, True]),
+        (cp.int64, [-(2**63), -(2**63) + 1], 0, 0.0, [True, False]),
+        (cp.uint64, [2**64 - 2, 2**64 - 1], 1, 0.0, [False, True]),
+        (
+            cp.uint64,
+            [2**63, 2**63 + 1, 2**63 + 2],
+            1,
+            0.5,
+            [True, True, False],
+        ),
+        (
+            cp.int64,
+            [-(2**53) - 2, -(2**53) - 1, -(2**53)],
+            1,
+            0.5,
+            [False, True, True],
+        ),
+    ],
+)
+@pytest.mark.parametrize("use_blocks", [False, True])
+def test_flood_keeps_integer_seed_exact_with_float_tolerance(
+    dtype, values, seed, tolerance, expected, use_blocks
+):
+    image = cp.array(values, dtype=dtype)
+    expected = cp.array(expected)
+    if use_blocks:
+        image = cp.stack((image, image))
+        expected = cp.stack((expected, expected))
+        seed = (0, seed)
+    cp.testing.assert_array_equal(
+        flood(image, seed, tolerance=tolerance), expected
+    )

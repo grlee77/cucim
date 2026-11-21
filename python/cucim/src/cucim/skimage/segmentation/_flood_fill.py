@@ -43,6 +43,33 @@ def _numeric_dtype_min_max(dtype):
     return float(info.min), float(info.max)
 
 
+def _tolerance_bounds(seed_value, tolerance, dtype):
+    """Clip the tolerance interval without narrowing an integer seed."""
+    if isinstance(tolerance, np.generic):
+        tolerance = tolerance.item()
+    tolerance = abs(tolerance)
+    min_value, max_value = _numeric_dtype_min_max(dtype)
+
+    if dtype.kind not in "iu" or isinstance(tolerance, int):
+        low = seed_value - tolerance
+        high = seed_value + tolerance
+    else:
+        try:
+            whole = int(tolerance)
+        except (OverflowError, ValueError):
+            # Infinite and NaN tolerances span the dtype range.
+            return min_value, max_value
+        low = seed_value - whole
+        high = seed_value + whole
+        if tolerance % 1:
+            # Subtracting a positive fraction from a positive lower bound
+            # or adding it to a negative upper bound truncates toward zero.
+            low -= low > 0
+            high += high < 0
+
+    return max(min_value, low), min(max_value, high)
+
+
 def _resolve_seed_point(seed_point, shape):
     """The seed point as a tuple of non-negative Python ints."""
     try:
@@ -166,6 +193,9 @@ def flood(
     - If the value at `seed_point` is NaN, only the seed point itself is
       filled, with or without `tolerance` (no value compares equal to, or
       lies within a tolerance of, NaN).
+    - For integer images, the bounds are computed without narrowing the
+      tolerance or converting the seed to float. Fractional bounds are
+      truncated toward zero after clipping to the dtype range.
 
     Examples
     --------
@@ -236,8 +266,7 @@ def flood(
     seed_point = _resolve_seed_point(seed_point, image.shape)
     structure = _resolve_structure(footprint, connectivity, image.ndim)
 
-    # The value at the seed is the only value copied to the host. The bounds
-    # are computed on Python scalars so that they cannot overflow.
+    # Read the seed once. Keep integer bounds in Python integer arithmetic.
     seed_value = image[seed_point].item()
     if tolerance is None:
         low = high = seed_value
@@ -245,10 +274,7 @@ def flood(
         # NaN seed: no pixel is within the tolerance of it
         low = high = seed_value
     else:
-        tolerance = abs(tolerance)
-        min_value, max_value = _numeric_dtype_min_max(image.dtype)
-        low = max(min_value, seed_value - tolerance)
-        high = min(max_value, seed_value + tolerance)
+        low, high = _tolerance_bounds(seed_value, tolerance, image.dtype)
     # Like scikit-image, compare with the bounds converted to the dtype of the
     # image (a fractional bound of an integer image is truncated toward zero).
     low, high = image.dtype.type(low), image.dtype.type(high)
