@@ -390,7 +390,8 @@ def flood_fill(
     if cp.ndim(new_value) == 0:
         # one elementwise pass, much cheaper than the boolean-mask assignment
         if isinstance(new_value, cp.ndarray):
-            value = new_value.astype(image.dtype, copy=False)
+            # A 0-D view into image must be read before the parallel write.
+            value = new_value.astype(image.dtype, copy=in_place)
         else:
             value = np.asarray(new_value, dtype=image.dtype)[()]
         _set_where(mask, value, image)

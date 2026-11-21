@@ -548,3 +548,22 @@ def test_boolean_image_fractional_tolerance_example():
         False,
     ]
     assert flood(image, 3, tolerance=0.5).tolist() == [True, True, True, True]
+
+
+def test_inplace_fill_snapshots_aliased_device_scalar(monkeypatch):
+    import cucim.skimage.segmentation._flood_fill as module
+
+    image = cp.arange(4096, dtype=cp.int32)
+    replacement = image[77:78].reshape(())
+    assert replacement.data.ptr == image.data.ptr + 77 * image.itemsize
+    write = module._set_where
+
+    def check_storage(mask, value, output):
+        assert output is image
+        assert value.data.ptr != replacement.data.ptr
+        return write(mask, value, output)
+
+    monkeypatch.setattr(module, "_set_where", check_storage)
+    result = flood_fill(image, 0, replacement, tolerance=4096, in_place=True)
+    assert result is image
+    cp.testing.assert_array_equal(result, cp.full_like(image, 77))
